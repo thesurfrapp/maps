@@ -7,16 +7,11 @@
 	import { mode } from 'mode-watcher';
 	import { toast } from 'svelte-sonner';
 
-	import { browser } from '$app/environment';
-
+	import { timeSelectorActions } from '$lib/stores/keyboard';
 	import { desktop, loading } from '$lib/stores/preferences';
 	import { metaJson, modelRunLocked } from '$lib/stores/time';
 	import { inProgress, latest, modelRun, now, time } from '$lib/stores/time';
-	import {
-		domainSelectionOpen,
-		selectedDomain,
-		variableSelectionOpen
-	} from '$lib/stores/variables';
+	import { selectedDomain } from '$lib/stores/variables';
 
 	import PrefetchButton from '$lib/components/time/prefetch-button.svelte';
 	import * as Select from '$lib/components/ui/select';
@@ -351,39 +346,20 @@
 	const throttledPreviousModel = throttle(previousModel, 250);
 	const throttledNextModel = throttle(nextModel, 250);
 
-	const keyDownEvent = (event: KeyboardEvent) => {
-		const canNavigate = !($domainSelectionOpen || $variableSelectionOpen);
-		if (!canNavigate) return;
-
-		const actions: Record<string, () => void> = {
-			ArrowLeft: event.ctrlKey ? throttledPreviousModel : throttledPreviousHour,
-			ArrowRight: event.ctrlKey ? throttledNextModel : throttledNextHour,
-			ArrowDown: throttledPreviousDay,
-			ArrowUp: throttledNextDay,
-			c: jumpToCurrentTime,
-			m: () => toggleModelRunLock(),
-			n: () => setLatestModelRun()
-		};
-
-		const action = actions[event.key];
-		if (!action) return;
-
-		// check if loading
-		if (!disabled || ['m'].includes(event.key)) {
-			action();
-		}
-	};
-
-	onMount(() => {
-		if (browser) {
-			window.addEventListener('keydown', keyDownEvent);
-		}
-	});
-
-	onDestroy(() => {
-		if (browser) {
-			window.removeEventListener('keydown', keyDownEvent);
-		}
+	$effect(() => {
+		timeSelectorActions.set({
+			previousHour: throttledPreviousHour,
+			nextHour: throttledNextHour,
+			previousDay: throttledPreviousDay,
+			nextDay: throttledNextDay,
+			previousModel: throttledPreviousModel,
+			nextModel: throttledNextModel,
+			jumpToCurrentTime,
+			toggleModelRunLock,
+			setLatestModelRun,
+			timeNavigationDisabled: disabled
+		});
+		return () => timeSelectorActions.set({});
 	});
 
 	const latestReferenceTime = $derived(new Date($latest?.reference_time as string));

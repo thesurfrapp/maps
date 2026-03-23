@@ -37,6 +37,7 @@
 		SnapshotButton
 	} from '$lib/components/buttons';
 	import HelpDialog from '$lib/components/help/help-dialog.svelte';
+	import KeyboardHandler from '$lib/components/keyboard/keyboard-handler.svelte';
 	import Spinner from '$lib/components/loading/spinner.svelte';
 	import Scale from '$lib/components/scale/scale.svelte';
 	import VariableSelection from '$lib/components/selection/variable-selection.svelte';
@@ -129,19 +130,7 @@
 			addPopup();
 			changeOMfileURL();
 		});
-
-		if (browser) {
-			window.addEventListener('keydown', keyDownEvent);
-		}
 	});
-
-	const keyDownEvent = (event: KeyboardEvent) => {
-		switch (event.key) {
-			case 's':
-				if (!event.ctrlKey) takeSnapshot($map);
-				break;
-		}
-	};
 
 	let getInitialMetaDataPromise: Promise<void> | undefined;
 	const domainSubscription = domain.subscribe(async (newDomain) => {
@@ -188,9 +177,6 @@
 		}
 		domainSubscription(); // unsubscribe
 		variableSubscription(); // unsubscribe
-		if (browser) {
-			window.removeEventListener('keydown', keyDownEvent);
-		}
 	});
 </script>
 
@@ -217,3 +203,4 @@
 <TimeSelector />
 <Settings />
 <HelpDialog />
+<KeyboardHandler />
