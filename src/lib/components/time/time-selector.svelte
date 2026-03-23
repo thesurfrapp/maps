@@ -3,13 +3,13 @@
 	import { SvelteDate } from 'svelte/reactivity';
 	import { fade } from 'svelte/transition';
 
-	import { closestModelRun, domainStep } from '@openmeteo/mapbox-layer';
+	import { closestModelRun, domainStep } from '@openmeteo/weather-map-layer';
 	import { mode } from 'mode-watcher';
 	import { toast } from 'svelte-sonner';
 
 	import { browser } from '$app/environment';
 
-	import { desktop, loading, preferences } from '$lib/stores/preferences';
+	import { desktop, loading } from '$lib/stores/preferences';
 	import { metaJson, modelRunLocked } from '$lib/stores/time';
 	import { inProgress, latest, modelRun, now, time } from '$lib/stores/time';
 	import {
