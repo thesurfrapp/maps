@@ -39,6 +39,7 @@ export const getMetaData = async (): Promise<DomainMetaDataJson> => {
 		mR.set(latestReferenceTime);
 		modelRun = get(mR) as Date;
 	}
+	latest?.valid_times.sort();
 
 	if (latestReferenceTime && modelRun.getTime() === latestReferenceTime.getTime()) {
 		return latest as DomainMetaDataJson;
