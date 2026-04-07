@@ -14,7 +14,7 @@
 	import 'maplibre-gl/dist/maplibre-gl.css';
 	import { toast } from 'svelte-sonner';
 
-	import { browser, version } from '$app/environment';
+	import { version } from '$app/environment';
 
 	import { map } from '$lib/stores/map';
 	import { defaultColorHash, omProtocolSettings } from '$lib/stores/om-protocol-settings';
@@ -33,8 +33,7 @@
 		DarkModeButton,
 		HelpButton,
 		HillshadeButton,
-		SettingsButton,
-		SnapshotButton
+		SettingsButton
 	} from '$lib/components/buttons';
 	import HelpDialog from '$lib/components/help/help-dialog.svelte';
 	import KeyboardHandler from '$lib/components/keyboard/keyboard-handler.svelte';
@@ -49,7 +48,6 @@
 	import { addTerrainSource, getStyle, setMapControlSettings } from '$lib/map-controls';
 	import { getInitialMetaData, getMetaData, matchVariableOrFirst } from '$lib/metadata';
 	import { addPopup } from '$lib/popup';
-	import { takeSnapshot } from '$lib/snapshot';
 	import { formatISOWithoutTimezone } from '$lib/time-format';
 	import { findTimeStep } from '$lib/time-utils';
 	import { updateUrl, urlParamsToPreferences } from '$lib/url';
@@ -101,8 +99,7 @@
 			zoom: domainObject.grid.zoom,
 			keyboard: false,
 			hash: true,
-			maxPitch: 85,
-			canvasContextAttributes: { preserveDrawingBuffer: true }
+			maxPitch: 85
 		});
 
 		setMapControlSettings();
@@ -118,7 +115,6 @@
 			$map.addControl(new DarkModeButton());
 			$map.addControl(new SettingsButton());
 			$map.addControl(new HelpButton());
-			$map.addControl(new SnapshotButton());
 
 			if (getInitialMetaDataPromise) await getInitialMetaDataPromise;
 
