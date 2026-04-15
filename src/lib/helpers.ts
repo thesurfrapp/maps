@@ -1,4 +1,4 @@
-import { browser, dev } from '$app/environment';
+import { browser } from '$app/environment';
 
 /**
  * Pads a number with leading zeros to ensure 2 digits
@@ -11,10 +11,12 @@ export const fmtModelRun = (modelRun: Date): string =>
 export const fmtSelectedTime = (t: Date): string =>
 	`${t.getUTCFullYear()}-${pad(t.getUTCMonth() + 1)}-${pad(t.getUTCDate())}T${pad(t.getUTCHours())}${pad(t.getUTCMinutes())}`;
 
-export const getBaseUri = (domainValue: string): string =>
-	dev && domainValue.startsWith('dwd_icon') && !domainValue.endsWith('eps')
-		? 'https://s3.servert.ch'
-		: 'https://map-tiles.open-meteo.com';
+// All tile/json requests go through our own Cloudflare Pages Function proxy
+// (functions/tiles/[[path]].ts) which edge-caches .om files for 30 days. This
+// cuts first-byte latency from ~10s (Open-Meteo's CDN cold miss) to edge speeds
+// once the file is cached, and reduces load on Open-Meteo's origin.
+// Same URL works in dev (localhost reaches public proxy) and prod.
+export const getBaseUri = (_domainValue: string): string => 'https://maps.thesurfr.app/tiles';
 
 export const hashValue = (val: string): string => {
 	// FNV-1a 32-bit – synchronous, fast, and sufficient for cache-busting keys.

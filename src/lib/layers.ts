@@ -239,6 +239,24 @@ const vectorContourLabelsLayer = (): SlotLayer => ({
 });
 
 // =============================================================================
+// beforeLayer resolution
+// =============================================================================
+
+// Resolve a beforeLayer id against the active style. If the requested id is
+// missing, fall back to the first boundary OR symbol layer — whichever comes
+// earlier in the style. This puts country borders and place labels ON TOP of
+// the weather raster (matches how maps.open-meteo.com renders bright white
+// borders over a dense wind overlay). Final fallback: undefined = top of stack.
+const resolveBeforeLayer = (map: maplibregl.Map, desired: string): string => {
+	if (map.getLayer(desired)) return desired;
+	const layers = map.getStyle().layers ?? [];
+	const first = layers.find((l: { type: string; id: string }) =>
+		l.id.startsWith('boundary') || l.type === 'symbol'
+	);
+	return first?.id ?? (undefined as unknown as string);
+};
+
+// =============================================================================
 // Manager instances
 // =============================================================================
 
@@ -253,7 +271,10 @@ export const createManagers = (): void => {
 
 	rasterManager = new SlotManager(map, {
 		sourceIdPrefix: 'omRasterSource',
-		beforeLayer: preferences.hillshade ? HILLSHADE_LAYER : BEFORE_LAYER_RASTER,
+		beforeLayer: resolveBeforeLayer(
+			map,
+			preferences.hillshade ? HILLSHADE_LAYER : BEFORE_LAYER_RASTER
+		),
 		layerFactory: () => [rasterLayer()],
 		sourceSpec: (sourceUrl) => ({
 			url: sourceUrl,
@@ -273,7 +294,10 @@ export const createManagers = (): void => {
 
 	vectorManager = new SlotManager(map, {
 		sourceIdPrefix: 'omVectorSource',
-		beforeLayer: preferences.clipWater ? BEFORE_LAYER_VECTOR_WATER_CLIP : BEFORE_LAYER_VECTOR,
+		beforeLayer: resolveBeforeLayer(
+			map,
+			preferences.clipWater ? BEFORE_LAYER_VECTOR_WATER_CLIP : BEFORE_LAYER_VECTOR
+		),
 		layerFactory: () => [
 			vectorArrowLayer(),
 			vectorGridLayer(),
@@ -310,9 +334,14 @@ export const changeOMfileURL = (vectorOnly = false, rasterOnly = false): void =>
 
 	const preferences = get(p);
 	vectorManager?.setBeforeLayer(
-		preferences.clipWater ? BEFORE_LAYER_VECTOR_WATER_CLIP : BEFORE_LAYER_VECTOR
+		resolveBeforeLayer(
+			map,
+			preferences.clipWater ? BEFORE_LAYER_VECTOR_WATER_CLIP : BEFORE_LAYER_VECTOR
+		)
 	);
-	rasterManager?.setBeforeLayer(preferences.hillshade ? HILLSHADE_LAYER : BEFORE_LAYER_RASTER);
+	rasterManager?.setBeforeLayer(
+		resolveBeforeLayer(map, preferences.hillshade ? HILLSHADE_LAYER : BEFORE_LAYER_RASTER)
+	);
 
 	if (!vectorOnly) rasterManager?.update('om://' + omUrl);
 	if (!rasterOnly) vectorManager?.update('om://' + omUrl);

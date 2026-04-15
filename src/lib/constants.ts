@@ -20,11 +20,14 @@ export const DEFAULT_PREFERENCES = {
 	showScale: true
 };
 
-// Layer names for map rendering
+// Layer names for map rendering.
+// These are insertion points ("beforeId") used by map.addLayer(...) so our weather
+// raster and vector arrow layers land below place labels. They must reference a
+// layer that exists in the active basemap style — we use OpenFreeMap Positron.
 export const HILLSHADE_LAYER = 'hillshadeLayer';
-export const BEFORE_LAYER_RASTER = 'waterway-tunnel';
-export const BEFORE_LAYER_VECTOR = 'place_label_other';
-export const BEFORE_LAYER_VECTOR_WATER_CLIP = 'water-clip';
+export const BEFORE_LAYER_RASTER = 'waterway_line_label';
+export const BEFORE_LAYER_VECTOR = 'waterway_line_label';
+export const BEFORE_LAYER_VECTOR_WATER_CLIP = 'waterway_line_label';
 
 // Default tile size and opacity
 export const DEFAULT_TILE_SIZE = 512;

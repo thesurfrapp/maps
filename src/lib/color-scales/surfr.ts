@@ -1,28 +1,53 @@
 import type { BreakpointColorScale } from '@openmeteo/weather-map-layer';
 
-// Surfr wind color palette — mirror of WindguruService.WIND_COLOR_ANCHORS in /frontend.
-// Breakpoints are converted from knots to m/s (1 kt = 0.514444 m/s) so colors line up
-// with the ForecastTable at the same wind speed in knots.
-// Library lookup is step-function (findLastIndexLE), matching the table's "nearest lower anchor" rule.
+// Surfr wind color palette — hues from WindguruService.WIND_COLOR_ANCHORS in /frontend,
+// linearly interpolated between anchors so the map renders a smooth gradient instead of
+// hard bucket edges. ForecastTable cells still snap to discrete anchor colors, but at the
+// anchor knots (0/5/10/…/50) the map shows the exact same hue, so palette parity holds at
+// every bucket centre.
 
 const KT_TO_MPS = 0.514444;
 
-const anchors: { kt: number; rgb: [number, number, number]; a: number }[] = [
-	{ kt: 0, rgb: [80, 112, 192], a: 0 },
-	{ kt: 5, rgb: [64, 184, 200], a: 0.55 },
-	{ kt: 10, rgb: [80, 200, 120], a: 0.7 },
-	{ kt: 15, rgb: [144, 216, 64], a: 0.85 },
-	{ kt: 20, rgb: [208, 216, 40], a: 1 },
-	{ kt: 25, rgb: [232, 168, 48], a: 1 },
-	{ kt: 30, rgb: [224, 104, 72], a: 1 },
-	{ kt: 35, rgb: [224, 72, 152], a: 1 },
-	{ kt: 40, rgb: [208, 72, 192], a: 1 },
-	{ kt: 50, rgb: [136, 88, 200], a: 1 }
+// Lower than 1 so basemap reads through the overlay. Global raster-opacity (default 0.75)
+// multiplies on top — effective alpha at default settings is ~0.375.
+const UNIFORM_ALPHA = 0.5;
+
+// Anchors in knots — must stay in sync with WindguruService.WIND_COLOR_ANCHORS.
+const anchors: [number, number, number, number][] = [
+	[0, 80, 112, 192],
+	[5, 64, 184, 200],
+	[10, 80, 200, 120],
+	[15, 144, 216, 64],
+	[20, 208, 216, 40],
+	[25, 232, 168, 48],
+	[30, 224, 104, 72],
+	[35, 224, 72, 152],
+	[40, 208, 72, 192],
+	[50, 136, 88, 200]
 ];
+
+// Densify to 1-knot resolution. Each integer knot from 0 to 50 gets an interpolated color.
+// Library does step lookup (findLastIndexLE); at 1-kt resolution the "steps" are too fine
+// to see — result reads as a smooth gradient.
+const lerp = (a: number, b: number, t: number): number => Math.round(a + (b - a) * t);
+
+const densified: { kt: number; rgb: [number, number, number] }[] = [];
+for (let i = 0; i < anchors.length - 1; i++) {
+	const [k0, r0, g0, b0] = anchors[i];
+	const [k1, r1, g1, b1] = anchors[i + 1];
+	const span = k1 - k0;
+	for (let k = k0; k < k1; k++) {
+		const t = (k - k0) / span;
+		densified.push({ kt: k, rgb: [lerp(r0, r1, t), lerp(g0, g1, t), lerp(b0, b1, t)] });
+	}
+}
+// Append the terminal anchor.
+const last = anchors[anchors.length - 1];
+densified.push({ kt: last[0], rgb: [last[1], last[2], last[3]] });
 
 export const surfrWindScale: BreakpointColorScale = {
 	type: 'breakpoint',
 	unit: 'm/s',
-	breakpoints: anchors.map((a) => +(a.kt * KT_TO_MPS).toFixed(4)),
-	colors: anchors.map(({ rgb, a }) => [rgb[0], rgb[1], rgb[2], a])
+	breakpoints: densified.map((d) => +(d.kt * KT_TO_MPS).toFixed(4)),
+	colors: densified.map(({ rgb }) => [rgb[0], rgb[1], rgb[2], UNIFORM_ALPHA])
 };
