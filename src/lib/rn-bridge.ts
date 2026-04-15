@@ -27,7 +27,7 @@ type OutMsg =
 	| { type: 'timestampChanged'; time: string; t: number }
 	| { type: 'forecastLocationSet'; lat: number; lng: number; t: number }
 	| { type: 'referenceTime'; domain: string; referenceTime: string; t: number }
-	| { type: 'tileFetch'; url: string; status: number; ms: number; bytes: number; t: number }
+	| { type: 'tileFetch'; url: string; status: number; ms: number; bytes: number; cache: string; t: number }
 	// New: lifecycle events to attribute time-loss
 	| { type: 'setTimeReceived'; time: string; t: number }
 	| { type: 'setVariableReceived'; variable: string; t: number }
@@ -148,14 +148,13 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 		try {
 			const res = await origFetch(input, init);
 			const ms = Math.round(performance.now() - start);
-			// content-length isn't always set on 206s; fall back to 0 — the
-			// important signal is timing + status.
 			const bytes = Number(res.headers.get('content-length')) || 0;
-			postToRN({ type: 'tileFetch', url, status: res.status, ms, bytes });
+			const cache = res.headers.get('x-surfr-cache-status') || '';
+			postToRN({ type: 'tileFetch', url, status: res.status, ms, bytes, cache });
 			return res;
 		} catch (err) {
 			const ms = Math.round(performance.now() - start);
-			postToRN({ type: 'tileFetch', url, status: 0, ms, bytes: 0 });
+			postToRN({ type: 'tileFetch', url, status: 0, ms, bytes: 0, cache: 'ERR' });
 			throw err;
 		}
 	};

@@ -42,7 +42,11 @@ const corsHeaders = {
 	'Access-Control-Allow-Origin': '*',
 	'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
 	'Access-Control-Allow-Headers': `Range, If-Match, If-None-Match, If-Modified-Since, ${FORCE_REFRESH_HEADER}, ${WARM_HEADER}`,
-	'Access-Control-Expose-Headers': 'ETag, Content-Range, Content-Length, Accept-Ranges',
+	// Expose our X-Surfr-Cache-Status header so the RN host can read it from
+	// `res.headers.get(...)` for diagnostics. Without this, CORS hides custom
+	// response headers from the client.
+	'Access-Control-Expose-Headers':
+		'ETag, Content-Range, Content-Length, Accept-Ranges, X-Surfr-Cache-Status, X-Surfr-Refreshed',
 	'Access-Control-Max-Age': '3000'
 };
 
@@ -121,14 +125,19 @@ export const onRequest: PagesFunction = async (context) => {
 	const ifModifiedSince = request.headers.get('If-Modified-Since');
 	if (ifModifiedSince) upstreamHeaders.set('If-Modified-Since', ifModifiedSince);
 
+	// Diagnostic: peek into the edge cache BEFORE the fetch to determine
+	// hit/miss, so we can emit X-Surfr-Cache-Status in the response. We use
+	// `ignoreMethod: true` so HEAD requests share the same cache key as GET.
+	// Note: this is best-effort. CF's `cacheEverything: true` may use a
+	// slightly different internal key from `caches.default.match`, so an
+	// occasional false MISS is possible — but a HIT here is always reliable.
+	const cacheCheckKey = new Request(upstreamUrl, { method: 'GET' });
+	const peeked = await caches.default.match(cacheCheckKey).catch(() => null);
+	const cacheStatus = peeked ? 'HIT' : 'MISS';
+
 	// Force-refresh path: evict the existing edge entry *before* the fetch. The
 	// fetch below uses `cacheEverything: true` which — after our delete — will
 	// miss, pull fresh from origin, and repopulate the edge cache automatically.
-	// This handles both 200 (full) and 206 (Range) responses correctly; CF stores
-	// the full resource internally and serves arbitrary ranges out of it.
-	// Primary use: the warmer invalidates `latest.json` after pre-warming the new
-	// run's .om files, so clients never see a reference_time that isn't backed
-	// by warm .om entries.
 	if (forceRefresh) {
 		await caches.default.delete(upstreamUrl).catch(() => {});
 	}
@@ -150,6 +159,10 @@ export const onRequest: PagesFunction = async (context) => {
 	const headers = new Headers(upstream.headers);
 	for (const [k, v] of Object.entries(corsHeaders)) headers.set(k, v);
 	headers.set('Cache-Control', `public, max-age=${ttl}`);
+	// HIT/MISS reflects the state BEFORE this request was served. After a MISS
+	// we also populate the cache via cacheEverything, so the *next* request for
+	// the same URL should report HIT.
+	headers.set('X-Surfr-Cache-Status', forceRefresh ? 'BYPASS' : cacheStatus);
 	if (forceRefresh) {
 		headers.set('X-Surfr-Refreshed', '1');
 	}
