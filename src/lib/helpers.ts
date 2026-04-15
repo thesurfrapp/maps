@@ -1,4 +1,4 @@
-import { browser } from '$app/environment';
+import { browser, dev } from '$app/environment';
 
 /**
  * Pads a number with leading zeros to ensure 2 digits
@@ -12,18 +12,19 @@ export const fmtSelectedTime = (t: Date): string =>
 	`${t.getUTCFullYear()}-${pad(t.getUTCMonth() + 1)}-${pad(t.getUTCDate())}T${pad(t.getUTCHours())}${pad(t.getUTCMinutes())}`;
 
 export const getBaseUri = (domainValue: string): string =>
-	domainValue.startsWith('dwd_icon') && !domainValue.endsWith('eps')
+	dev && domainValue.startsWith('dwd_icon') && !domainValue.endsWith('eps')
 		? 'https://s3.servert.ch'
 		: 'https://map-tiles.open-meteo.com';
 
-export const hashValue = (val: string): Promise<string> =>
-	crypto.subtle.digest('SHA-256', new TextEncoder().encode(val)).then((h) => {
-		const view = new DataView(h);
-		const hexes: string[] = [];
-		for (let i = 0; i < view.byteLength; i += 4)
-			hexes.push(('00000000' + view.getUint32(i).toString(16)).slice(-8));
-		return hexes.join('');
-	});
+export const hashValue = (val: string): string => {
+	// FNV-1a 32-bit – synchronous, fast, and sufficient for cache-busting keys.
+	let h = 0x811c9dc5;
+	for (let i = 0; i < val.length; i++) {
+		h ^= val.charCodeAt(i);
+		h = Math.imul(h, 0x01000193);
+	}
+	return (h >>> 0).toString(16).padStart(8, '0');
+};
 
 export const throttle = <T extends unknown[]>(
 	callback: (...args: T) => void,

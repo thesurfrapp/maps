@@ -3,12 +3,12 @@
 	import { get } from 'svelte/store';
 
 	import {
+		type Domain,
 		GridFactory,
 		domainOptions,
 		omProtocol,
 		updateCurrentBounds
 	} from '@openmeteo/weather-map-layer';
-	import { type RequestParameters } from 'maplibre-gl';
 	import * as maplibregl from 'maplibre-gl';
 	import 'maplibre-gl/dist/maplibre-gl.css';
 	import { toast } from 'svelte-sonner';
@@ -29,11 +29,14 @@
 	import { domain, selectedDomain, selectedVariable, variable } from '$lib/stores/variables';
 
 	import {
+		ClippingButton,
 		DarkModeButton,
 		HelpButton,
 		HillshadeButton,
 		SettingsButton
 	} from '$lib/components/buttons';
+	import ClippingPanel from '$lib/components/clipping/clipping-panel.svelte';
+	import Dropzone from '$lib/components/dropzone/dropzone.svelte';
 	import HelpDialog from '$lib/components/help/help-dialog.svelte';
 	import KeyboardHandler from '$lib/components/keyboard/keyboard-handler.svelte';
 	import Spinner from '$lib/components/loading/spinner.svelte';
@@ -53,9 +56,13 @@
 
 	import '../styles.css';
 
+	import type { RequestParameters } from 'maplibre-gl';
+
+	let clippingPanel: ReturnType<typeof ClippingPanel>;
+
 	let mapContainer: HTMLElement | null;
 
-	onMount(() => {
+	onMount(async () => {
 		$url = new URL(document.location.href);
 		urlParamsToPreferences();
 
@@ -66,9 +73,7 @@
 			}
 			tileSizeSet.set(true);
 		}
-	});
 
-	onMount(async () => {
 		// resets all the states when a new version is set in 'package.json' and version already set before
 		if (version !== $localStorageVersion) {
 			if ($localStorageVersion) {
@@ -76,16 +81,14 @@
 			}
 			$localStorageVersion = version;
 		}
-	});
 
-	onMount(async () => {
 		maplibregl.addProtocol('om', (params: RequestParameters, abortController: AbortController) =>
 			omProtocol(params, abortController, $omProtocolSettings)
 		);
 
 		const style = await getStyle();
 
-		const domainObject = domainOptions.find(({ value }) => value === $domain);
+		const domainObject = domainOptions.find(({ value }: Domain) => value === $domain);
 		if (!domainObject) {
 			throw new Error('Domain not found');
 		}
@@ -103,6 +106,7 @@
 
 		setMapControlSettings();
 
+		// update bounds when new tiles are requested, to trigger new data ranges loading if necessary
 		$map.on('dataloading', () => {
 			const bounds = $map.getBounds();
 			const [minLng, minLat] = bounds.getSouthWest().toArray();
@@ -114,14 +118,16 @@
 			$map.addControl(new DarkModeButton());
 			$map.addControl(new SettingsButton());
 			$map.addControl(new HelpButton());
+			$map.addControl(new ClippingButton());
 
 			if (getInitialMetaDataPromise) await getInitialMetaDataPromise;
 
 			addTerrainSource($map);
 			addTerrainSource($map, 'terrainSource2');
 			$map.addControl(new HillshadeButton());
-			addOmFileLayers();
+			clippingPanel?.initTerraDraw();
 
+			addOmFileLayers();
 			addPopup();
 			changeOMfileURL();
 		});
@@ -136,23 +142,25 @@
 			toast('Domain set to: ' + $selectedDomain.label);
 		}
 
-		getInitialMetaDataPromise = getInitialMetaData();
+		getInitialMetaDataPromise = (async () => {
+			await getInitialMetaData();
+			$metaJson = await getMetaData();
+
+			const timeSteps = $metaJson?.valid_times.map((validTime: string) => new Date(validTime));
+			const timeStep = findTimeStep($time, timeSteps);
+			// clamp time to valid times in meta data
+			if (timeStep) {
+				$time = timeStep;
+				updateUrl('time', formatISOWithoutTimezone($time));
+			} else {
+				// otherwise use first valid time
+				$time = timeSteps[0];
+				updateUrl('time', formatISOWithoutTimezone($time));
+			}
+
+			matchVariableOrFirst();
+		})();
 		await getInitialMetaDataPromise;
-		$metaJson = await getMetaData();
-
-		const timeSteps = $metaJson?.valid_times.map((validTime: string) => new Date(validTime));
-		const timeStep = findTimeStep($time, timeSteps);
-		// clamp time to valid times in meta data
-		if (timeStep) {
-			$time = timeStep;
-			updateUrl('time', formatISOWithoutTimezone($time));
-		} else {
-			// otherwise use first valid time
-			$time = timeSteps[0];
-			updateUrl('time', formatISOWithoutTimezone($time));
-		}
-
-		matchVariableOrFirst();
 		changeOMfileURL();
 	});
 
@@ -187,7 +195,13 @@
 
 <Scale />
 <VariableSelection />
+<ClippingPanel bind:this={clippingPanel} />
 <TimeSelector />
 <Settings />
 <HelpDialog />
 <KeyboardHandler />
+<Dropzone
+	ondrop={(features) => {
+		clippingPanel?.addImportedFeatures(features);
+	}}
+/>

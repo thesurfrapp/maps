@@ -24,7 +24,13 @@ import { modelRun as mR, modelRunLocked as mRL, time } from '$lib/stores/time';
 import { domain as d, variable as v } from '$lib/stores/variables';
 import { vectorOptions as vO } from '$lib/stores/vector';
 
+import {
+	CLIP_COUNTRIES_PARAM,
+	parseClipCountriesParam,
+	serializeClipCountriesParam
+} from './clipping';
 import { fmtModelRun, fmtSelectedTime, getBaseUri, hashValue } from './helpers';
+import { clippingCountryCodes } from './stores/clipping';
 import { omProtocolSettings } from './stores/om-protocol-settings';
 import { formatISOUTCWithZ, parseISOWithoutTimezone } from './time-format';
 
@@ -49,7 +55,6 @@ export const updateUrl = async (
 	}
 
 	await tick();
-
 	let fullUrl: string;
 	try {
 		const map = get(m);
@@ -132,19 +137,32 @@ export const urlParamsToPreferences = () => {
 		url.searchParams.set('interval', String(vectorOptions.contourInterval));
 	}
 
+	const clipCountries = parseClipCountriesParam(params.get(CLIP_COUNTRIES_PARAM));
+	if (clipCountries.length > 0) {
+		clippingCountryCodes.set(clipCountries);
+	} else {
+		const currentCodes = get(clippingCountryCodes);
+		const serialized = serializeClipCountriesParam(currentCodes);
+		if (serialized) {
+			url.searchParams.set(CLIP_COUNTRIES_PARAM, serialized);
+		}
+	}
+
 	vO.set(vectorOptions);
 	p.set(preferences);
 };
 
+let cachedClippingJson = '';
+let cachedClippingHash = '';
 let cachedColorJson = '';
 let cachedColorHash = '';
 
-const memorisedHash = async (json: string, cachedJson: string, cachedHash: string) => {
+const memorisedHash = (json: string, cachedJson: string, cachedHash: string) => {
 	if (json === cachedJson) return { json, hash: cachedHash };
-	return { json, hash: await hashValue(json) };
+	return { json, hash: hashValue(json) };
 };
 
-export const getOMUrl = async () => {
+export const getOMUrl = () => {
 	const domain = get(d);
 	const base = `${getBaseUri(domain)}/data_spatial/${domain}`;
 	const modelRun = get(mR);
@@ -166,12 +184,23 @@ export const getOMUrl = async () => {
 	if (tileSize !== 256) result += `&tile_size=${tileSize}`;
 
 	const omProtocolSettingsState = get(omProtocolSettings);
+	if (
+		omProtocolSettingsState.clippingOptions !== undefined &&
+		omProtocolSettingsState.clippingOptions !== defaultOmProtocolSettings.clippingOptions
+	) {
+		const clippingJson = JSON.stringify(omProtocolSettingsState.clippingOptions);
+		const cached = memorisedHash(clippingJson, cachedClippingJson, cachedClippingHash);
+		cachedClippingJson = cached.json;
+		cachedClippingHash = cached.hash;
+		result += `&clipping_options_hash=${cached.hash}`;
+	}
+
 	const colorJson = JSON.stringify(omProtocolSettingsState.colorScales);
 	if (
 		omProtocolSettingsState.colorScales !== undefined &&
 		colorJson !== JSON.stringify(defaultOmProtocolSettings.colorScales)
 	) {
-		const cached = await memorisedHash(colorJson, cachedColorJson, cachedColorHash);
+		const cached = memorisedHash(colorJson, cachedColorJson, cachedColorHash);
 		cachedColorJson = cached.json;
 		cachedColorHash = cached.hash;
 		result += `&color_hash=${cached.hash}`;

@@ -1,16 +1,24 @@
 import { get } from 'svelte/store';
 
-import { getColor, getColorScale, getValueFromLatLong } from '@openmeteo/weather-map-layer';
+import {
+	GridFactory,
+	createClippingTester,
+	getCachedResolvedClipping,
+	getColor,
+	getColorScale,
+	getValueFromLatLong
+} from '@openmeteo/weather-map-layer';
 import * as maplibregl from 'maplibre-gl';
 import { mode } from 'mode-watcher';
 
 import { map as m, popup as p, popupMode } from '$lib/stores/map';
 import { omProtocolSettings } from '$lib/stores/om-protocol-settings';
 import { convertValue, getDisplayUnit, unitPreferences } from '$lib/stores/units';
-import { variable as v } from '$lib/stores/variables';
+import { selectedDomain, variable as v } from '$lib/stores/variables';
 
 import { textWhite } from './helpers';
 import { rasterManager } from './layers';
+import { terraDrawActive } from './stores/clipping';
 import { desktop, opacity } from './stores/preferences';
 
 let el: HTMLDivElement | undefined;
@@ -19,6 +27,10 @@ let contentDiv: HTMLDivElement | undefined;
 let valueSpan: HTMLSpanElement | undefined;
 let unitSpan: HTMLSpanElement | undefined;
 let elevationSpan: HTMLSpanElement | undefined;
+
+// Cached clipping tester — recomputed only when clippingOptions reference changes.
+let cachedClippingOptionsRef: unknown = undefined;
+let cachedClippingTester: ((lon: number, lat: number) => boolean) | undefined;
 
 const initPopupDiv = (): void => {
 	el = document.createElement('div');
@@ -61,15 +73,32 @@ const updatePopupContent = async (coordinates: maplibregl.LngLat): Promise<void>
 	const elevation = map?.queryTerrainElevation(coordinates);
 	const hasElevation = typeof elevation === 'number' && isFinite(elevation);
 
-	const { value } = await getValueFromLatLong(
-		coordinates.lat,
-		coordinates.lng,
-		rasterManager?.getActiveSourceUrl() ?? ''
-	);
+	const activeUrl = rasterManager?.getActiveSourceUrl();
+	if (!activeUrl) return;
+
+	const { value } = await getValueFromLatLong(coordinates.lat, coordinates.lng, activeUrl);
 
 	if (isFinite(value)) {
+		const omProtocolSettingsState = get(omProtocolSettings);
+		const clippingOptions = omProtocolSettingsState.clippingOptions;
+
+		if (clippingOptions) {
+			if (clippingOptions !== cachedClippingOptionsRef) {
+				cachedClippingOptionsRef = clippingOptions;
+				cachedClippingTester = createClippingTester(getCachedResolvedClipping(clippingOptions));
+			}
+			if (cachedClippingTester && !cachedClippingTester(coordinates.lng, coordinates.lat)) {
+				contentDiv.style.backgroundColor = '';
+				contentDiv.style.color = '';
+				valueSpan.innerText = 'Outside clip';
+				unitSpan.innerText = '';
+				elevationSpan.innerText = hasElevation ? `${Math.round(elevation)}m` : '';
+				return;
+			}
+		}
+
 		const isDark = mode.current === 'dark';
-		const colorScale = getColorScale(get(v), isDark, get(omProtocolSettings).colorScales);
+		const colorScale = getColorScale(get(v), isDark, omProtocolSettingsState.colorScales);
 		const color = getColor(colorScale, value);
 
 		const popupOpacity =
@@ -82,12 +111,23 @@ const updatePopupContent = async (coordinates: maplibregl.LngLat): Promise<void>
 		valueSpan.innerText = displayValue.toFixed(1);
 		unitSpan.innerText = getDisplayUnit(colorScale.unit, units);
 		elevationSpan.innerText = hasElevation ? `${Math.round(elevation)}m` : '';
+		elevationSpan.style.color = textWhite(color, isDark) ? 'white' : 'black';
 	} else {
 		contentDiv.style.backgroundColor = '';
 		contentDiv.style.color = '';
-		valueSpan.innerText = 'Outside domain';
+
+		const domainBounds = GridFactory.create(get(selectedDomain).grid).getBounds();
+		const [minLon, minLat, maxLon, maxLat] = domainBounds;
+		const insideDomain =
+			coordinates.lat >= minLat &&
+			coordinates.lat <= maxLat &&
+			coordinates.lng >= minLon &&
+			coordinates.lng <= maxLon;
+
+		valueSpan.innerText = insideDomain ? 'No data' : 'Outside domain';
 		unitSpan.innerText = '';
 		elevationSpan.innerText = hasElevation ? `${Math.round(elevation)}m` : '';
+		elevationSpan.style.color = '';
 	}
 };
 
@@ -124,7 +164,7 @@ export const refreshPopup = async (): Promise<void> => {
 };
 
 const updatePopup = async (e: maplibregl.MapMouseEvent): Promise<void> => {
-	if (get(popupMode) === 'follow') {
+	if (get(popupMode) === 'follow' && !get(terraDrawActive)) {
 		const popup = get(p);
 		if (popup) {
 			popup.setLngLat(e.lngLat);
@@ -155,18 +195,31 @@ export const addPopup = (): void => {
 
 	map.on('mousemove', updatePopup);
 
-	map.on('click', async (e: maplibregl.MapMouseEvent) => {
-		if (!map) return;
+	map.on('click', async (e: maplibregl.MapLayerMouseEvent) => {
+		if (!map || get(terraDrawActive)) return;
 
 		switchPopupMode();
 
 		if (get(popupMode) === null) {
-			const popup = get(p);
-			popup?.remove();
-			p.set(undefined);
+			removePopup();
 			return;
 		}
 
+		// Re-add mousemove listener (may have been removed by a previous removePopup)
+		map.off('mousemove', updatePopup);
+		map.on('mousemove', updatePopup);
+
 		await renderPopup(e.lngLat);
 	});
+};
+
+export const removePopup = (): void => {
+	const map = get(m);
+	if (!map) return;
+
+	map.off('mousemove', updatePopup);
+
+	const popup = get(p);
+	popup?.remove();
+	p.set(undefined);
 };
