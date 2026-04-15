@@ -36,16 +36,18 @@ const getRasterOpacity = (): number => {
 };
 
 const makeArrowColor = (): maplibregl.ExpressionSpecification => {
+	// Capped at 0.4 (was 0.7) so arrows hint at direction without overpowering
+	// the underlying weather raster.
 	let expr: maplibregl.ExpressionSpecification = [
 		'literal',
-		lightOrDark('rgba(0,0,0, 0.2)', 'rgba(255,255,255, 0.2)')
+		lightOrDark('rgba(0,0,0, 0.15)', 'rgba(255,255,255, 0.15)')
 	];
 	const thresholds: [number, string, string][] = [
-		[2, 'rgba(0,0,0, 0.3)', 'rgba(255,255,255, 0.3)'],
-		[3, 'rgba(0,0,0, 0.4)', 'rgba(255,255,255, 0.4)'],
-		[4, 'rgba(0,0,0, 0.5)', 'rgba(255,255,255, 0.5)'],
-		[5, 'rgba(0,0,0, 0.6)', 'rgba(255,255,255, 0.6)'],
-		[10, 'rgba(0,0,0, 0.7)', 'rgba(255,255,255, 0.7)']
+		[2, 'rgba(0,0,0, 0.2)', 'rgba(255,255,255, 0.2)'],
+		[3, 'rgba(0,0,0, 0.25)', 'rgba(255,255,255, 0.25)'],
+		[4, 'rgba(0,0,0, 0.3)', 'rgba(255,255,255, 0.3)'],
+		[5, 'rgba(0,0,0, 0.35)', 'rgba(255,255,255, 0.35)'],
+		[10, 'rgba(0,0,0, 0.4)', 'rgba(255,255,255, 0.4)']
 	];
 	for (const [threshold, light, dark] of [...thresholds]) {
 		expr = [
@@ -58,23 +60,25 @@ const makeArrowColor = (): maplibregl.ExpressionSpecification => {
 	return expr;
 };
 
+// Roughly halved from upstream (was 1.5–2.8) so arrows stay legible without
+// dominating the colour overlay.
 const makeArrowWidth = (): maplibregl.ExpressionSpecification => [
 	'case',
 	['boolean', ['>', ['to-number', ['get', 'value']], 20], false],
-	2.8,
+	1.3,
 	[
 		'case',
 		['boolean', ['>', ['to-number', ['get', 'value']], 10], false],
-		2.2,
+		1.1,
 		[
 			'case',
 			['boolean', ['>', ['to-number', ['get', 'value']], 5], false],
-			2,
+			1,
 			[
 				'case',
 				['boolean', ['>', ['to-number', ['get', 'value']], 3], false],
-				1.8,
-				['case', ['boolean', ['>', ['to-number', ['get', 'value']], 2], false], 1.6, 1.5]
+				0.9,
+				['case', ['boolean', ['>', ['to-number', ['get', 'value']], 2], false], 0.8, 0.7]
 			]
 		]
 	]

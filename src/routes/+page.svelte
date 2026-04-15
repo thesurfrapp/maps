@@ -158,7 +158,8 @@
 			clippingPanel?.initTerraDraw();
 
 			addOmFileLayers();
-			addPopup();
+			// Skip the click-to-show m/s popup in embed — RN owns the forecast UI.
+			if (!embed) addPopup();
 			changeOMfileURL();
 
 			rnBridgeCleanup = installRnBridge($map);

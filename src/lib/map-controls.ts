@@ -117,62 +117,55 @@ export const getStyle = async () => {
 				layer.layout = { ...(layer.layout ?? {}), visibility: 'none' };
 				continue;
 			}
-			// Country borders — both styles. `boundary_country_*` is dark;
-			// `boundary_2` is positron. Keep the upstream zoom-interpolated
-			// line-width so borders stay appropriately scaled; just force full
-			// white + opacity. Explicitly clear any dash pattern to solid.
+			// Country borders: bump color to white at full opacity. Also exclude
+			// maritime features — OpenMapTiles' admin_level=2 layer includes
+			// territorial-water / EEZ lines that draw weird offshore lines.
+			// (Width left alone — upstream uses wide casings at high zoom that
+			// blow up if we multiply.)
 			if (id.startsWith('boundary_country') || id === 'boundary_2') {
-				const upstreamWidth = layer.paint?.['line-width'];
 				layer.paint = {
 					...(layer.paint ?? {}),
 					'line-color': '#ffffff',
-					'line-opacity': 1,
-					// scale upstream width up by ~1.6x for visibility over weather
-					'line-width': Array.isArray(upstreamWidth)
-						? [
-								'interpolate',
-								['linear'],
-								['zoom'],
-								0,
-								1.5,
-								3,
-								2,
-								5,
-								2.5,
-								12,
-								4.5
-							]
-						: 2.5
+					'line-opacity': 1
 				};
-				// Ensure no dash pattern bleeds in
-				if ('line-dasharray' in (layer.paint as Record<string, unknown>)) {
-					delete (layer.paint as Record<string, unknown>)['line-dasharray'];
-				}
-				layer.layout = {
-					...(layer.layout ?? {}),
-					visibility: 'visible',
-					'line-cap': 'round',
-					'line-join': 'round'
+				const existing = layer.filter;
+				const noMaritime = ['!=', ['get', 'maritime'], 1] as unknown as maplibregl.FilterSpecification;
+				layer.filter = (
+					existing ? (['all', existing, noMaritime] as unknown) : noMaritime
+				) as maplibregl.FilterSpecification;
+			}
+
+			// Place labels (countries, states, cities, towns): white, no halo.
+			// Upstream's gray-with-halo reads muddy over our saturated weather
+			// raster; we keep the basemap minimal so labels can be flat colour.
+			if (src === 'place' && id.startsWith('place_')) {
+				layer.paint = {
+					...(layer.paint ?? {}),
+					'text-color': '#ffffff',
+					'text-halo-color': 'rgba(0,0,0,0)',
+					'text-halo-width': 0,
+					'text-halo-blur': 0
 				};
 			}
 		}
 
-		// Add a coastline layer. OpenMapTiles' `boundary_country_*` draws only
-		// land-land borders (e.g. USA-Canada), not coastlines — so in a dark basemap
-		// where land and ocean are both near-black, countries like Canada or Australia
-		// appear without any outline. Stroking the water polygon layer with a thin
-		// bright line gives us real coastlines + major lake rings.
+		// Coastline layer — strokes water polygons in white. Real coastlines
+		// (true land/water boundary). Restored after we removed it by mistake.
 		const hasOpenmaptiles = Boolean(style.sources?.openmaptiles);
 		if (hasOpenmaptiles && !style.layers.find((l: { id: string }) => l.id === 'surfr_coastline')) {
-			// Insert just after the water fill layer so the stroke sits on top of water
-			// but below all labels/borders.
 			const waterIdx = style.layers.findIndex((l: { id: string }) => l.id === 'water');
 			const coastline = {
 				id: 'surfr_coastline',
 				type: 'line',
 				source: 'openmaptiles',
 				'source-layer': 'water',
-				filter: ['all', ['==', ['geometry-type'], 'Polygon']],
+				// Only ocean polygons — exclude rivers / lakes / ponds so we
+				// trace true coastlines, not inland water rings.
+				filter: [
+					'all',
+					['==', ['geometry-type'], 'Polygon'],
+					['==', ['get', 'class'], 'ocean']
+				],
 				paint: {
 					'line-color': '#ffffff',
 					'line-opacity': 0.55,
