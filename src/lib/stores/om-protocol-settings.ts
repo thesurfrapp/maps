@@ -68,14 +68,22 @@ export const omProtocolSettings: Writable<OmProtocolSettings> = writable({
 	},
 
 	postReadCallback: (omFileReader: WeatherMapLayerFileReader, data: Data, state: OmUrlState) => {
-		const nextOmUrls = getNextOmUrls(state.omFileUrl, get(selectedDomain), get(metaJson));
-		for (const nextOmUrl of nextOmUrls) {
-			if (nextOmUrl === undefined) continue;
-			omFileReader.setToOmFile(nextOmUrl);
-			// This will trigger a request to the tail of the file and cache it
-			// Not requesting a real variable ensures that we don't request any additional data.
-			omFileReader.prefetchVariable('not_a_real_variable');
-		}
+		// PREFETCH DISABLED — the upstream behaviour was to fetch the
+		// prev/next-hour file index after each load (a `200 1KB` probe + a
+		// `206 ~65KB` end-of-file footer read). On a real network the footer
+		// fetch consistently took 7-8 s and remained in-flight on the same
+		// HTTP/2 connection. When the user clicked the next hour while it
+		// was still pending, their new range reads queued behind it,
+		// producing the visible ~10 s "second click is slow" effect.
+		// Trade-off: we lose the next-click "feels instant" benefit on
+		// slow scrubbing in exchange for predictable per-click latency on
+		// fast scrubbing. Re-enable + add AbortController if we want both.
+		// const nextOmUrls = getNextOmUrls(state.omFileUrl, get(selectedDomain), get(metaJson));
+		// for (const nextOmUrl of nextOmUrls) {
+		// 	if (nextOmUrl === undefined) continue;
+		// 	omFileReader.setToOmFile(nextOmUrl);
+		// 	omFileReader.prefetchVariable('not_a_real_variable');
+		// }
 		if (
 			state.dataOptions.domain.value === 'ecmwf_ifs' &&
 			state.dataOptions.variable === 'pressure_msl'
