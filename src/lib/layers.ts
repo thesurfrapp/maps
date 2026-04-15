@@ -295,8 +295,19 @@ export const createManagers = (): void => {
 		},
 		onError: () => loading.set(false),
 		slowLoadWarningMs: 10000,
-		onSlowLoad: () =>
-			toast.warning('Loading raster data might be limited by bandwidth or upstream server speed.')
+		onSlowLoad: () => {
+			toast.warning('Loading raster data might be limited by bandwidth or upstream server speed.');
+			// Forward to the RN host so the diagnostic timeline sees it.
+			try {
+				const rn = (window as unknown as { ReactNativeWebView?: { postMessage: (s: string) => void } })
+					.ReactNativeWebView;
+				rn?.postMessage(
+					JSON.stringify({ type: 'slowLoadWarning', t: Math.round(performance.now()) })
+				);
+			} catch {
+				/* noop */
+			}
+		}
 	});
 
 	vectorManager = new SlotManager(map, {
