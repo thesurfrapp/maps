@@ -27,7 +27,7 @@ type OutMsg =
 	| { type: 'timestampChanged'; time: string; t: number }
 	| { type: 'forecastLocationSet'; lat: number; lng: number; t: number }
 	| { type: 'referenceTime'; domain: string; referenceTime: string; t: number }
-	| { type: 'tileFetch'; url: string; status: number; ms: number; bytes: number; cache: string; range: string; t: number }
+	| { type: 'tileFetch'; url: string; status: number; ms: number; bytes: number; cache: string; range: string; upMs: number; t: number }
 	| { type: 'storageEstimate'; quotaMb: number; usageMb: number; cacheCount?: number; t: number }
 	// New: lifecycle events to attribute time-loss
 	| { type: 'setTimeReceived'; time: string; t: number }
@@ -168,6 +168,7 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 			const ms = Math.round(performance.now() - start);
 			const bytes = Number(res.headers.get('content-length')) || 0;
 			const cache = res.headers.get('x-surfr-cache-status') || '';
+			const upMs = Number(res.headers.get('x-surfr-upstream-ms')) || 0;
 			postToRN({
 				type: 'tileFetch',
 				url,
@@ -175,7 +176,8 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 				ms,
 				bytes,
 				cache,
-				range: rangeHdr
+				range: rangeHdr,
+				upMs
 			});
 			return res;
 		} catch (err) {
