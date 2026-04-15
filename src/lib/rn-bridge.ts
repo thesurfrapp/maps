@@ -17,6 +17,7 @@ type OutMsg =
 	| { type: 'ready' }
 	| { type: 'moveend'; lat: number; lng: number; zoom: number }
 	| { type: 'availableTimestamps'; timestamps: string[] }
+	| { type: 'availableVariables'; variables: string[] }
 	| { type: 'timestampChanged'; time: string }
 	| { type: 'forecastLocationSet'; lat: number; lng: number };
 
@@ -79,6 +80,12 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 	const unsubMeta = metaJson.subscribe((meta) => {
 		if (meta?.valid_times?.length) {
 			postToRN({ type: 'availableTimestamps', timestamps: meta.valid_times });
+		}
+		// Expose the per-model variable manifest so RN can disable unsupported
+		// overlay pills (rain / gusts on models that don't carry them).
+		const variables = (meta as { variables?: string[] } | undefined)?.variables;
+		if (Array.isArray(variables) && variables.length) {
+			postToRN({ type: 'availableVariables', variables });
 		}
 	});
 

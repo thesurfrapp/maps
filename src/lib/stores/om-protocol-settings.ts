@@ -55,13 +55,16 @@ export const omProtocolSettings: Writable<OmProtocolSettings> = writable({
 		cache: createBlockCache()
 	},
 
-	// dynamic (can be changed during runtime)
-	// Surfr overrides: `wind` is inherited by wind_speed_10m / wind_gusts_10m via the
-	// library's fallback resolution (styling.ts getOptionalColorScale).
+	// dynamic (can be changed during runtime).
+	// Order matters: persisted user customs are applied FIRST, then Surfr's
+	// scale is layered on top. This ensures `wind` always renders with the
+	// Surfr palette regardless of any localStorage residue from earlier
+	// dev sessions in the browser. (`wind` is inherited by wind_speed_10m /
+	// wind_gusts_10m via the library's fallback in styling.ts.)
 	colorScales: {
 		...defaultOmProtocolSettings.colorScales,
-		wind: surfrWindScale,
-		...initialCustomColorScales
+		...initialCustomColorScales,
+		wind: surfrWindScale
 	},
 
 	postReadCallback: (omFileReader: WeatherMapLayerFileReader, data: Data, state: OmUrlState) => {

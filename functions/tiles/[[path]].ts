@@ -13,9 +13,16 @@
 
 const UPSTREAM_HOST = 'https://map-tiles.open-meteo.com';
 
-// TTLs in seconds
-const OM_FILE_TTL = 60 * 60; // 60 minutes — bounded staleness between force-refreshes
-const JSON_INDEX_TTL = 60; // 1 minute — fresh model-run metadata
+// TTLs in seconds.
+// .om files get a long TTL because staleness is handled *actively* by the
+// `X-Surfr-Force-Refresh` warmer on a 6 h cron. Long TTL keeps the entry warm
+// indefinitely once any request has populated it, so the only remaining
+// cold-fetch window is "URL newly published by Open-Meteo, warmer hasn't
+// reached it yet" (≤30 min, our regular warmer interval).
+// JSON indexes stay short-TTL because clients need to discover new
+// reference_times promptly when a new model run publishes.
+const OM_FILE_TTL = 60 * 60 * 24; // 24 hours
+const JSON_INDEX_TTL = 60; // 1 minute
 const ERROR_404_TTL = 30;
 
 const FORCE_REFRESH_HEADER = 'X-Surfr-Force-Refresh';
