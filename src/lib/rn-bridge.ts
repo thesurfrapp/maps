@@ -15,15 +15,25 @@ import { domain, variable } from '$lib/stores/variables';
 
 import { formatISOWithoutTimezone, parseISOWithoutTimezone } from './time-format';
 
+// Every OutMsg gets stamped with `t` = ms since page load. Lets the RN host
+// reconstruct an accurate timeline (gaps between events tell us where wall
+// time goes — decode time, idle waits, render lag — that the per-event `ms`
+// alone can't reveal).
 type OutMsg =
-	| { type: 'ready' }
-	| { type: 'moveend'; lat: number; lng: number; zoom: number }
-	| { type: 'availableTimestamps'; timestamps: string[] }
-	| { type: 'availableVariables'; variables: string[] }
-	| { type: 'timestampChanged'; time: string }
-	| { type: 'forecastLocationSet'; lat: number; lng: number }
-	| { type: 'referenceTime'; domain: string; referenceTime: string }
-	| { type: 'tileFetch'; url: string; status: number; ms: number; bytes: number };
+	| { type: 'ready'; t: number }
+	| { type: 'moveend'; lat: number; lng: number; zoom: number; t: number }
+	| { type: 'availableTimestamps'; timestamps: string[]; t: number }
+	| { type: 'availableVariables'; variables: string[]; t: number }
+	| { type: 'timestampChanged'; time: string; t: number }
+	| { type: 'forecastLocationSet'; lat: number; lng: number; t: number }
+	| { type: 'referenceTime'; domain: string; referenceTime: string; t: number }
+	| { type: 'tileFetch'; url: string; status: number; ms: number; bytes: number; t: number }
+	// New: lifecycle events to attribute time-loss
+	| { type: 'setTimeReceived'; time: string; t: number }
+	| { type: 'setVariableReceived'; variable: string; t: number }
+	| { type: 'setDomainReceived'; domain: string; t: number }
+	| { type: 'mapDataLoading'; t: number }
+	| { type: 'mapIdle'; t: number };
 
 type InMsg =
 	| { type: 'setCenter'; lat: number; lng: number; zoom?: number }
@@ -40,11 +50,14 @@ declare global {
 	}
 }
 
-const postToRN = (msg: OutMsg): void => {
+// Loose typing on purpose — TS struggles with the OutMsg discriminated union
+// when stamping `t` after the fact. The OutMsg type above documents the wire
+// shape; runtime code just spreads + adds `t`.
+const postToRN = (msg: { type: string } & Record<string, unknown>): void => {
 	const rn = typeof window !== 'undefined' ? window.ReactNativeWebView : undefined;
 	if (!rn?.postMessage) return;
 	try {
-		rn.postMessage(JSON.stringify(msg));
+		rn.postMessage(JSON.stringify({ ...msg, t: Math.round(performance.now()) }));
 	} catch {
 		/* noop */
 	}
@@ -73,6 +86,20 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 		postToRN({ type: 'moveend', lat: c.lat, lng: c.lng, zoom: map.getZoom() });
 	}, 150);
 	map.on('moveend', onMoveEnd);
+
+	// Render-lifecycle markers. `dataloading` fires when MapLibre starts
+	// requesting a source's tiles; `idle` fires when all in-flight requests
+	// finished AND the canvas is repainted. The gap between the last setTime
+	// and the next `idle` is the user-perceived "scrub-to-paint" wall time.
+	let lastDataLoadingAt = 0;
+	const onDataLoading = () => {
+		const now = performance.now();
+		if (now - lastDataLoadingAt > 50) postToRN({ type: 'mapDataLoading' });
+		lastDataLoadingAt = now;
+	};
+	map.on('dataloading', onDataLoading);
+	const onIdle = () => postToRN({ type: 'mapIdle' });
+	map.on('idle', onIdle);
 
 	// A tap anywhere on the map sets a forecast location — RN listens and refreshes
 	// its model picker + ForecastTable for that point. Mirrors Windy's
@@ -156,12 +183,15 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 				});
 				break;
 			case 'setVariable':
+				postToRN({ type: 'setVariableReceived', variable: msg.variable });
 				if (get(variable) !== msg.variable) variable.set(msg.variable);
 				break;
 			case 'setDomain':
+				postToRN({ type: 'setDomainReceived', domain: msg.domain });
 				if (get(domain) !== msg.domain) domain.set(msg.domain);
 				break;
 			case 'setTime': {
+				postToRN({ type: 'setTimeReceived', time: msg.time });
 				// Mirror what the fork's own time-selector does: set the store
 				// AND call changeOMfileURL() — only domain + variable have their
 				// own subscriptions that re-fetch tiles; time doesn't.
@@ -202,6 +232,8 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 	return () => {
 		map.off('moveend', onMoveEnd);
 		map.off('click', onClick);
+		map.off('dataloading', onDataLoading);
+		map.off('idle', onIdle);
 		unsubMeta();
 		unsubTime();
 		window.removeEventListener('message', onWindowMessage);
