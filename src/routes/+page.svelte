@@ -47,6 +47,7 @@
 
 	import { checkHighDefinition } from '$lib/helpers';
 	import { addOmFileLayers, changeOMfileURL } from '$lib/layers';
+	import { installRnBridge, isEmbedMode } from '$lib/rn-bridge';
 	import { addTerrainSource, getStyle, setMapControlSettings } from '$lib/map-controls';
 	import { getInitialMetaData, getMetaData, matchVariableOrFirst } from '$lib/metadata';
 	import { addPopup } from '$lib/popup';
@@ -62,8 +63,12 @@
 
 	let mapContainer: HTMLElement | null;
 
+	let embed = $state(false);
+	let rnBridgeCleanup: (() => void) | undefined;
+
 	onMount(async () => {
 		$url = new URL(document.location.href);
+		embed = isEmbedMode();
 		urlParamsToPreferences();
 
 		// first time on load, check if monitor supports high definition, for increased tile size
@@ -115,21 +120,25 @@
 		});
 
 		$map.on('load', async () => {
-			$map.addControl(new DarkModeButton());
-			$map.addControl(new SettingsButton());
-			$map.addControl(new HelpButton());
-			$map.addControl(new ClippingButton());
+			if (!embed) {
+				$map.addControl(new DarkModeButton());
+				$map.addControl(new SettingsButton());
+				$map.addControl(new HelpButton());
+				$map.addControl(new ClippingButton());
+			}
 
 			if (getInitialMetaDataPromise) await getInitialMetaDataPromise;
 
 			addTerrainSource($map);
 			addTerrainSource($map, 'terrainSource2');
-			$map.addControl(new HillshadeButton());
+			if (!embed) $map.addControl(new HillshadeButton());
 			clippingPanel?.initTerraDraw();
 
 			addOmFileLayers();
 			addPopup();
 			changeOMfileURL();
+
+			rnBridgeCleanup = installRnBridge($map);
 		});
 	});
 
@@ -175,6 +184,7 @@
 	});
 
 	onDestroy(() => {
+		rnBridgeCleanup?.();
 		if ($map) {
 			$map.remove();
 		}
@@ -193,15 +203,17 @@
 
 <div class="map maplibregl-map" id="#map_container" bind:this={mapContainer}></div>
 
-<Scale />
-<VariableSelection />
 <ClippingPanel bind:this={clippingPanel} />
-<TimeSelector />
-<Settings />
-<HelpDialog />
-<KeyboardHandler />
-<Dropzone
-	ondrop={(features) => {
-		clippingPanel?.addImportedFeatures(features);
-	}}
-/>
+{#if !embed}
+	<Scale />
+	<VariableSelection />
+	<TimeSelector />
+	<Settings />
+	<HelpDialog />
+	<KeyboardHandler />
+	<Dropzone
+		ondrop={(features) => {
+			clippingPanel?.addImportedFeatures(features);
+		}}
+	/>
+{/if}

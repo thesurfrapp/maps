@@ -9,6 +9,7 @@ import { persisted } from 'svelte-persisted-store';
 
 import { browser } from '$app/environment';
 
+import { surfrWindScale } from '$lib/color-scales/surfr';
 import {
 	DEFAULT_CACHE_BLOCK_SIZE_KB,
 	DEFAULT_CACHE_MAX_BYTES_MB,
@@ -55,7 +56,13 @@ export const omProtocolSettings: Writable<OmProtocolSettings> = writable({
 	},
 
 	// dynamic (can be changed during runtime)
-	colorScales: { ...defaultOmProtocolSettings.colorScales, ...initialCustomColorScales },
+	// Surfr overrides: `wind` is inherited by wind_speed_10m / wind_gusts_10m via the
+	// library's fallback resolution (styling.ts getOptionalColorScale).
+	colorScales: {
+		...defaultOmProtocolSettings.colorScales,
+		wind: surfrWindScale,
+		...initialCustomColorScales
+	},
 
 	postReadCallback: (omFileReader: WeatherMapLayerFileReader, data: Data, state: OmUrlState) => {
 		const nextOmUrls = getNextOmUrls(state.omFileUrl, get(selectedDomain), get(metaJson));
