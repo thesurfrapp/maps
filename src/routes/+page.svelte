@@ -78,6 +78,20 @@
 		$url = new URL(document.location.href);
 		embed = isEmbedMode();
 
+		// Optional ?clearCache=1 wipes the BrowserBlockCache before the library
+		// initialises so we can A/B test cold-start performance from a known
+		// baseline. Used during diagnostics — RN passes this on every embed
+		// load to make every test cold (apples-to-apples comparison).
+		if ($url.searchParams.get('clearCache') === '1') {
+			try {
+				const keys = await caches.keys();
+				for (const k of keys) await caches.delete(k);
+				console.log('[fork] cleared', keys.length, 'cache(s):', keys);
+			} catch (err) {
+				console.warn('[fork] clearCache failed:', err);
+			}
+		}
+
 		// Optional ?theme=dark|light|system override. Used by the RN WebView
 		// so the embed matches the host app's theme regardless of the iOS
 		// simulator's / Android device's system appearance.
