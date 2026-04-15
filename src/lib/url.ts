@@ -214,7 +214,11 @@ export const getNextOmUrls = (
 	domain: Domain,
 	metaJson: DomainMetaDataJson | undefined
 ): [string | undefined, string | undefined] => {
-	const base = `https://map-tiles.open-meteo.com/data_spatial/${domain.value}`;
+	// IMPORTANT: route through our proxy (`getBaseUri`) so prefetched adjacent
+	// timestamps go through CF edge cache + our warmer-populated entries.
+	// Hardcoding upstream here was the upstream default; we route everything
+	// via the proxy via `helpers.ts:getBaseUri()`.
+	const base = `${getBaseUri(domain.value)}/data_spatial/${domain.value}`;
 	const date = get(time);
 	const dateString = formatISOUTCWithZ(date);
 
