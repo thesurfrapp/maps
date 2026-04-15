@@ -24,7 +24,11 @@ const OM_FILE_TTL = 60 * 60 * 24 * 30; // 30 days — URLs are immutable, cache 
 const META_JSON_TTL = 60 * 60 * 24 * 30; // 30 days — per-run metadata, immutable.
 const LATEST_JSON_TTL = 60 * 5; // 5 min — long enough that clients lag the warmer.
 const IN_PROGRESS_JSON_TTL = 30; // 30 s — reflects a run still being written.
-const ERROR_404_TTL = 30;
+// 404s on .om URLs mean "this forecast hour is beyond this run's horizon".
+// The horizon doesn't change within a run, so we can safely cache the 404 for
+// as long as the run itself lives. Keeps repeated out-of-horizon probes fast
+// even though RN should already be gating them via useMapValidTimes.
+const ERROR_404_TTL = 60 * 60; // 1 hour
 
 const FORCE_REFRESH_HEADER = 'X-Surfr-Force-Refresh';
 // Fire-and-forget cache warming. When set on a request, the proxy kicks off
