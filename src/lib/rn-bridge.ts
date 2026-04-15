@@ -55,12 +55,28 @@ declare global {
 // when stamping `t` after the fact. The OutMsg type above documents the wire
 // shape; runtime code just spreads + adds `t`.
 const postToRN = (msg: { type: string } & Record<string, unknown>): void => {
+	const t = Math.round(performance.now());
+	const stamped = { ...msg, t };
 	const rn = typeof window !== 'undefined' ? window.ReactNativeWebView : undefined;
-	if (!rn?.postMessage) return;
-	try {
-		rn.postMessage(JSON.stringify({ ...msg, t: Math.round(performance.now()) }));
-	} catch {
-		/* noop */
+	if (rn?.postMessage) {
+		try {
+			rn.postMessage(JSON.stringify(stamped));
+		} catch {
+			/* noop */
+		}
+	}
+	// Mirror to browser console so the same diagnostics show up when testing
+	// the embed directly in a browser tab (no RN host present). Compact format
+	// so the console doesn't get unreadable.
+	if (typeof console !== 'undefined') {
+		const { type, ...rest } = stamped;
+		const restStr = Object.keys(rest).length
+			? ' ' +
+				Object.entries(rest)
+					.map(([k, v]) => `${k}=${typeof v === 'object' ? JSON.stringify(v) : v}`)
+					.join(' ')
+			: '';
+		console.log(`[bridge] ${type}${restStr}`);
 	}
 };
 
