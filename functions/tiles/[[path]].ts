@@ -1,68 +1,77 @@
-// Cloudflare Pages Function — tile proxy with edge caching.
+// Cloudflare Pages Function — tile proxy with **explicit** Cache API caching.
 //
 // Forwards GET/HEAD/OPTIONS for `/tiles/<anything>` to
 //   https://map-tiles.open-meteo.com/<anything>
-// with `cacheEverything: true` so the first request fills the CF edge cache and
-// all subsequent requests (including Range-partial reads) are served locally.
 //
-// Cache-lifetime model (key facts):
-//   * `.om` files — immutable per `(domain, reference_time, forecast_time)`.
-//     A new model run always produces new URLs; existing URLs never get
-//     content updates. Safe to cache ~forever.
-//   * `meta.json` — produced once per model run; immutable after publish.
-//   * `latest.json` — the ONLY moving piece: its `reference_time` field flips
-//     when a new model run publishes. Deliberately kept at a medium TTL so
-//     clients lag behind the warmer — i.e. we want clients to still be reading
-//     the old reference_time while the warmer discovers and pre-warms the new
-//     run's URLs. Force-refresh (X-Surfr-Force-Refresh: 1) lets the warmer
-//     evict `latest.json` atomically after warming completes.
+// Why explicit Cache API instead of `cf.cacheEverything: true`:
+//   * `cf.cacheEverything` works but uses an opaque internal cache key that
+//     `caches.default.match()` cannot peek at. We can never know HIT/MISS from
+//     within the Worker.
+//   * Managing the cache ourselves with `caches.default.{match,put,delete}`
+//     gives us a single, deterministic cache key (the upstream URL) and means
+//     `match()` actually returns what we stored. Reliable HIT/MISS visibility.
+//
+// Cache-lifetime model:
+//   * `.om` files — immutable per (domain, reference_time, forecast_time).
+//     Cache 30 days.
+//   * `meta.json` — per-run, immutable after publish. Cache 30 days.
+//   * `latest.json` — flips when a new model run publishes. 5 min so clients
+//     lag the warmer (warmer warms new run, then explicitly refreshes
+//     latest.json via X-Surfr-Force-Refresh).
+//   * `in-progress.json` — short TTL (30s) to track a writing run.
+//   * 404s — 1 hour (horizon doesn't change within a run).
+//
+// Range handling:
+//   * We fetch the FULL response from upstream (no Range header) when caching.
+//     CF's edge cache stores the complete 200 response.
+//   * Client Range requests get sliced from the cached full body. This is what
+//     makes warmer-time investment pay off — one cache fill serves any range.
 
 const UPSTREAM_HOST = 'https://map-tiles.open-meteo.com';
 
-// TTLs in seconds.
-const OM_FILE_TTL = 60 * 60 * 24 * 30; // 30 days — URLs are immutable, cache as long as CF keeps it.
-const META_JSON_TTL = 60 * 60 * 24 * 30; // 30 days — per-run metadata, immutable.
-const LATEST_JSON_TTL = 60 * 5; // 5 min — long enough that clients lag the warmer.
-const IN_PROGRESS_JSON_TTL = 30; // 30 s — reflects a run still being written.
-// 404s on .om URLs mean "this forecast hour is beyond this run's horizon".
-// The horizon doesn't change within a run, so we can safely cache the 404 for
-// as long as the run itself lives. Keeps repeated out-of-horizon probes fast
-// even though RN should already be gating them via useMapValidTimes.
-const ERROR_404_TTL = 60 * 60; // 1 hour
+const OM_FILE_TTL = 60 * 60 * 24 * 30;
+const META_JSON_TTL = 60 * 60 * 24 * 30;
+const LATEST_JSON_TTL = 60 * 5;
+const IN_PROGRESS_JSON_TTL = 30;
+const ERROR_404_TTL = 60 * 60;
 
 const FORCE_REFRESH_HEADER = 'X-Surfr-Force-Refresh';
-// Fire-and-forget cache warming. When set on a request, the proxy kicks off
-// the upstream fetch with cacheEverything + drain-via-waitUntil, and returns
-// 202 immediately so the caller (our warmer) doesn't need to hold a
-// potentially multi-hundred-MB stream open. CF continues the cache fill in
-// the background.
 const WARM_HEADER = 'X-Surfr-Warm';
 
 const corsHeaders = {
 	'Access-Control-Allow-Origin': '*',
 	'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
 	'Access-Control-Allow-Headers': `Range, If-Match, If-None-Match, If-Modified-Since, ${FORCE_REFRESH_HEADER}, ${WARM_HEADER}`,
-	// Expose our X-Surfr-Cache-Status header so the RN host can read it from
-	// `res.headers.get(...)` for diagnostics. Without this, CORS hides custom
-	// response headers from the client.
 	'Access-Control-Expose-Headers':
 		'ETag, Content-Range, Content-Length, Accept-Ranges, X-Surfr-Cache-Status, X-Surfr-Refreshed',
 	'Access-Control-Max-Age': '3000'
 };
 
-// Pick the TTL for a given upstream path. The path shape is:
-//   /data_spatial/{domain}/{YYYY}/{MM}/{DD}/{HHmm}Z/{forecastTime}.om
-//   /data_spatial/{domain}/latest.json
-//   /data_spatial/{domain}/in-progress.json
-//   /data_spatial/{domain}/{YYYY}/{MM}/{DD}/{HHmm}Z/meta.json
 const pickTtl = (path: string): number => {
 	if (path.endsWith('.om')) return OM_FILE_TTL;
 	if (path.endsWith('/latest.json')) return LATEST_JSON_TTL;
 	if (path.endsWith('/in-progress.json')) return IN_PROGRESS_JSON_TTL;
 	if (path.endsWith('/meta.json')) return META_JSON_TTL;
-	// Unknown .json or asset — short but non-zero.
 	return LATEST_JSON_TTL;
 };
+
+// Parse a `Range: bytes=A-B` header into [start, end] inclusive. Returns null
+// if no range or invalid.
+function parseRange(header: string | null, totalSize: number): [number, number] | null {
+	if (!header) return null;
+	const m = /^bytes=(\d+)-(\d*)$/.exec(header);
+	if (!m) return null;
+	const start = Number(m[1]);
+	const end = m[2] ? Number(m[2]) : totalSize - 1;
+	if (Number.isNaN(start) || Number.isNaN(end) || start > end) return null;
+	return [Math.max(0, start), Math.min(end, totalSize - 1)];
+}
+
+// Fetch the full upstream response (no Range header) so the cache stores the
+// complete file. Future Range requests slice from this.
+async function fetchUpstreamFull(upstreamUrl: string): Promise<Response> {
+	return fetch(upstreamUrl);
+}
 
 export const onRequest: PagesFunction = async (context) => {
 	const { request } = context;
@@ -76,100 +85,110 @@ export const onRequest: PagesFunction = async (context) => {
 
 	const url = new URL(request.url);
 	const upstreamPath = url.pathname.replace(/^\/tiles/, '') || '/';
-	// Strip query params when talking to upstream/CF cache. `.om` URLs append
-	// `?variable=wind_speed_10m` (and similar) purely as client-side metadata
-	// — the .om binary contains every variable and S3 ignores the query.
-	// Without stripping, every variable-flavour hits a different CF cache
-	// entry, so our warmer (which omits the query) never covers the library's
-	// real fetches. Converging on a single no-query cache key makes warmer and
-	// library share the same edge entry.
+	// Strip query params — `.om` URLs append `?variable=...` purely as
+	// client-side metadata. The .om binary contains every variable, S3 ignores
+	// the query, and stripping converges all variants on one cache key so the
+	// warmer's URL matches what the library fetches.
 	const upstreamUrl = `${UPSTREAM_HOST}${upstreamPath}`;
 
 	const ttl = pickTtl(upstreamPath);
 	const forceRefresh = request.headers.get(FORCE_REFRESH_HEADER) === '1';
 	const warm = request.headers.get(WARM_HEADER) === '1';
 
-	// Fire-and-forget warming path. The warmer calls us with this header to
-	// prime CF's edge cache without having to stream the full upstream body.
-	// We kick off the fetch + drain via waitUntil and return immediately.
+	// Cache key — same shape regardless of Range header so we always hit the
+	// full cached entry and slice as needed.
+	const cacheKey = new Request(upstreamUrl, { method: 'GET' });
+	const cache = caches.default;
+
+	// ──── Force-refresh path ────────────────────────────────────────────────
+	if (forceRefresh) {
+		await cache.delete(cacheKey).catch(() => {});
+	}
+
+	// ──── Fire-and-forget warming path ──────────────────────────────────────
+	// Warmer sends X-Surfr-Warm: 1 + no Range. We fetch full upstream + put
+	// in cache via waitUntil and return 202 immediately so the warmer doesn't
+	// hold the connection.
 	if (warm) {
-		const cachePromise = (async () => {
-			try {
-				if (forceRefresh) {
-					await caches.default.delete(upstreamUrl).catch(() => {});
+		context.waitUntil(
+			(async () => {
+				try {
+					const up = await fetchUpstreamFull(upstreamUrl);
+					if (!up.ok && up.status !== 404) return;
+					const cached = new Response(up.body, {
+						status: up.status,
+						headers: { 'Cache-Control': `public, max-age=${ttl}` }
+					});
+					await cache.put(cacheKey, cached);
+				} catch {
+					/* noop */
 				}
-				const up = await fetch(upstreamUrl, {
-					cf: {
-						cacheEverything: true,
-						cacheTtl: ttl,
-						cacheTtlByStatus: { '200-299': ttl, '404': ERROR_404_TTL, '500-599': 0 }
-					}
-				});
-				// Must drain the body for CF to finish populating the cache entry.
-				if (up.body) await up.body.pipeTo(new WritableStream());
-			} catch {
-				/* noop */
-			}
-		})();
-		context.waitUntil(cachePromise);
+			})()
+		);
 		return new Response(null, { status: 202, headers: corsHeaders });
 	}
 
-	// Forward relevant headers only. Range is critical (the Open-Meteo client
-	// does byte-range reads into large .om files).
-	const upstreamHeaders = new Headers();
-	const range = request.headers.get('Range');
-	if (range) upstreamHeaders.set('Range', range);
-	const ifNoneMatch = request.headers.get('If-None-Match');
-	if (ifNoneMatch) upstreamHeaders.set('If-None-Match', ifNoneMatch);
-	const ifModifiedSince = request.headers.get('If-Modified-Since');
-	if (ifModifiedSince) upstreamHeaders.set('If-Modified-Since', ifModifiedSince);
+	// ──── Normal client request path ───────────────────────────────────────
+	let cacheStatus: 'HIT' | 'MISS' = 'MISS';
+	let cached = await cache.match(cacheKey).catch(() => null);
 
-	// Diagnostic: peek into the edge cache BEFORE the fetch to determine
-	// hit/miss, so we can emit X-Surfr-Cache-Status in the response. We use
-	// `ignoreMethod: true` so HEAD requests share the same cache key as GET.
-	// Note: this is best-effort. CF's `cacheEverything: true` may use a
-	// slightly different internal key from `caches.default.match`, so an
-	// occasional false MISS is possible — but a HIT here is always reliable.
-	const cacheCheckKey = new Request(upstreamUrl, { method: 'GET' });
-	const peeked = await caches.default.match(cacheCheckKey).catch(() => null);
-	const cacheStatus = peeked ? 'HIT' : 'MISS';
+	if (!cached) {
+		// Miss → fetch full from upstream, store in cache, then serve.
+		const up = await fetchUpstreamFull(upstreamUrl);
+		// Build a cacheable response: keep status + body, set our Cache-Control.
+		const headers = new Headers();
+		headers.set('Cache-Control', `public, max-age=${up.status === 404 ? ERROR_404_TTL : ttl}`);
+		// Preserve a few useful upstream headers
+		const ct = up.headers.get('content-type');
+		if (ct) headers.set('Content-Type', ct);
+		const etag = up.headers.get('etag');
+		if (etag) headers.set('ETag', etag);
+		const lm = up.headers.get('last-modified');
+		if (lm) headers.set('Last-Modified', lm);
 
-	// Force-refresh path: evict the existing edge entry *before* the fetch. The
-	// fetch below uses `cacheEverything: true` which — after our delete — will
-	// miss, pull fresh from origin, and repopulate the edge cache automatically.
-	if (forceRefresh) {
-		await caches.default.delete(upstreamUrl).catch(() => {});
+		// Read the full body so we can store and slice. For .om files this is
+		// 30-200 MB — fine in Worker memory for one request, freed after.
+		const buf = await up.arrayBuffer();
+		const toCache = new Response(buf, { status: up.status, headers });
+		// waitUntil so cache write doesn't delay the user response.
+		context.waitUntil(cache.put(cacheKey, toCache.clone()).catch(() => {}));
+		cached = toCache;
+	} else {
+		cacheStatus = 'HIT';
 	}
 
-	const upstream = await fetch(upstreamUrl, {
-		method: request.method,
-		headers: upstreamHeaders,
-		cf: {
-			cacheEverything: true,
-			cacheTtl: ttl,
-			cacheTtlByStatus: {
-				'200-299': ttl,
-				'404': ERROR_404_TTL,
-				'500-599': 0
-			}
+	// Build the outgoing response. Honor Range if the client asked for one
+	// AND the cached entry is a full 200.
+	const outHeaders = new Headers();
+	for (const [k, v] of Object.entries(corsHeaders)) outHeaders.set(k, v);
+	outHeaders.set('Cache-Control', `public, max-age=${ttl}`);
+	outHeaders.set('X-Surfr-Cache-Status', forceRefresh ? 'BYPASS' : cacheStatus);
+	if (forceRefresh) outHeaders.set('X-Surfr-Refreshed', '1');
+	const ct = cached.headers.get('content-type');
+	if (ct) outHeaders.set('Content-Type', ct);
+
+	const rangeHeader = request.headers.get('Range');
+	if (rangeHeader && cached.status === 200) {
+		const buf = await cached.arrayBuffer();
+		const range = parseRange(rangeHeader, buf.byteLength);
+		if (range) {
+			const [start, end] = range;
+			const slice = buf.slice(start, end + 1);
+			outHeaders.set('Content-Range', `bytes ${start}-${end}/${buf.byteLength}`);
+			outHeaders.set('Content-Length', String(end - start + 1));
+			outHeaders.set('Accept-Ranges', 'bytes');
+			return new Response(slice, { status: 206, statusText: 'Partial Content', headers: outHeaders });
 		}
-	});
-
-	const headers = new Headers(upstream.headers);
-	for (const [k, v] of Object.entries(corsHeaders)) headers.set(k, v);
-	headers.set('Cache-Control', `public, max-age=${ttl}`);
-	// HIT/MISS reflects the state BEFORE this request was served. After a MISS
-	// we also populate the cache via cacheEverything, so the *next* request for
-	// the same URL should report HIT.
-	headers.set('X-Surfr-Cache-Status', forceRefresh ? 'BYPASS' : cacheStatus);
-	if (forceRefresh) {
-		headers.set('X-Surfr-Refreshed', '1');
 	}
 
-	return new Response(upstream.body, {
-		status: upstream.status,
-		statusText: upstream.statusText,
-		headers
-	});
+	// HEAD: no body, full headers (with content-length from cached body).
+	if (request.method === 'HEAD') {
+		const buf = await cached.arrayBuffer();
+		outHeaders.set('Content-Length', String(buf.byteLength));
+		outHeaders.set('Accept-Ranges', 'bytes');
+		return new Response(null, { status: cached.status, headers: outHeaders });
+	}
+
+	// Non-range GET: clone body so we can return it.
+	return new Response(cached.body, { status: cached.status, headers: outHeaders });
 };
