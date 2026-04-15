@@ -62,6 +62,29 @@ export const tileSizeSet = persisted('tile-size-set', false);
 
 export const opacity = persisted('opacity', DEFAULT_OPACITY);
 
+// Display timezone for the timeline labels. Stored as an IANA name (e.g.
+// "Europe/Amsterdam") plus a literal 'UTC' fallback. Defaults to the viewer's
+// browser timezone on first load; persists their choice thereafter.
+// In the RN embed this can be overridden via URL param / bridge to the
+// location's timezone, but the store name stays the same.
+const detectBrowserTz = (): string => {
+	if (typeof Intl !== 'undefined') {
+		try {
+			return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+		} catch {
+			/* fall through */
+		}
+	}
+	return 'UTC';
+};
+
+export const displayTimezone = persisted<string>('display-timezone', detectBrowserTz());
+
+// Legacy alias — derived store driving the offset used by the timeline. Kept
+// as a separate writable so the embed path (URL param / bridge) can override
+// it directly without going through an IANA name.
+export const displayTzOffsetSeconds = writable(0);
+
 export { cacheBlockSizeKb, cacheMaxBytesMb } from './om-protocol-settings';
 
 export const localStorageVersion: Persisted<string | undefined> = persisted(

@@ -19,6 +19,8 @@
 	import { omProtocolSettings } from '$lib/stores/om-protocol-settings';
 	import {
 		loading,
+		displayTimezone,
+		displayTzOffsetSeconds,
 		localStorageVersion,
 		opacity,
 		resetStates,
@@ -49,6 +51,9 @@
 	import { setMode } from 'mode-watcher';
 
 	import { checkHighDefinition } from '$lib/helpers';
+	import { initSurfrSpots, setSurfrSpotsConfig } from '$lib/surfr-spots';
+	import { getIanaOffsetSeconds } from '$lib/time-format';
+	import TimezoneSelector from '$lib/components/timezone/TimezoneSelector.svelte';
 	import { addOmFileLayers, changeOMfileURL } from '$lib/layers';
 	import { installRnBridge, isEmbedMode } from '$lib/rn-bridge';
 	import { addTerrainSource, getStyle, setMapControlSettings } from '$lib/map-controls';
@@ -87,6 +92,26 @@
 		if (opacityParam) {
 			const n = Number(opacityParam);
 			if (Number.isFinite(n)) opacity.set(Math.max(0, Math.min(100, n)));
+		}
+
+		// Optional ?tz_offset_seconds=N — RN override for the display timezone
+		// (passes the spot's utc_offset_seconds). When absent, standalone web
+		// falls back to the user's chosen displayTimezone from localStorage.
+		const tzParam = $url.searchParams.get('tz_offset_seconds');
+		if (tzParam) {
+			const n = Number(tzParam);
+			if (Number.isFinite(n)) displayTzOffsetSeconds.set(n);
+		} else {
+			// Compute from the persisted IANA name, DST-aware for "now".
+			displayTzOffsetSeconds.set(getIanaOffsetSeconds(get(displayTimezone)));
+		}
+
+		// Optional Surfr spots layer config — RN supplies backend URL + auth
+		// token via URL params (and can refresh via bridge). Unset → no spots.
+		const spotsEndpoint = $url.searchParams.get('spots_endpoint');
+		const spotsToken = $url.searchParams.get('spots_token');
+		if (spotsEndpoint && spotsToken) {
+			setSurfrSpotsConfig({ endpoint: spotsEndpoint, token: spotsToken });
 		}
 
 		urlParamsToPreferences();
@@ -162,6 +187,8 @@
 			if (!embed) addPopup();
 			changeOMfileURL();
 
+			initSurfrSpots($map);
+
 			rnBridgeCleanup = installRnBridge($map);
 		});
 	});
@@ -231,6 +258,11 @@
 {#if !embed}
 	<Scale />
 	<VariableSelection />
+	<!-- Timezone selector sits below the domain/variable stack in the top-left,
+	     same width and glass-blur style so they read as one control column. -->
+	<div class="tz-stack">
+		<TimezoneSelector />
+	</div>
 	<TimeSelector />
 	<Settings />
 	<HelpDialog />
@@ -241,3 +273,16 @@
 		}}
 	/>
 {/if}
+
+<style>
+	.tz-stack {
+		/* Anchored so it lands just under the variable-selection button stack,
+		   which starts at top-2.5 (10px). The variable stack holds up to 3
+		   buttons (domain, variable, optional level) at h-7.25 (~29px) with
+		   gap-2.5 (10px), so the next row sits at roughly 10 + 3*(29+10). */
+		position: absolute;
+		top: 137px;
+		left: 0.625rem;
+		z-index: 70;
+	}
+</style>

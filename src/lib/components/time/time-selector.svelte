@@ -26,17 +26,22 @@
 	import { changeOMfileURL } from '$lib/layers';
 	import { getMetaData } from '$lib/metadata';
 	import {
+		formatDisplayDate,
+		formatDisplayDateTime,
+		formatDisplayTime,
 		formatISOWithoutTimezone,
-		formatLocalDate,
 		formatLocalTime,
 		formatUTCDate,
 		formatUTCDateTime,
 		formatUTCOffset,
 		formatUTCTime,
+		getDisplayDate,
+		getDisplayMonth,
 		isValidTimeStep,
-		startOfLocalDay,
-		withLocalTime
+		startOfDisplayDay,
+		withDisplayTime
 	} from '$lib/time-format';
+	import { displayTzOffsetSeconds } from '$lib/stores/preferences';
 	import { findTimeStep } from '$lib/time-utils';
 	import { updateUrl } from '$lib/url';
 
@@ -409,13 +414,16 @@
 		const dates: string[] = [];
 		if (timeSteps) {
 			for (const timeStep of timeSteps) {
-				let monthIndex = timeStep.getMonth();
-				let date = timeStep.getDate();
+				// Day grouping in the display timezone (location's TZ in embed,
+				// UTC in standalone) so timeline ticks line up with a viewer's
+				// understanding of "a day".
+				let monthIndex = getDisplayMonth(timeStep, $displayTzOffsetSeconds);
+				let date = getDisplayDate(timeStep, $displayTzOffsetSeconds);
 				if (dates.includes(`${monthIndex}-${date}`)) {
 					continue;
 				} else {
 					dates.push(`${monthIndex}-${date}`);
-					days.push(startOfLocalDay(timeStep));
+					days.push(startOfDisplayDay(timeStep, $displayTzOffsetSeconds));
 				}
 			}
 		}
@@ -429,10 +437,10 @@
 			for (let i = 0; i <= 23; i++) {
 				if (metaFirstResolutionHours === 0.25) {
 					for (let j = 0; j < 60; j += 15) {
-						timeStepsComplete.push(withLocalTime(day, i, j));
+						timeStepsComplete.push(withDisplayTime(day, i, $displayTzOffsetSeconds, j));
 					}
 				} else {
-					timeStepsComplete.push(withLocalTime(day, i));
+					timeStepsComplete.push(withDisplayTime(day, i, $displayTzOffsetSeconds));
 				}
 			}
 		}
@@ -770,11 +778,11 @@
 							{#if currentTimeStep}
 								{#if desktop.current}
 									<div class="font-bold">
-										{formatLocalTime(currentTimeStep!)}
+										{formatDisplayTime(currentTimeStep!, $displayTzOffsetSeconds)}
 									</div>
 								{:else}
 									<div class={$time.getTime() === currentDate.getTime() ? 'font-bold' : ''}>
-										{formatLocalTime(currentDate)}
+										{formatDisplayTime(currentDate, $displayTzOffsetSeconds)}
 									</div>
 								{/if}
 							{/if}
@@ -981,17 +989,9 @@
 		<div
 			class="time-selector md:px-0 h-20 md:h-12.5 relative bg-glass/75 backdrop-blur-sm duration-500"
 		>
-			{#if hoverX || currentDate.getTime() !== $time.getTime()}
-				<div
-					transition:fade={{ duration: 300 }}
-					class="absolute {desktop.current ? '-left-6' : 'left-1.75'} -top-5 text-xs p-1"
-				>
-					UTC{formatUTCOffset($now)}
-					{#if desktop.current}
-						{Intl.DateTimeFormat().resolvedOptions().timeZone}
-					{/if}
-				</div>
-			{/if}
+			<!-- (Removed the "UTC+HH:MM <browser-tz>" badge that used to sit above
+			     the timeline — it duplicated info from the TimezoneSelector in
+			     the top-left and confused users who now have a dropdown.) -->
 			<div
 				class="absolute {!desktop.current
 					? 'pointer-events-none'
@@ -1057,9 +1057,9 @@
 								class="absolute flex mt-10 md:mt-3.25 -translate-x-1/2 left-1/2 items-center justify-center text-center flex-col"
 							>
 								<div class="">{DAY_NAMES[dayStep.getDay()]}</div>
-								<small class="-mt-2">{formatLocalDate(dayStep)}</small>
+								<small class="-mt-2">{formatDisplayDate(dayStep, $displayTzOffsetSeconds)}</small>
 							</div>
-							{#if dayStep.getDate() === $now.getDate()}
+							{#if getDisplayDate(dayStep, $displayTzOffsetSeconds) === getDisplayDate($now, $displayTzOffsetSeconds) && getDisplayMonth(dayStep, $displayTzOffsetSeconds) === getDisplayMonth($now, $displayTzOffsetSeconds)}
 								<div
 									style="left: {dayWidth *
 										(($now.getTime() - dayStep.getTime()) /

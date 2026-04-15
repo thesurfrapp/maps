@@ -61,6 +61,116 @@ export const startOfLocalDay = (date: Date): SvelteDate => {
 	return day;
 };
 
+/** Start of UTC day — same moment for every viewer regardless of timezone. */
+export const startOfUTCDay = (date: Date): SvelteDate => {
+	const day = new SvelteDate(date);
+	day.setUTCHours(0, 0, 0, 0);
+	return day;
+};
+
+/** Create a Date with the given hour/minute in UTC. */
+export const withUTCTime = (date: Date, hour: number, minute = 0): SvelteDate => {
+	const next = new SvelteDate(date);
+	next.setUTCHours(hour, minute, 0, 0);
+	return next;
+};
+
+// =============================================================================
+// Display-timezone helpers — shift-by-offset trick.
+// A "display" time is the true UTC moment shifted by `offsetSeconds`; we then
+// read UTC components to get the value as it reads in the target timezone.
+// Internally all Date objects remain UTC ms-epochs; these helpers only affect
+// what the user sees on the timeline.
+// =============================================================================
+
+/** Shift a UTC Date forward by the offset so UTC getters read the target-TZ value. */
+const toShifted = (date: Date, offsetSeconds: number): Date =>
+	new Date(date.getTime() + (offsetSeconds || 0) * 1000);
+
+/** Unshift back to the true UTC moment. */
+const fromShifted = (shifted: Date, offsetSeconds: number): SvelteDate =>
+	new SvelteDate(shifted.getTime() - (offsetSeconds || 0) * 1000);
+
+/** Start of the day in the display timezone, as a true UTC Date. */
+export const startOfDisplayDay = (date: Date, offsetSeconds: number): SvelteDate => {
+	const shifted = toShifted(date, offsetSeconds);
+	shifted.setUTCHours(0, 0, 0, 0);
+	return fromShifted(shifted, offsetSeconds);
+};
+
+/** Create a Date representing the given hour/minute of the target-TZ day. */
+export const withDisplayTime = (
+	date: Date,
+	hour: number,
+	offsetSeconds: number,
+	minute = 0
+): SvelteDate => {
+	const shifted = toShifted(date, offsetSeconds);
+	shifted.setUTCHours(hour, minute, 0, 0);
+	return fromShifted(shifted, offsetSeconds);
+};
+
+/** Format as DD-MM in the display timezone. */
+export const formatDisplayDate = (date: Date, offsetSeconds: number): string => {
+	const d = toShifted(date, offsetSeconds);
+	return `${pad(d.getUTCDate())}-${pad(d.getUTCMonth() + 1)}`;
+};
+
+/** Format as HH:MM in the display timezone. */
+export const formatDisplayTime = (date: Date, offsetSeconds: number): string => {
+	const d = toShifted(date, offsetSeconds);
+	return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+};
+
+/** Format as DD-MM HH:MM in the display timezone. */
+export const formatDisplayDateTime = (date: Date, offsetSeconds: number): string =>
+	`${formatDisplayDate(date, offsetSeconds)} ${formatDisplayTime(date, offsetSeconds)}`;
+
+/** getDate() in the display timezone. */
+export const getDisplayDate = (date: Date, offsetSeconds: number): number =>
+	toShifted(date, offsetSeconds).getUTCDate();
+
+/** getMonth() in the display timezone. */
+export const getDisplayMonth = (date: Date, offsetSeconds: number): number =>
+	toShifted(date, offsetSeconds).getUTCMonth();
+
+/**
+ * Compute the offset in seconds between UTC and an IANA timezone at a given
+ * moment. DST-aware via Intl.DateTimeFormat. Returns 0 for 'UTC' and for any
+ * invalid tz.
+ */
+export const getIanaOffsetSeconds = (tz: string, at: Date = new Date()): number => {
+	if (!tz || tz === 'UTC') return 0;
+	try {
+		const dtf = new Intl.DateTimeFormat('en-US', {
+			timeZone: tz,
+			year: 'numeric',
+			month: '2-digit',
+			day: '2-digit',
+			hour: '2-digit',
+			minute: '2-digit',
+			second: '2-digit',
+			hour12: false
+		});
+		const map: Record<string, string> = {};
+		for (const part of dtf.formatToParts(at)) {
+			if (part.type !== 'literal') map[part.type] = part.value;
+		}
+		const hour = map.hour === '24' ? 0 : Number(map.hour);
+		const asUtc = Date.UTC(
+			Number(map.year),
+			Number(map.month) - 1,
+			Number(map.day),
+			hour,
+			Number(map.minute),
+			Number(map.second)
+		);
+		return Math.round((asUtc - at.getTime()) / 1000);
+	} catch {
+		return 0;
+	}
+};
+
 /**
  * Creates a new date with specified local time
  * @param date - The base date to use

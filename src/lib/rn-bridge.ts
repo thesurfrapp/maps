@@ -7,7 +7,9 @@ import { get } from 'svelte/store';
 import type * as maplibregl from 'maplibre-gl';
 
 import { changeOMfileURL } from '$lib/layers';
+import { setSurfrSpotsConfig } from '$lib/surfr-spots';
 
+import { displayTzOffsetSeconds } from '$lib/stores/preferences';
 import { metaJson, time } from '$lib/stores/time';
 import { domain, variable } from '$lib/stores/variables';
 
@@ -19,13 +21,18 @@ type OutMsg =
 	| { type: 'availableTimestamps'; timestamps: string[] }
 	| { type: 'availableVariables'; variables: string[] }
 	| { type: 'timestampChanged'; time: string }
-	| { type: 'forecastLocationSet'; lat: number; lng: number };
+	| { type: 'forecastLocationSet'; lat: number; lng: number }
+	| { type: 'referenceTime'; domain: string; referenceTime: string }
+	| { type: 'tileFetch'; url: string; status: number; ms: number; bytes: number };
 
 type InMsg =
 	| { type: 'setCenter'; lat: number; lng: number; zoom?: number }
+	| { type: 'setForecastLocation'; lat: number; lng: number }
 	| { type: 'setVariable'; variable: string }
 	| { type: 'setDomain'; domain: string }
-	| { type: 'setTime'; time: string };
+	| { type: 'setTime'; time: string }
+	| { type: 'setTzOffsetSeconds'; offsetSeconds: number }
+	| { type: 'setSpotsConfig'; endpoint?: string; token?: string };
 
 declare global {
 	interface Window {
@@ -87,7 +94,44 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 		if (Array.isArray(variables) && variables.length) {
 			postToRN({ type: 'availableVariables', variables });
 		}
+		// Expose reference_time so the RN host can log what run it's rendering.
+		// Handy for diagnosing cache-miss complaints.
+		const refTime = (meta as { reference_time?: string } | undefined)?.reference_time;
+		if (refTime) {
+			postToRN({ type: 'referenceTime', domain: get(domain), referenceTime: refTime });
+		}
 	});
+
+	// Monkey-patch window.fetch so every tile fetch (URL containing /tiles/ or
+	// /data_spatial/) gets reported back to RN with status + timing + bytes.
+	// This reveals exactly which .om URLs the library actually requests —
+	// including the reference_time segment — and whether it's hitting the CF
+	// edge or eating a cold upstream fetch.
+	const origFetch = window.fetch.bind(window);
+	window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+		const url =
+			typeof input === 'string'
+				? input
+				: input instanceof URL
+				? input.toString()
+				: (input as Request).url;
+		const isTile = /\/(tiles|data_spatial)\//.test(url);
+		if (!isTile) return origFetch(input, init);
+		const start = performance.now();
+		try {
+			const res = await origFetch(input, init);
+			const ms = Math.round(performance.now() - start);
+			// content-length isn't always set on 206s; fall back to 0 — the
+			// important signal is timing + status.
+			const bytes = Number(res.headers.get('content-length')) || 0;
+			postToRN({ type: 'tileFetch', url, status: res.status, ms, bytes });
+			return res;
+		} catch (err) {
+			const ms = Math.round(performance.now() - start);
+			postToRN({ type: 'tileFetch', url, status: 0, ms, bytes: 0 });
+			throw err;
+		}
+	};
 
 	const unsubTime = time.subscribe((t) => {
 		if (t) postToRN({ type: 'timestampChanged', time: formatISOWithoutTimezone(t) });
@@ -127,6 +171,24 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 					time.set(parsed);
 					changeOMfileURL();
 				}
+				break;
+			}
+			case 'setForecastLocation': {
+				// Drop the red marker without moving the camera — used when the
+				// RN host picks a search result / spot.
+				placeForecastMarker(map, msg.lat, msg.lng);
+				break;
+			}
+			case 'setTzOffsetSeconds': {
+				// Display-only — no tile refetch. Timeline labels will re-render
+				// reactively via Svelte store subscription.
+				if (Number.isFinite(msg.offsetSeconds)) {
+					displayTzOffsetSeconds.set(msg.offsetSeconds);
+				}
+				break;
+			}
+			case 'setSpotsConfig': {
+				setSurfrSpotsConfig({ endpoint: msg.endpoint, token: msg.token });
 				break;
 			}
 		}
