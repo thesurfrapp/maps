@@ -27,7 +27,8 @@ type OutMsg =
 	| { type: 'timestampChanged'; time: string; t: number }
 	| { type: 'forecastLocationSet'; lat: number; lng: number; t: number }
 	| { type: 'referenceTime'; domain: string; referenceTime: string; t: number }
-	| { type: 'tileFetch'; url: string; status: number; ms: number; bytes: number; cache: string; t: number }
+	| { type: 'tileFetch'; url: string; status: number; ms: number; bytes: number; cache: string; range: string; t: number }
+	| { type: 'storageEstimate'; quotaMb: number; usageMb: number; cacheCount?: number; t: number }
 	// New: lifecycle events to attribute time-loss
 	| { type: 'setTimeReceived'; time: string; t: number }
 	| { type: 'setVariableReceived'; variable: string; t: number }
@@ -144,17 +145,50 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 				: (input as Request).url;
 		const isTile = /\/(tiles|data_spatial)\//.test(url);
 		if (!isTile) return origFetch(input, init);
+		// Capture the Range header (if any) to detect duplicate block fetches —
+		// if the BrowserBlockCache is silently failing or the WebView is
+		// evicting Cache API entries, we'll see the same URL+range fetched
+		// repeatedly within a session.
+		let rangeHdr = '';
+		try {
+			const headers = init?.headers;
+			if (headers instanceof Headers) rangeHdr = headers.get('Range') || '';
+			else if (Array.isArray(headers)) {
+				const h = headers.find(([k]) => k.toLowerCase() === 'range');
+				if (h) rangeHdr = h[1] || '';
+			} else if (headers && typeof headers === 'object') {
+				rangeHdr = (headers as Record<string, string>).Range || (headers as Record<string, string>).range || '';
+			}
+		} catch {
+			/* noop */
+		}
 		const start = performance.now();
 		try {
 			const res = await origFetch(input, init);
 			const ms = Math.round(performance.now() - start);
 			const bytes = Number(res.headers.get('content-length')) || 0;
 			const cache = res.headers.get('x-surfr-cache-status') || '';
-			postToRN({ type: 'tileFetch', url, status: res.status, ms, bytes, cache });
+			postToRN({
+				type: 'tileFetch',
+				url,
+				status: res.status,
+				ms,
+				bytes,
+				cache,
+				range: rangeHdr
+			});
 			return res;
 		} catch (err) {
 			const ms = Math.round(performance.now() - start);
-			postToRN({ type: 'tileFetch', url, status: 0, ms, bytes: 0, cache: 'ERR' });
+			postToRN({
+				type: 'tileFetch',
+				url,
+				status: 0,
+				ms,
+				bytes: 0,
+				cache: 'ERR',
+				range: rangeHdr
+			});
 			throw err;
 		}
 	};
@@ -228,6 +262,35 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 
 	postToRN({ type: 'ready' });
 
+	// One-shot storage probe so we can see what the WebView's Cache API actually
+	// allows. If `usageMb` plateaus far below `cacheMaxBytesMb` (default 400) it
+	// means the platform is silently quota-evicting and the library's local
+	// block cache isn't actually holding what it thinks it is.
+	const probeStorage = async () => {
+		try {
+			const est = (await (navigator as unknown as { storage?: { estimate: () => Promise<{ quota?: number; usage?: number }> } }).storage?.estimate?.()) ?? null;
+			if (!est) return;
+			let cacheCount: number | undefined;
+			try {
+				const keys = await caches.keys();
+				cacheCount = keys.length;
+			} catch {
+				/* noop */
+			}
+			postToRN({
+				type: 'storageEstimate',
+				quotaMb: Math.round((est.quota ?? 0) / 1e6),
+				usageMb: Math.round((est.usage ?? 0) / 1e6),
+				cacheCount
+			});
+		} catch {
+			/* noop */
+		}
+	};
+	probeStorage();
+	// Also probe periodically so we can watch usage grow and see if it plateaus.
+	const storageProbeInterval = setInterval(probeStorage, 30 * 1000);
+
 	return () => {
 		map.off('moveend', onMoveEnd);
 		map.off('click', onClick);
@@ -235,6 +298,7 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 		map.off('idle', onIdle);
 		unsubMeta();
 		unsubTime();
+		clearInterval(storageProbeInterval);
 		window.removeEventListener('message', onWindowMessage);
 		document.removeEventListener('message', onWindowMessage as EventListener);
 	};
