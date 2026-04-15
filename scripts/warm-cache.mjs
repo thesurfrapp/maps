@@ -54,7 +54,9 @@ const DEFAULT_DOMAINS = [
 	'dwd_icon_eu',
 	'ecmwf_ifs025',
 	'dwd_icon',
-	'ncep_gfs013'
+	// GFS: frontend uses 0.13° for wind/rain and 0.25° for gusts — warm both.
+	'ncep_gfs013',
+	'ncep_gfs025'
 ];
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
