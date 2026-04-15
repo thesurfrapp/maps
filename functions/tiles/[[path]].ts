@@ -72,7 +72,14 @@ export const onRequest: PagesFunction = async (context) => {
 
 	const url = new URL(request.url);
 	const upstreamPath = url.pathname.replace(/^\/tiles/, '') || '/';
-	const upstreamUrl = `${UPSTREAM_HOST}${upstreamPath}${url.search}`;
+	// Strip query params when talking to upstream/CF cache. `.om` URLs append
+	// `?variable=wind_speed_10m` (and similar) purely as client-side metadata
+	// — the .om binary contains every variable and S3 ignores the query.
+	// Without stripping, every variable-flavour hits a different CF cache
+	// entry, so our warmer (which omits the query) never covers the library's
+	// real fetches. Converging on a single no-query cache key makes warmer and
+	// library share the same edge entry.
+	const upstreamUrl = `${UPSTREAM_HOST}${upstreamPath}`;
 
 	const ttl = pickTtl(upstreamPath);
 	const forceRefresh = request.headers.get(FORCE_REFRESH_HEADER) === '1';
