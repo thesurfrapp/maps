@@ -27,11 +27,17 @@ const IN_PROGRESS_JSON_TTL = 30; // 30 s — reflects a run still being written.
 const ERROR_404_TTL = 30;
 
 const FORCE_REFRESH_HEADER = 'X-Surfr-Force-Refresh';
+// Fire-and-forget cache warming. When set on a request, the proxy kicks off
+// the upstream fetch with cacheEverything + drain-via-waitUntil, and returns
+// 202 immediately so the caller (our warmer) doesn't need to hold a
+// potentially multi-hundred-MB stream open. CF continues the cache fill in
+// the background.
+const WARM_HEADER = 'X-Surfr-Warm';
 
 const corsHeaders = {
 	'Access-Control-Allow-Origin': '*',
 	'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-	'Access-Control-Allow-Headers': `Range, If-Match, If-None-Match, If-Modified-Since, ${FORCE_REFRESH_HEADER}`,
+	'Access-Control-Allow-Headers': `Range, If-Match, If-None-Match, If-Modified-Since, ${FORCE_REFRESH_HEADER}, ${WARM_HEADER}`,
 	'Access-Control-Expose-Headers': 'ETag, Content-Range, Content-Length, Accept-Ranges',
 	'Access-Control-Max-Age': '3000'
 };
@@ -66,6 +72,33 @@ export const onRequest: PagesFunction = async (context) => {
 
 	const ttl = pickTtl(upstreamPath);
 	const forceRefresh = request.headers.get(FORCE_REFRESH_HEADER) === '1';
+	const warm = request.headers.get(WARM_HEADER) === '1';
+
+	// Fire-and-forget warming path. The warmer calls us with this header to
+	// prime CF's edge cache without having to stream the full upstream body.
+	// We kick off the fetch + drain via waitUntil and return immediately.
+	if (warm) {
+		const cachePromise = (async () => {
+			try {
+				if (forceRefresh) {
+					await caches.default.delete(upstreamUrl).catch(() => {});
+				}
+				const up = await fetch(upstreamUrl, {
+					cf: {
+						cacheEverything: true,
+						cacheTtl: ttl,
+						cacheTtlByStatus: { '200-299': ttl, '404': ERROR_404_TTL, '500-599': 0 }
+					}
+				});
+				// Must drain the body for CF to finish populating the cache entry.
+				if (up.body) await up.body.pipeTo(new WritableStream());
+			} catch {
+				/* noop */
+			}
+		})();
+		context.waitUntil(cachePromise);
+		return new Response(null, { status: 202, headers: corsHeaders });
+	}
 
 	// Forward relevant headers only. Range is critical (the Open-Meteo client
 	// does byte-range reads into large .om files).
