@@ -8,23 +8,25 @@ import type { BreakpointColorScale } from '@openmeteo/weather-map-layer';
 
 const KT_TO_MPS = 0.514444;
 
-// Per-anchor alpha — ASCENDING ramp matching the arrow layer's pattern in
-// layers.ts:makeArrowColor (arrows go 0.2 → 0.7 from calm to strong). Calm
-// areas fade nearly transparent so the basemap dominates; only stronger winds
-// build up to vivid color. Global raster-opacity preference multiplies on top.
+// Per-anchor alpha — still ascending (strong winds are more opaque than calm)
+// but with a higher floor so the calm-blue/cyan end stays visible on the dark
+// basemap. The original 0.05 floor made 0–5 kt effectively invisible over
+// OpenFreeMap's dark style; raised to 0.35 so calm sits readably over both
+// light and dark basemaps. Global raster-opacity preference still multiplies
+// on top.
 // Anchors in knots — RGB synced with WindguruService.WIND_COLOR_ANCHORS in /frontend.
 const anchors: [number, number, number, number, number][] = [
 	// kt, R, G, B, alpha
-	[0, 80, 112, 192, 0.05],
-	[5, 64, 184, 200, 0.15],
-	[10, 80, 200, 120, 0.3],
-	[15, 144, 216, 64, 0.45],
-	[20, 208, 216, 40, 0.6],
-	[25, 232, 168, 48, 0.7],
-	[30, 224, 104, 72, 0.75],
-	[35, 224, 72, 152, 0.8],
-	[40, 208, 72, 192, 0.85],
-	[50, 136, 88, 200, 0.9]
+	[0, 80, 112, 192, 0.35],
+	[5, 64, 184, 200, 0.45],
+	[10, 80, 200, 120, 0.55],
+	[15, 144, 216, 64, 0.65],
+	[20, 208, 216, 40, 0.7],
+	[25, 232, 168, 48, 0.75],
+	[30, 224, 104, 72, 0.8],
+	[35, 224, 72, 152, 0.85],
+	[40, 208, 72, 192, 0.9],
+	[50, 136, 88, 200, 0.95]
 ];
 
 // Densify to 1-knot resolution. Both RGB and alpha are interpolated between

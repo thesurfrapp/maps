@@ -133,9 +133,38 @@
 			$localStorageVersion = version;
 		}
 
-		maplibregl.addProtocol('om', (params: RequestParameters, abortController: AbortController) =>
-			omProtocol(params, abortController, $omProtocolSettings)
-		);
+		// Boot-time audit of the color-scale wiring. Surfaces any divergence
+		// between the scales we *think* we registered and what maplibre actually
+		// sees at request time.
+		{
+			const settings = $omProtocolSettings;
+			const scales = settings.colorScales as Record<string, { colors?: unknown[] }>;
+			const windScale = scales['wind'];
+			const uScale = scales['wind_u_component_10m'];
+			console.log('[surfr-boot]', {
+				hasResolveRequest: typeof settings.resolveRequest === 'function',
+				windKeys: Object.keys(scales).filter((k) => k.startsWith('wind')),
+				windFirstColor: windScale?.colors?.[0],
+				windUCompFirstColor: uScale?.colors?.[0],
+				currentVariable: get(variable),
+				currentDomain: get(domain),
+				persistedCustomColorScales: (() => {
+					try {
+						return Object.keys(JSON.parse(localStorage.getItem('custom-color-scales') ?? '{}'));
+					} catch {
+						return '<parse error>';
+					}
+				})()
+			});
+		}
+
+		maplibregl.addProtocol('om', (params: RequestParameters, abortController: AbortController) => {
+			// Per-request trace. `params.url` is the om:// URL that includes the
+			// active variable; if this doesn't contain `wind` when you expect it
+			// to, the problem is upstream in the variable store.
+			console.log('[surfr-protocol]', { url: params.url });
+			return omProtocol(params, abortController, $omProtocolSettings);
+		});
 
 		const style = await getStyle();
 

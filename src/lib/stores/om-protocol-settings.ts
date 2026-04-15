@@ -58,6 +58,7 @@ function createBlockCache() {
 // unambiguous way to make it stick for every wind-family variable.
 const WIND_VARIABLE_PATTERN = /^wind_(speed|gusts|u_component|v_component)(_|$)/;
 
+
 export const omProtocolSettings: Writable<OmProtocolSettings> = writable({
 	...defaultOmProtocolSettings,
 	// static
@@ -84,7 +85,29 @@ export const omProtocolSettings: Writable<OmProtocolSettings> = writable({
 	// braces on top of the colorScales map above.
 	resolveRequest: (urlComponents, settings) => {
 		const resolved = defaultResolveRequest(urlComponents, settings);
-		if (WIND_VARIABLE_PATTERN.test(resolved.dataOptions.variable)) {
+		const v = resolved.dataOptions.variable;
+		const matched = WIND_VARIABLE_PATTERN.test(v);
+		// Print once per URL so the console isn't drowned by per-tile calls.
+		const sig = `${urlComponents.baseUrl}?variable=${v}`;
+		if (sig !== (window as unknown as { __lastOmSig?: string }).__lastOmSig) {
+			(window as unknown as { __lastOmSig?: string }).__lastOmSig = sig;
+			const incomingColors = JSON.stringify(
+				(resolved.renderOptions.colorScale as { colors?: unknown }).colors
+			).slice(0, 60);
+			const surfrColors = surfrWindScale.colors as unknown as unknown[];
+			const surfrFirstColor = JSON.stringify(surfrColors[0]);
+			console.log('[surfr-colors]', {
+				variable: v,
+				matched,
+				incomingScaleUnit: (resolved.renderOptions.colorScale as { unit?: string }).unit,
+				incomingFirstColors: incomingColors,
+				surfrFirstColor,
+				colorScalesRegistered: Object.keys(settings.colorScales).filter((k) =>
+					k.startsWith('wind')
+				)
+			});
+		}
+		if (matched) {
 			const dark = urlComponents.params.get('dark') === 'true';
 			resolved.renderOptions = {
 				...resolved.renderOptions,
