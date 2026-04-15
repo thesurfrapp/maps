@@ -20,6 +20,7 @@
 	import {
 		loading,
 		localStorageVersion,
+		opacity,
 		resetStates,
 		tileSize,
 		tileSizeSet,
@@ -45,6 +46,8 @@
 	import Settings from '$lib/components/settings/settings.svelte';
 	import TimeSelector from '$lib/components/time/time-selector.svelte';
 
+	import { setMode } from 'mode-watcher';
+
 	import { checkHighDefinition } from '$lib/helpers';
 	import { addOmFileLayers, changeOMfileURL } from '$lib/layers';
 	import { installRnBridge, isEmbedMode } from '$lib/rn-bridge';
@@ -69,6 +72,23 @@
 	onMount(async () => {
 		$url = new URL(document.location.href);
 		embed = isEmbedMode();
+
+		// Optional ?theme=dark|light|system override. Used by the RN WebView
+		// so the embed matches the host app's theme regardless of the iOS
+		// simulator's / Android device's system appearance.
+		const themeParam = $url.searchParams.get('theme');
+		if (themeParam === 'dark' || themeParam === 'light' || themeParam === 'system') {
+			setMode(themeParam);
+		}
+
+		// Optional ?opacity=N override (0-100). Used to debug the
+		// embed-vs-browser brightness divergence.
+		const opacityParam = $url.searchParams.get('opacity');
+		if (opacityParam) {
+			const n = Number(opacityParam);
+			if (Number.isFinite(n)) opacity.set(Math.max(0, Math.min(100, n)));
+		}
+
 		urlParamsToPreferences();
 
 		// first time on load, check if monitor supports high definition, for increased tile size
@@ -106,10 +126,13 @@
 			zoom: domainObject.grid.zoom,
 			keyboard: false,
 			hash: true,
-			maxPitch: 85
+			maxPitch: 85,
+			// Hide MapLibre's default "© OpenMapTiles / © OpenStreetMap" strip when
+			// embedded — the RN app shows its own attribution in settings/about.
+			attributionControl: embed ? false : undefined
 		});
 
-		setMapControlSettings();
+		setMapControlSettings({ embed });
 
 		// update bounds when new tiles are requested, to trigger new data ranges loading if necessary
 		$map.on('dataloading', () => {

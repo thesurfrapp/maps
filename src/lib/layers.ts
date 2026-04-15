@@ -28,8 +28,11 @@ const isDark = (): boolean => mode.current === 'dark';
 const lightOrDark = (light: string, dark: string): string => (isDark() ? dark : light);
 
 const getRasterOpacity = (): number => {
-	const opacityValue = get(opacity) / 100;
-	return isDark() ? Math.max(0, (opacityValue * 100 - 10) / 100) : opacityValue;
+	// Upstream knocked 10 pp off in dark mode for contrast reasons. Our embed
+	// uses a stripped-down basemap (mostly black + white borders), so the dark
+	// reduction makes the overlay look washed out next to the same map in the
+	// browser's light mode. Use the raw preference in both modes.
+	return get(opacity) / 100;
 };
 
 const makeArrowColor = (): maplibregl.ExpressionSpecification => {
@@ -324,10 +327,18 @@ export const addOmFileLayers = (): void => {
 
 export const changeOMfileURL = (vectorOnly = false, rasterOnly = false): void => {
 	const map = get(m);
-	if (!map) return;
+	if (!map) {
+		console.log('[changeOMfileURL] no map yet, skip');
+		return;
+	}
 
 	const omUrl = getOMUrl();
-	if (get(currentOmUrl) == omUrl || !omUrl) return;
+	const previous = get(currentOmUrl);
+	console.log('[changeOMfileURL] new=', omUrl, 'previous=', previous);
+	if (previous == omUrl || !omUrl) {
+		console.log('[changeOMfileURL] noop (same url or no modelRun)');
+		return;
+	}
 	currentOmUrl.set(omUrl);
 
 	loading.set(true);

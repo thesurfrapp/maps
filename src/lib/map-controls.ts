@@ -11,11 +11,18 @@ import { BEFORE_LAYER_RASTER, HILLSHADE_LAYER } from '$lib/constants';
 import { addOmFileLayers } from './layers';
 import { updateUrl } from './url';
 
-export const setMapControlSettings = () => {
+export const setMapControlSettings = ({ embed = false } = {}) => {
 	const map = get(m);
 	if (!map) return;
 
 	map.touchZoomRotate.disableRotation();
+	map.scrollZoom.setZoomRate(1 / 85);
+	map.scrollZoom.setWheelZoomRate(1 / 85);
+
+	// In embed mode the RN app owns all UI — don't render MapLibre's default
+	// NavigationControl / GeolocateControl / GlobeControl.
+	if (embed) return;
+
 	map.addControl(
 		new maplibregl.NavigationControl({ visualizePitch: true, showZoom: true, showCompass: true })
 	);
@@ -30,9 +37,6 @@ export const setMapControlSettings = () => {
 	const globeControl = new maplibregl.GlobeControl();
 	map.addControl(globeControl);
 	globeControl._globeButton.addEventListener('click', () => globeHandler());
-
-	map.scrollZoom.setZoomRate(1 / 85);
-	map.scrollZoom.setWheelZoomRate(1 / 85);
 };
 
 export const addTerrainSource = (map: maplibregl.Map, name: string = 'terrainSource') => {
@@ -150,6 +154,35 @@ export const getStyle = async () => {
 					'line-cap': 'round',
 					'line-join': 'round'
 				};
+			}
+		}
+
+		// Add a coastline layer. OpenMapTiles' `boundary_country_*` draws only
+		// land-land borders (e.g. USA-Canada), not coastlines — so in a dark basemap
+		// where land and ocean are both near-black, countries like Canada or Australia
+		// appear without any outline. Stroking the water polygon layer with a thin
+		// bright line gives us real coastlines + major lake rings.
+		const hasOpenmaptiles = Boolean(style.sources?.openmaptiles);
+		if (hasOpenmaptiles && !style.layers.find((l: { id: string }) => l.id === 'surfr_coastline')) {
+			// Insert just after the water fill layer so the stroke sits on top of water
+			// but below all labels/borders.
+			const waterIdx = style.layers.findIndex((l: { id: string }) => l.id === 'water');
+			const coastline = {
+				id: 'surfr_coastline',
+				type: 'line',
+				source: 'openmaptiles',
+				'source-layer': 'water',
+				filter: ['all', ['==', ['geometry-type'], 'Polygon']],
+				paint: {
+					'line-color': '#ffffff',
+					'line-opacity': 0.55,
+					'line-width': ['interpolate', ['linear'], ['zoom'], 0, 0.4, 3, 0.7, 6, 1, 12, 1.4]
+				}
+			};
+			if (waterIdx >= 0) {
+				style.layers.splice(waterIdx + 1, 0, coastline);
+			} else {
+				style.layers.push(coastline);
 			}
 		}
 	}
