@@ -2,37 +2,59 @@
 /**
  * Cache warmer for our CF Pages Function tile proxy.
  *
- * For each map-tile domain:
- *   1. GET latest.json        → reference_time
- *   2. GET {run}/meta.json    → valid_times[]
- *   3. Filter valid_times to now..now+Nh
- *   4. Concurrent GETs (Range: bytes=0-65535) for each (domain, time)
+ * Design (see plan file / redesign in the conversation):
+ *   1. `.om` URLs are immutable per (domain, reference_time, forecast_time).
+ *   2. The only thing that moves is `latest.json` — its `reference_time` field
+ *      flips when Open-Meteo publishes a new model run.
+ *   3. Therefore we only need to warm a domain's URLs when its reference_time
+ *      changes. Unchanged → noop.
  *
- * Empirically, one small range-GET warms CF's edge for that file;
- * subsequent range reads to any byte offset in the same file serve
- * ~140 ms through our proxy.
+ * Loop per run:
+ *   for each domain:
+ *     directLatest = fetch upstream latest.json   (bypass our proxy → truth)
+ *     if directLatest.reference_time !== state.last[domain]:
+ *       warm ALL .om URLs for the new run (next HOURS_AHEAD h)
+ *       THEN force-refresh our proxy's latest.json   (atomic swap — clients
+ *         stop seeing the old reference_time only after new URLs are warm)
+ *       state.last[domain] = directLatest.reference_time
+ *     else:
+ *       log noop
  *
- * Usage:  node scripts/warm-cache.mjs [--hours=72] [--concurrency=8] [--domains=dwd_icon,dwd_icon_eu]
+ * State file: scripts/warmer-state.json — gitignored, created on first run.
+ *
+ * Usage:
+ *   node scripts/warm-cache.mjs                             # normal
+ *   node scripts/warm-cache.mjs --domains=dwd_icon_eu       # subset
+ *   node scripts/warm-cache.mjs --hours=72 --concurrency=8
+ *   node scripts/warm-cache.mjs --force                     # ignore state; warm every domain
  */
 
-const PROXY_BASE = 'https://maps.thesurfr.app/tiles';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-// Map-tile domain names (from @openmeteo/weather-map-layer/src/domains.ts) mapped
-// to the frontend's FORECAST_MODELS catalog.
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const STATE_PATH = resolve(__dirname, 'warmer-state.json');
+
+const PROXY_BASE = 'https://maps.thesurfr.app/tiles';
+const UPSTREAM_BASE = 'https://map-tiles.open-meteo.com';
+
+// Map-tile domain names (canonical list in @openmeteo/weather-map-layer/src/domains.ts),
+// aligned to the frontend's FORECAST_MODELS catalog.
 const DEFAULT_DOMAINS = [
-	'metno_nordic_pp', // MET Nordic 1km
-	'meteofrance_arome_france_hd', // Arome-HD 1.3km
-	'dwd_icon_d2', // ICON-D2 2km
-	'knmi_harmonie_arome_netherlands', // KNMI NL 2km
-	'ukmo_uk_deterministic_2km', // UKV 2km
-	'meteofrance_arome_france0025', // Arome 2.5km
-	'cmc_gem_hrdps', // GEM HRDPS 2.5km
-	'ncep_hrrr_conus', // HRRR 3km
-	'knmi_harmonie_arome_europe', // HARMONIE 5.5km
-	'dwd_icon_eu', // ICON-EU 7km
-	'ecmwf_ifs025', // ECMWF 9km
-	'dwd_icon', // ICON 11km
-	'ncep_gfs013' // GFS 13km
+	'metno_nordic_pp',
+	'meteofrance_arome_france_hd',
+	'dwd_icon_d2',
+	'knmi_harmonie_arome_netherlands',
+	'ukmo_uk_deterministic_2km',
+	'meteofrance_arome_france0025',
+	'cmc_gem_hrdps',
+	'ncep_hrrr_conus',
+	'knmi_harmonie_arome_europe',
+	'dwd_icon_eu',
+	'ecmwf_ifs025',
+	'dwd_icon',
+	'ncep_gfs013'
 ];
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
@@ -46,62 +68,85 @@ const HOURS_AHEAD = Number(args.hours ?? 72);
 const CONCURRENCY = Number(args.concurrency ?? 8);
 const DOMAINS = args.domains ? String(args.domains).split(',') : DEFAULT_DOMAINS;
 const RANGE_HEADER = 'bytes=0-65535'; // ~64 KB probe per file
-// --force-refresh: tells our Pages Function to evict + repopulate each URL's
-// edge cache entry via the `X-Surfr-Force-Refresh: 1` header. Used on the 6-hourly
-// cron aligned with Open-Meteo model-run publishes (00/06/12/18 UTC + 15 min).
-const FORCE_REFRESH = args['force-refresh'] === true || args['force-refresh'] === 'true';
+const FORCE = args.force === true || args.force === 'true';
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── State helpers ───────────────────────────────────────────────────────────
+function loadState() {
+	if (!existsSync(STATE_PATH)) return {};
+	try {
+		return JSON.parse(readFileSync(STATE_PATH, 'utf8'));
+	} catch {
+		return {};
+	}
+}
+
+function saveState(state) {
+	mkdirSync(dirname(STATE_PATH), { recursive: true });
+	writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
+}
+
+// ─── Time format helpers (mirror fork's url.ts) ──────────────────────────────
+const pad = (n) => String(n).padStart(2, '0');
 const fmtModelRun = (iso) => {
 	const d = new Date(iso);
-	const pad = (n) => String(n).padStart(2, '0');
 	return `${d.getUTCFullYear()}/${pad(d.getUTCMonth() + 1)}/${pad(d.getUTCDate())}/${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}Z`;
 };
-
 const fmtValidTime = (iso) => {
 	const d = new Date(iso);
-	const pad = (n) => String(n).padStart(2, '0');
 	return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}`;
 };
 
-const now = Date.now();
-const cutoff = now + HOURS_AHEAD * 3600 * 1000;
-
-async function probeDomain(domain) {
+// ─── Per-domain check + warm ────────────────────────────────────────────────
+async function processDomain(domain, state) {
 	const t0 = performance.now();
 	const stats = {
 		domain,
-		filesAttempted: 0,
+		action: 'noop',
+		referenceTime: null,
 		filesOk: 0,
-		filesSlow: 0, // > 1s TTFB (= upstream cold miss)
 		filesFailed: 0,
+		filesSlow: 0,
 		totalBytes: 0,
-		totalMs: 0,
+		avgMs: 0,
+		wallMs: 0,
 		error: null
 	};
 	try {
-		// 1. latest.json
-		const latestRes = await fetch(`${PROXY_BASE}/data_spatial/${domain}/latest.json`);
-		if (!latestRes.ok) throw new Error(`latest.json ${latestRes.status}`);
+		// 1. UPSTREAM latest.json — bypass our proxy so we see the real truth.
+		const latestRes = await fetch(`${UPSTREAM_BASE}/data_spatial/${domain}/latest.json`);
+		if (!latestRes.ok) throw new Error(`upstream latest.json ${latestRes.status}`);
 		const latest = await latestRes.json();
 		const refTime = latest.reference_time;
 		if (!refTime) throw new Error('no reference_time');
+		stats.referenceTime = refTime;
 
-		// 2. meta.json for that run
+		const lastKnown = state[domain]?.referenceTime;
+		if (!FORCE && lastKnown === refTime) {
+			stats.action = 'noop';
+			return stats;
+		}
+
+		stats.action = FORCE ? 'forced' : lastKnown ? 'new-run' : 'first-run';
+
+		// 2. meta.json for that run (through our proxy — this also primes the cache).
 		const runPath = fmtModelRun(refTime);
-		const metaRes = await fetch(`${PROXY_BASE}/data_spatial/${domain}/${runPath}/meta.json`);
-		if (!metaRes.ok) throw new Error(`meta.json ${metaRes.status}`);
+		const metaRes = await fetch(
+			`${PROXY_BASE}/data_spatial/${domain}/${runPath}/meta.json`
+		);
+		if (!metaRes.ok) throw new Error(`proxy meta.json ${metaRes.status}`);
 		const meta = await metaRes.json();
 		const allTimes = meta.valid_times ?? [];
+
+		const now = Date.now();
+		const cutoff = now + HOURS_AHEAD * 3600 * 1000;
 		const targets = allTimes.filter((t) => {
 			const ms = new Date(t).getTime();
-			return ms >= now && ms <= cutoff;
+			return ms >= now - 3600 * 1000 && ms <= cutoff; // include the slot we're currently in
 		});
 
-		// 3. Parallel warm-up with bounded concurrency
+		// 3. Warm .om files for the new run.
 		const queue = [...targets];
-		const requestHeaders = { Range: RANGE_HEADER };
-		if (FORCE_REFRESH) requestHeaders['X-Surfr-Force-Refresh'] = '1';
+		let totalMs = 0;
 		const workers = Array.from({ length: CONCURRENCY }, () =>
 			(async () => {
 				while (queue.length) {
@@ -110,10 +155,9 @@ async function probeDomain(domain) {
 					const url = `${PROXY_BASE}/data_spatial/${domain}/${runPath}/${fmtValidTime(validTime)}.om`;
 					const req = performance.now();
 					try {
-						const res = await fetch(url, { headers: requestHeaders });
+						const res = await fetch(url, { headers: { Range: RANGE_HEADER } });
 						const ms = performance.now() - req;
-						stats.filesAttempted++;
-						stats.totalMs += ms;
+						totalMs += ms;
 						if (!res.ok && res.status !== 206) {
 							stats.filesFailed++;
 							continue;
@@ -122,14 +166,25 @@ async function probeDomain(domain) {
 						stats.totalBytes += buf.byteLength;
 						stats.filesOk++;
 						if (ms > 1000) stats.filesSlow++;
-					} catch (e) {
-						stats.filesAttempted++;
+					} catch {
 						stats.filesFailed++;
 					}
 				}
 			})()
 		);
 		await Promise.all(workers);
+		stats.avgMs = stats.filesOk ? Math.round(totalMs / stats.filesOk) : 0;
+
+		// 4. ATOMIC SWAP: force-refresh our proxy's latest.json so clients start
+		//    seeing the new reference_time only now — AFTER the new run's .om
+		//    URLs are all warm. Clients that fetched latest.json during the warm
+		//    phase still have the old reference_time in their app state.
+		await fetch(`${PROXY_BASE}/data_spatial/${domain}/latest.json`, {
+			headers: { 'X-Surfr-Force-Refresh': '1' }
+		}).catch(() => {});
+
+		// 5. Persist state
+		state[domain] = { referenceTime: refTime, warmedAt: new Date().toISOString() };
 	} catch (e) {
 		stats.error = e.message;
 	}
@@ -138,30 +193,32 @@ async function probeDomain(domain) {
 }
 
 // ─── Run ─────────────────────────────────────────────────────────────────────
+const state = loadState();
 console.log(
-	`${FORCE_REFRESH ? 'Force-refreshing' : 'Warming'} ${DOMAINS.length} domains × next ${HOURS_AHEAD}h (concurrency=${CONCURRENCY})\n`
+	`Warmer pass — ${DOMAINS.length} domains, next ${HOURS_AHEAD} h, concurrency=${CONCURRENCY}${FORCE ? ' [FORCE]' : ''}\n`
 );
 const startAll = performance.now();
 const results = [];
 for (const d of DOMAINS) {
 	process.stdout.write(`  ${d.padEnd(38)} `);
-	const r = await probeDomain(d);
+	const r = await processDomain(d, state);
 	results.push(r);
 	if (r.error) {
 		console.log(`✗ ${r.error}`);
+	} else if (r.action === 'noop') {
+		console.log(`noop (ref ${r.referenceTime})`);
 	} else {
-		const avgMs = r.filesOk ? Math.round(r.totalMs / r.filesOk) : 0;
 		const mb = (r.totalBytes / 1e6).toFixed(1);
-		const wallS = (r.wallMs / 1000).toFixed(1);
 		console.log(
-			`${r.filesOk}/${r.filesAttempted} ok, ${r.filesSlow} slow, avg ${avgMs}ms, ${mb} MB, wall ${wallS}s`
+			`${r.action} ref ${r.referenceTime} — ${r.filesOk} ok / ${r.filesFailed} failed, ${r.filesSlow} slow, avg ${r.avgMs} ms, ${mb} MB, wall ${(r.wallMs / 1000).toFixed(1)} s`
 		);
 	}
 }
+saveState(state);
+
 const totalWallS = ((performance.now() - startAll) / 1000).toFixed(1);
-const totalOk = results.reduce((s, r) => s + r.filesOk, 0);
-const totalFailed = results.reduce((s, r) => s + r.filesFailed, 0);
-const totalMB = (results.reduce((s, r) => s + r.totalBytes, 0) / 1e6).toFixed(1);
+const warmed = results.filter((r) => r.action !== 'noop' && !r.error).length;
+const errors = results.filter((r) => r.error).length;
 console.log(
-	`\nTotal: ${totalOk} ok, ${totalFailed} failed, ${totalMB} MB, wall ${totalWallS}s`
+	`\nDone. ${warmed}/${results.length} domains warmed, ${errors} errors, wall ${totalWallS} s.`
 );

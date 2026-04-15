@@ -2,27 +2,28 @@
 //
 // Forwards GET/HEAD/OPTIONS for `/tiles/<anything>` to
 //   https://map-tiles.open-meteo.com/<anything>
-// with `cacheEverything` + 60 min TTL so the first request fills the CF edge
-// cache and all subsequent requests (including Range-partial ones) are served
-// locally. Also takes load off Open-Meteo.
+// with `cacheEverything: true` so the first request fills the CF edge cache and
+// all subsequent requests (including Range-partial reads) are served locally.
 //
-// Open-Meteo rewrites the same URL when a new model run publishes (every 3–6 h
-// per domain). To stay fresh we combine TTL with a **force-refresh** mode:
-// a warmer cron sends `X-Surfr-Force-Refresh: 1` every 6 h to evict + repopulate
-// the edge cache. Per-URL precision, no CF zone-purge API used.
+// Cache-lifetime model (key facts):
+//   * `.om` files — immutable per `(domain, reference_time, forecast_time)`.
+//     A new model run always produces new URLs; existing URLs never get
+//     content updates. Safe to cache ~forever.
+//   * `meta.json` — produced once per model run; immutable after publish.
+//   * `latest.json` — the ONLY moving piece: its `reference_time` field flips
+//     when a new model run publishes. Deliberately kept at a medium TTL so
+//     clients lag behind the warmer — i.e. we want clients to still be reading
+//     the old reference_time while the warmer discovers and pre-warms the new
+//     run's URLs. Force-refresh (X-Surfr-Force-Refresh: 1) lets the warmer
+//     evict `latest.json` atomically after warming completes.
 
 const UPSTREAM_HOST = 'https://map-tiles.open-meteo.com';
 
 // TTLs in seconds.
-// .om files get a long TTL because staleness is handled *actively* by the
-// `X-Surfr-Force-Refresh` warmer on a 6 h cron. Long TTL keeps the entry warm
-// indefinitely once any request has populated it, so the only remaining
-// cold-fetch window is "URL newly published by Open-Meteo, warmer hasn't
-// reached it yet" (≤30 min, our regular warmer interval).
-// JSON indexes stay short-TTL because clients need to discover new
-// reference_times promptly when a new model run publishes.
-const OM_FILE_TTL = 60 * 60 * 24; // 24 hours
-const JSON_INDEX_TTL = 60; // 1 minute
+const OM_FILE_TTL = 60 * 60 * 24 * 30; // 30 days — URLs are immutable, cache as long as CF keeps it.
+const META_JSON_TTL = 60 * 60 * 24 * 30; // 30 days — per-run metadata, immutable.
+const LATEST_JSON_TTL = 60 * 5; // 5 min — long enough that clients lag the warmer.
+const IN_PROGRESS_JSON_TTL = 30; // 30 s — reflects a run still being written.
 const ERROR_404_TTL = 30;
 
 const FORCE_REFRESH_HEADER = 'X-Surfr-Force-Refresh';
@@ -33,6 +34,20 @@ const corsHeaders = {
 	'Access-Control-Allow-Headers': `Range, If-Match, If-None-Match, If-Modified-Since, ${FORCE_REFRESH_HEADER}`,
 	'Access-Control-Expose-Headers': 'ETag, Content-Range, Content-Length, Accept-Ranges',
 	'Access-Control-Max-Age': '3000'
+};
+
+// Pick the TTL for a given upstream path. The path shape is:
+//   /data_spatial/{domain}/{YYYY}/{MM}/{DD}/{HHmm}Z/{forecastTime}.om
+//   /data_spatial/{domain}/latest.json
+//   /data_spatial/{domain}/in-progress.json
+//   /data_spatial/{domain}/{YYYY}/{MM}/{DD}/{HHmm}Z/meta.json
+const pickTtl = (path: string): number => {
+	if (path.endsWith('.om')) return OM_FILE_TTL;
+	if (path.endsWith('/latest.json')) return LATEST_JSON_TTL;
+	if (path.endsWith('/in-progress.json')) return IN_PROGRESS_JSON_TTL;
+	if (path.endsWith('/meta.json')) return META_JSON_TTL;
+	// Unknown .json or asset — short but non-zero.
+	return LATEST_JSON_TTL;
 };
 
 export const onRequest: PagesFunction = async (context) => {
@@ -49,11 +64,10 @@ export const onRequest: PagesFunction = async (context) => {
 	const upstreamPath = url.pathname.replace(/^\/tiles/, '') || '/';
 	const upstreamUrl = `${UPSTREAM_HOST}${upstreamPath}${url.search}`;
 
-	const isOmFile = upstreamPath.endsWith('.om');
-	const ttl = isOmFile ? OM_FILE_TTL : JSON_INDEX_TTL;
+	const ttl = pickTtl(upstreamPath);
 	const forceRefresh = request.headers.get(FORCE_REFRESH_HEADER) === '1';
 
-	// Forward relevant headers only (Range is the big one — the Open-Meteo library
+	// Forward relevant headers only. Range is critical (the Open-Meteo client
 	// does byte-range reads into large .om files).
 	const upstreamHeaders = new Headers();
 	const range = request.headers.get('Range');
@@ -68,13 +82,13 @@ export const onRequest: PagesFunction = async (context) => {
 	// miss, pull fresh from origin, and repopulate the edge cache automatically.
 	// This handles both 200 (full) and 206 (Range) responses correctly; CF stores
 	// the full resource internally and serves arbitrary ranges out of it.
+	// Primary use: the warmer invalidates `latest.json` after pre-warming the new
+	// run's .om files, so clients never see a reference_time that isn't backed
+	// by warm .om entries.
 	if (forceRefresh) {
 		await caches.default.delete(upstreamUrl).catch(() => {});
 	}
 
-	// Single fetch init — always use cacheEverything so CF's edge cache stays
-	// the source of truth. When the warmer force-refreshes, the above delete
-	// guarantees this fetch misses and repopulates with fresh data.
 	const upstream = await fetch(upstreamUrl, {
 		method: request.method,
 		headers: upstreamHeaders,
@@ -89,13 +103,10 @@ export const onRequest: PagesFunction = async (context) => {
 		}
 	});
 
-	// Mirror upstream response with CORS tacked on.
 	const headers = new Headers(upstream.headers);
 	for (const [k, v] of Object.entries(corsHeaders)) headers.set(k, v);
-	// Advertise our own Cache-Control so browsers cache the proxy response too.
 	headers.set('Cache-Control', `public, max-age=${ttl}`);
 	if (forceRefresh) {
-		// Signal back to the warmer that this request went through the refresh path.
 		headers.set('X-Surfr-Refreshed', '1');
 	}
 
