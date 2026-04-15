@@ -31,29 +31,18 @@
 	import { metaJson, modelRun, time } from '$lib/stores/time';
 	import { domain, selectedDomain, selectedVariable, variable } from '$lib/stores/variables';
 
-	import {
-		ClippingButton,
-		DarkModeButton,
-		HelpButton,
-		HillshadeButton,
-		SettingsButton
-	} from '$lib/components/buttons';
-	import ClippingPanel from '$lib/components/clipping/clipping-panel.svelte';
-	import Dropzone from '$lib/components/dropzone/dropzone.svelte';
-	import HelpDialog from '$lib/components/help/help-dialog.svelte';
 	import KeyboardHandler from '$lib/components/keyboard/keyboard-handler.svelte';
 	import Spinner from '$lib/components/loading/spinner.svelte';
-	import Scale from '$lib/components/scale/scale.svelte';
-	import VariableSelection from '$lib/components/selection/variable-selection.svelte';
-	import Settings from '$lib/components/settings/settings.svelte';
+	import ModelPills from '$lib/components/overlay-pills/model-pills.svelte';
+	import OverlayPills from '$lib/components/overlay-pills/overlay-pills.svelte';
 	import TimeSelector from '$lib/components/time/time-selector.svelte';
+	import TimezoneSelector from '$lib/components/timezone/TimezoneSelector.svelte';
 
 	import { setMode } from 'mode-watcher';
 
 	import { checkHighDefinition } from '$lib/helpers';
 	import { initSurfrSpots, setSurfrSpotsConfig } from '$lib/surfr-spots';
 	import { getIanaOffsetSeconds } from '$lib/time-format';
-	import TimezoneSelector from '$lib/components/timezone/TimezoneSelector.svelte';
 	import { addOmFileLayers, changeOMfileURL } from '$lib/layers';
 	import { installRnBridge, isEmbedMode } from '$lib/rn-bridge';
 	import { addTerrainSource, getStyle, setMapControlSettings } from '$lib/map-controls';
@@ -66,8 +55,6 @@
 	import '../styles.css';
 
 	import type { RequestParameters } from 'maplibre-gl';
-
-	let clippingPanel: ReturnType<typeof ClippingPanel>;
 
 	let mapContainer: HTMLElement | null;
 
@@ -182,19 +169,14 @@
 		});
 
 		$map.on('load', async () => {
-			if (!embed) {
-				$map.addControl(new DarkModeButton());
-				$map.addControl(new SettingsButton());
-				$map.addControl(new HelpButton());
-				$map.addControl(new ClippingButton());
-			}
-
+			// All the upstream chrome (DarkMode/Settings/Help/Clipping/Hillshade
+			// buttons + clipping panel) was removed when we simplified the
+			// standalone UI to just OverlayPills + TimeSelector. Keep the load
+			// flow itself.
 			if (getInitialMetaDataPromise) await getInitialMetaDataPromise;
 
 			addTerrainSource($map);
 			addTerrainSource($map, 'terrainSource2');
-			if (!embed) $map.addControl(new HillshadeButton());
-			clippingPanel?.initTerraDraw();
 
 			addOmFileLayers();
 			// Skip the click-to-show m/s popup in embed — RN owns the forecast UI.
@@ -268,35 +250,29 @@
 
 <div class="map maplibregl-map" id="#map_container" bind:this={mapContainer}></div>
 
-<ClippingPanel bind:this={clippingPanel} />
 {#if !embed}
-	<Scale />
-	<VariableSelection />
-	<!-- Timezone selector sits below the domain/variable stack in the top-left,
-	     same width and glass-blur style so they read as one control column. -->
-	<div class="tz-stack">
+	<!-- Simplified standalone UI: only what's needed to navigate.
+	     - Wind/Gust/Rain pill selector (top-left)
+	     - Time scrubber (bottom)
+	     - Keyboard shortcuts for the time selector
+	     Everything else (clipping, scale, settings, help, dropzone, full
+	     VariableSelection) was removed to match the focused RN app UX. -->
+	<OverlayPills />
+	<ModelPills />
+	<div class="tz-wrapper">
 		<TimezoneSelector />
 	</div>
 	<TimeSelector />
-	<Settings />
-	<HelpDialog />
 	<KeyboardHandler />
-	<Dropzone
-		ondrop={(features) => {
-			clippingPanel?.addImportedFeatures(features);
-		}}
-	/>
 {/if}
 
 <style>
-	.tz-stack {
-		/* Anchored so it lands just under the variable-selection button stack,
-		   which starts at top-2.5 (10px). The variable stack holds up to 3
-		   buttons (domain, variable, optional level) at h-7.25 (~29px) with
-		   gap-2.5 (10px), so the next row sits at roughly 10 + 3*(29+10). */
+	/* Stacked in the top-left column under ModelPills + OverlayPills. */
+	.tz-wrapper {
 		position: absolute;
-		top: 137px;
-		left: 0.625rem;
-		z-index: 70;
+		top: 100px;
+		left: 12px;
+		z-index: 5;
 	}
 </style>
+

@@ -3,7 +3,9 @@ import { type Writable, get, writable } from 'svelte/store';
 import { BrowserBlockCache } from '@openmeteo/file-reader';
 import {
 	type WeatherMapLayerFileReader,
-	defaultOmProtocolSettings
+	defaultOmProtocolSettings,
+	defaultResolveRequest,
+	resolveColorScale
 } from '@openmeteo/weather-map-layer';
 import { persisted } from 'svelte-persisted-store';
 
@@ -47,6 +49,15 @@ function createBlockCache() {
 	});
 }
 
+// Variable names that must render with the Surfr wind palette, not the
+// Open-Meteo default. We used to rely on the library's colorScales map
+// (exact-match lookup in `getOptionalColorScale`), but that kept getting
+// bypassed somewhere in the chain — browser shows the default blue-green-red
+// gradient for u/v component winds regardless of how we keyed the overrides.
+// Forcing the scale here via a custom `resolveRequest` is the only
+// unambiguous way to make it stick for every wind-family variable.
+const WIND_VARIABLE_PATTERN = /^wind_(speed|gusts|u_component|v_component)(_|$)/;
+
 export const omProtocolSettings: Writable<OmProtocolSettings> = writable({
 	...defaultOmProtocolSettings,
 	// static
@@ -57,14 +68,31 @@ export const omProtocolSettings: Writable<OmProtocolSettings> = writable({
 
 	// dynamic (can be changed during runtime).
 	// Order matters: persisted user customs are applied FIRST, then Surfr's
-	// scale is layered on top. This ensures `wind` always renders with the
-	// Surfr palette regardless of any localStorage residue from earlier
-	// dev sessions in the browser. (`wind` is inherited by wind_speed_10m /
-	// wind_gusts_10m via the library's fallback in styling.ts.)
+	// scale is layered on top.
 	colorScales: {
 		...defaultOmProtocolSettings.colorScales,
 		...initialCustomColorScales,
-		wind: surfrWindScale
+		wind: surfrWindScale,
+		wind_speed_10m: surfrWindScale,
+		wind_gusts_10m: surfrWindScale,
+		wind_u_component_10m: surfrWindScale,
+		wind_v_component_10m: surfrWindScale
+	},
+
+	// Hard override. Wrap the library's default resolver and patch the
+	// colorScale for any wind-family variable to surfrWindScale. Belt-and-
+	// braces on top of the colorScales map above.
+	resolveRequest: (urlComponents, settings) => {
+		const resolved = defaultResolveRequest(urlComponents, settings);
+		if (WIND_VARIABLE_PATTERN.test(resolved.dataOptions.variable)) {
+			const dark = urlComponents.params.get('dark') === 'true';
+			resolved.renderOptions = {
+				...resolved.renderOptions,
+				colorScale: resolveColorScale(surfrWindScale, dark),
+				intervals: surfrWindScale.breakpoints
+			};
+		}
+		return resolved;
 	},
 
 	postReadCallback: (omFileReader: WeatherMapLayerFileReader, data: Data, state: OmUrlState) => {
