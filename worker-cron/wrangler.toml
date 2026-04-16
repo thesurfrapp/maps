@@ -6,3 +6,7 @@ compatibility_date = "2025-01-01"
 # no-ops since model runs publish every 1–12 h.
 [triggers]
 crons = ["*/5 * * * *"]
+
+[observability.logs]
+enabled = true
+invocation_logs = true
