@@ -135,42 +135,65 @@ const runBounded = async <T, R>(
 	return results;
 };
 
-export type PurgeAndRewarmResult = {
+export type PurgeResult = {
 	domain: string;
 	urls: number;
-	purge: { batches: Array<{ ok: boolean; status: number }>; totalMs: number };
-	rewarm: {
-		ok: number;
-		fail: number;
-		totalMs: number;
-		totalBytes: number;
-		byCfCacheStatus: Record<string, number>;
-		shortBodies: Array<{ url: string; bytes: number; contentLength: number }>;
-	};
+	batches: Array<{ ok: boolean; status: number }>;
+	totalMs: number;
 };
 
-export const purgeAndRewarmDomain = async (
+export type RewarmResult = {
+	domain: string;
+	urls: number;
+	ok: number;
+	fail: number;
+	totalMs: number;
+	totalBytes: number;
+	byCfCacheStatus: Record<string, number>;
+	shortBodies: Array<{ url: string; bytes: number; contentLength: number }>;
+};
+
+const buildDomainUrls = (
+	origin: string,
+	domain: string,
+	referenceTime: string,
+	validTimes: string[]
+): string[] => {
+	const capped = capValidTimes(validTimes, referenceTime);
+	return capped.map((iso) => strippedUrl(origin, domain, iso));
+};
+
+// Purge old-run bytes for a domain. Safe to call on every run swap — CF
+// purge is global and covers edge + Cache Reserve + upper tier.
+export const purgeDomain = async (
 	env: PurgeEnv,
 	origin: string,
 	domain: string,
 	referenceTime: string,
 	validTimes: string[]
-): Promise<PurgeAndRewarmResult> => {
-	const capped = capValidTimes(validTimes, referenceTime);
-	const urls = capped.map((iso) => strippedUrl(origin, domain, iso));
-
-	// Step 1: purge (global, all tiers including Cache Reserve).
-	const tPurge = Date.now();
+): Promise<PurgeResult> => {
+	const urls = buildDomainUrls(origin, domain, referenceTime, validTimes);
+	const t0 = Date.now();
 	const batches: Array<{ ok: boolean; status: number }> = [];
 	for (const batch of chunk(urls, PURGE_BATCH)) {
 		const res = await purgeBatch(env, batch);
 		batches.push({ ok: res.ok, status: res.status });
 		if (!res.ok) console.warn('[purge] batch failed', res.status, res.body);
 	}
-	const purgeMs = Date.now() - tPurge;
+	return { domain, urls: urls.length, batches, totalMs: Date.now() - t0 };
+};
 
-	// Step 2: re-warm. Single fetch per URL populates Cache Reserve globally.
-	const tRewarm = Date.now();
+// Re-warm CF Cache Reserve for a domain. Opt-in per-domain: only the big
+// globals really benefit — small regional models first-miss in <500 ms
+// from R2 and don't warrant the ~1 GB/swap of re-warm traffic.
+export const rewarmDomain = async (
+	origin: string,
+	domain: string,
+	referenceTime: string,
+	validTimes: string[]
+): Promise<RewarmResult> => {
+	const urls = buildDomainUrls(origin, domain, referenceTime, validTimes);
+	const t0 = Date.now();
 	const rewarmResults = await runBounded(urls, REWARM_CONCURRENCY, rewarmOne);
 	const ok = rewarmResults.filter((r) => r.status >= 200 && r.status < 400).length;
 	const fail = rewarmResults.length - ok;
@@ -180,23 +203,17 @@ export const purgeAndRewarmDomain = async (
 		const k = r.cfCacheStatus ?? 'null';
 		byCfCacheStatus[k] = (byCfCacheStatus[k] ?? 0) + 1;
 	}
-	// A body that came back short of Content-Length means the stream was cut
-	// (OOM, abort, etc) and CF likely didn't finalise the cache entry.
 	const shortBodies = rewarmResults
 		.filter((r) => r.contentLength > 0 && r.bytes < r.contentLength)
 		.map((r) => ({ url: r.url, bytes: r.bytes, contentLength: r.contentLength }));
-
 	return {
 		domain,
 		urls: urls.length,
-		purge: { batches, totalMs: purgeMs },
-		rewarm: {
-			ok,
-			fail,
-			totalMs: Date.now() - tRewarm,
-			totalBytes,
-			byCfCacheStatus,
-			shortBodies
-		}
+		ok,
+		fail,
+		totalMs: Date.now() - t0,
+		totalBytes,
+		byCfCacheStatus,
+		shortBodies
 	};
 };

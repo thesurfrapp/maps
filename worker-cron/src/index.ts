@@ -21,7 +21,12 @@
 // keeps client-facing URLs stable but flushes old-run bytes from CF edge
 // as soon as R2 holds the new run. See `./purge.ts` for the rationale.
 
-import { type PurgeAndRewarmResult, purgeAndRewarmDomain } from './purge';
+import {
+	type PurgeResult,
+	type RewarmResult,
+	purgeDomain,
+	rewarmDomain
+} from './purge';
 
 const WARMER_BASE = 'https://maps.thesurfr.app/tiles/_warmer-trigger';
 const CLIENT_ORIGIN = 'https://maps.thesurfr.app';
@@ -50,12 +55,19 @@ const DOMAINS = [
 // even when several domains have new runs queued up in one tick.
 const BETWEEN_DOMAIN_MS = 1500;
 
+// Domains whose files are large enough (≥ ~50 MB) that first-hit-per-PoP
+// from R2 is painful. Only these get Cache-Reserve re-warmed by cron.
+// Everyone else gets purged on swap and relies on the (fast) R2 tier for
+// first-per-PoP misses.
+const REWARM_DOMAINS: ReadonlySet<string> = new Set(['dwd_icon']);
+
 type DomainOutcome = {
 	domain: string;
 	status: number;
 	ms: number;
 	warmerStatus?: string;
-	purge?: PurgeAndRewarmResult;
+	purge?: PurgeResult;
+	rewarm?: RewarmResult;
 	bodyHead: string;
 };
 
@@ -107,13 +119,21 @@ const runTick = async (env: Env): Promise<string> => {
 				bodyHead: body.slice(0, 400)
 			};
 			if (result && isWarmed(result)) {
-				outcome.purge = await purgeAndRewarmDomain(
+				outcome.purge = await purgeDomain(
 					env,
 					CLIENT_ORIGIN,
 					domain,
 					result.referenceTime,
 					result.validTimes
 				);
+				if (REWARM_DOMAINS.has(domain)) {
+					outcome.rewarm = await rewarmDomain(
+						CLIENT_ORIGIN,
+						domain,
+						result.referenceTime,
+						result.validTimes
+					);
+				}
 			}
 			outcomes.push(outcome);
 		} catch (err) {
@@ -148,9 +168,12 @@ export default {
 
 	// HTTP entry-points:
 	//   GET /              → full per-domain cron pass (same as scheduled tick)
-	//   GET /force?domain=X → purge + re-warm CF edge cache for ONE domain,
-	//                         regardless of whether the run just swapped. Used
-	//                         for bootstrap and manual recovery.
+	//   GET /force?domain=X → purge + (for rewarm-list domains) re-warm CF
+	//                         edge cache for ONE domain, regardless of
+	//                         whether the run just swapped. Used for
+	//                         bootstrap and manual recovery.
+	//   GET /force?domain=X&rewarm=1 → force re-warm even if domain isn't
+	//                         in the default rewarm list.
 	async fetch(request: Request, env: Env): Promise<Response> {
 		const url = new URL(request.url);
 		if (url.pathname === '/force') {
@@ -168,16 +191,25 @@ export default {
 					{ status: 502, headers: { 'Content-Type': 'application/json' } }
 				);
 			}
-			const purge = await purgeAndRewarmDomain(
+			const purge = await purgeDomain(
 				env,
 				CLIENT_ORIGIN,
 				domain,
 				meta.reference_time,
 				meta.valid_times
 			);
-			return new Response(JSON.stringify({ domain, referenceTime: meta.reference_time, purge }, null, 2), {
-				headers: { 'Content-Type': 'application/json; charset=utf-8' }
-			});
+			const shouldRewarm = REWARM_DOMAINS.has(domain) || url.searchParams.get('rewarm') === '1';
+			const rewarm = shouldRewarm
+				? await rewarmDomain(CLIENT_ORIGIN, domain, meta.reference_time, meta.valid_times)
+				: null;
+			return new Response(
+				JSON.stringify(
+					{ domain, referenceTime: meta.reference_time, purge, rewarm },
+					null,
+					2
+				),
+				{ headers: { 'Content-Type': 'application/json; charset=utf-8' } }
+			);
 		}
 		const out = await runTick(env);
 		return new Response(out, {
