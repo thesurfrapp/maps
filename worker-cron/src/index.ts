@@ -21,12 +21,7 @@
 // keeps client-facing URLs stable but flushes old-run bytes from CF edge
 // as soon as R2 holds the new run. See `./purge.ts` for the rationale.
 
-import {
-	type PurgeResult,
-	type RewarmResult,
-	purgeDomain,
-	rewarmDomain
-} from './purge';
+import { type PurgeResult, type RewarmResult, purgeDomain, rewarmDomain } from './purge';
 
 const WARMER_BASE = 'https://maps.thesurfr.app/tiles/_warmer-trigger';
 const CLIENT_ORIGIN = 'https://maps.thesurfr.app';
@@ -55,11 +50,15 @@ const DOMAINS = [
 // even when several domains have new runs queued up in one tick.
 const BETWEEN_DOMAIN_MS = 1500;
 
-// Domains whose files are large enough (≥ ~50 MB) that first-hit-per-PoP
-// from R2 is painful. Only these get Cache-Reserve re-warmed by cron.
-// Everyone else gets purged on swap and relies on the (fast) R2 tier for
-// first-per-PoP misses.
-const REWARM_DOMAINS: ReadonlySet<string> = new Set(['dwd_icon']);
+// Domains with big-enough files that first-user-per-PoP cold fills feel
+// slow (several seconds) and are therefore worth rewarming to populate
+// Cache Reserve globally. The cron dispatches each URL to the separate
+// `surfr-tile-rewarmer` Worker so each drain has its own 30s CPU budget.
+const REWARM_DOMAINS: ReadonlySet<string> = new Set([
+	'dwd_icon',        // global 0.1°, ~168 MB/file
+	'ncep_gfs013',     // global 0.13°, ~130 MB/file
+	'ecmwf_ifs025'     // global 0.25°, ~80 MB/file
+]);
 
 type DomainOutcome = {
 	domain: string;
@@ -74,6 +73,8 @@ type DomainOutcome = {
 type Env = {
 	CF_PURGE_TOKEN?: string;
 	CF_ZONE_ID?: string;
+	// Service binding → companion `surfr-tile-rewarmer` Worker.
+	REWARMER: { fetch(request: Request): Promise<Response> };
 };
 
 type WarmedResult = {
@@ -131,7 +132,8 @@ const runTick = async (env: Env): Promise<string> => {
 						CLIENT_ORIGIN,
 						domain,
 						result.referenceTime,
-						result.validTimes
+						result.validTimes,
+						env.REWARMER
 					);
 				}
 			}
@@ -176,6 +178,7 @@ export default {
 	//                         in the default rewarm list.
 	async fetch(request: Request, env: Env): Promise<Response> {
 		const url = new URL(request.url);
+
 		if (url.pathname === '/force') {
 			const domain = url.searchParams.get('domain');
 			if (!domain || !DOMAINS.includes(domain as (typeof DOMAINS)[number])) {
@@ -200,7 +203,13 @@ export default {
 			);
 			const shouldRewarm = REWARM_DOMAINS.has(domain) || url.searchParams.get('rewarm') === '1';
 			const rewarm = shouldRewarm
-				? await rewarmDomain(CLIENT_ORIGIN, domain, meta.reference_time, meta.valid_times)
+				? await rewarmDomain(
+						CLIENT_ORIGIN,
+						domain,
+						meta.reference_time,
+						meta.valid_times,
+						env.REWARMER
+					)
 				: null;
 			return new Response(
 				JSON.stringify(

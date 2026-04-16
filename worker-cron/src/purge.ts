@@ -89,33 +89,47 @@ type RewarmOutcome = {
 	cfCacheStatus: string | null;
 };
 
-// Full-file GET with cacheEverything. The Pages Function returns a 200 with
-// the full body from R2; CF's Cache Rule + cacheEverything populate Cache
-// Reserve on the way back. Body is drained as a stream (low memory) and
-// discarded.
-const rewarmOne = async (url: string): Promise<RewarmOutcome> => {
+// Dispatch one URL rewarm via the service-bound companion `surfr-tile-
+// rewarmer` Worker. Each call fires a fresh Worker invocation with its
+// own 30s CPU budget — so dispatching 73 × 168 MB drains from one cron
+// invocation doesn't blow our budget. A same-Worker self-fetch loop is
+// blocked by CF and workers.dev subrequests to a sibling Worker were
+// failing silently in practice; service bindings route internally and
+// work reliably.
+//
+// The service binding is declared in wrangler.toml as `REWARMER`.
+type RewarmerService = { fetch(request: Request): Promise<Response> };
+
+const rewarmOne = async (
+	url: string,
+	rewarmer: RewarmerService
+): Promise<RewarmOutcome> => {
 	const t0 = Date.now();
 	try {
-		const res = await fetch(url, {
-			method: 'GET',
-			cf: { cacheEverything: true, cacheTtl: 30 * 86400 }
-		});
-		const contentLength = Number(res.headers.get('Content-Length') ?? '0');
-		const cfCacheStatus = res.headers.get('CF-Cache-Status');
-		let bytes = 0;
-		const reader = res.body?.getReader();
-		if (reader) {
-			while (true) {
-				const { done, value } = await reader.read();
-				if (done) break;
-				if (value) bytes += value.byteLength;
-			}
+		const dispatch = new Request(
+			`https://rewarmer.internal/rewarm?url=${encodeURIComponent(url)}`,
+			{ method: 'GET' }
+		);
+		const res = await rewarmer.fetch(dispatch);
+		if (!res.ok) {
+			const body = await res.text().catch(() => '(body read failed)');
+			console.warn('[rewarmOne] non-OK', res.status, body.slice(0, 200));
+			return {
+				url,
+				status: res.status,
+				ms: Date.now() - t0,
+				bytes: 0,
+				contentLength: 0,
+				cfCacheStatus: null
+			};
 		}
-		return { url, status: res.status, ms: Date.now() - t0, bytes, contentLength, cfCacheStatus };
-	} catch {
+		return (await res.json()) as RewarmOutcome;
+	} catch (err) {
+		console.warn('[rewarmOne] threw', url, String(err));
 		return { url, status: -1, ms: Date.now() - t0, bytes: 0, contentLength: 0, cfCacheStatus: null };
 	}
 };
+
 
 const runBounded = async <T, R>(
 	items: T[],
@@ -190,11 +204,14 @@ export const rewarmDomain = async (
 	origin: string,
 	domain: string,
 	referenceTime: string,
-	validTimes: string[]
+	validTimes: string[],
+	rewarmer: RewarmerService
 ): Promise<RewarmResult> => {
 	const urls = buildDomainUrls(origin, domain, referenceTime, validTimes);
 	const t0 = Date.now();
-	const rewarmResults = await runBounded(urls, REWARM_CONCURRENCY, rewarmOne);
+	const rewarmResults = await runBounded(urls, REWARM_CONCURRENCY, (u) =>
+		rewarmOne(u, rewarmer)
+	);
 	const ok = rewarmResults.filter((r) => r.status >= 200 && r.status < 400).length;
 	const fail = rewarmResults.length - ok;
 	const totalBytes = rewarmResults.reduce((s, r) => s + r.bytes, 0);
@@ -203,8 +220,10 @@ export const rewarmDomain = async (
 		const k = r.cfCacheStatus ?? 'null';
 		byCfCacheStatus[k] = (byCfCacheStatus[k] ?? 0) + 1;
 	}
+	// `bytes` is now always 1 (we range-request a single byte). The field is
+	// kept for sanity checks — flag anything where we didn't even get 1 byte.
 	const shortBodies = rewarmResults
-		.filter((r) => r.contentLength > 0 && r.bytes < r.contentLength)
+		.filter((r) => r.status >= 200 && r.status < 400 && r.bytes < 1)
 		.map((r) => ({ url: r.url, bytes: r.bytes, contentLength: r.contentLength }));
 	return {
 		domain,
