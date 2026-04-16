@@ -23,36 +23,7 @@ export const setMapControlSettings = ({ embed = false } = {}) => {
 	// In embed mode the RN app owns all UI — don't render any MapLibre
 	// default controls or our own SettingsButton/GlobeControl. RN handles
 	// zoom/globe via postMessage (setZoom / setGlobeProjection bridge).
-	if (embed) {
-		// Diagnostic: `?globeTest=1` re-adds MapLibre's built-in GlobeControl
-		// in the middle of the canvas so we can verify device-side globe
-		// rendering independently of the RN → WebView bridge. Temporary.
-		if (
-			typeof window !== 'undefined' &&
-			new URLSearchParams(window.location.search).get('globeTest') === '1'
-		) {
-			const globeControl = new maplibregl.GlobeControl();
-			map.addControl(globeControl);
-			globeControl._globeButton.addEventListener('click', () => globeHandler());
-			// Reparent the control out of MapLibre's top-right corner wrapper
-			// (whose width = content width, so percent positioning is useless)
-			// and attach to the map's canvas container with viewport-fixed
-			// positioning so it's guaranteed visible in the middle.
-			const container = (globeControl as unknown as { _container: HTMLElement })._container;
-			Object.assign(container.style, {
-				position: 'fixed',
-				top: '50%',
-				left: '50%',
-				transform: 'translate(-50%, -50%) scale(3)',
-				zIndex: '9999',
-				background: 'red',
-				border: '4px solid yellow',
-				padding: '8px'
-			});
-			document.body.appendChild(container);
-		}
-		return;
-	}
+	if (embed) return;
 
 	map.addControl(
 		new maplibregl.NavigationControl({ visualizePitch: true, showZoom: true, showCompass: true })
