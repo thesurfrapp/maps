@@ -249,6 +249,10 @@ export type DomainResult =
 			status: 'warmed';
 			referenceTime: string;
 			previousReferenceTime: string | null;
+			// Full list of ISO validTimes that were warmed in this run. The cron
+			// worker uses these to build stripped client-facing URLs for CF cache
+			// purge + re-warm after a run swap.
+			validTimes: string[];
 			files: { ok: number; skip: number; fail: number; timedOut: boolean };
 			deletedOldFiles: number;
 			wallMs: number;
@@ -378,6 +382,7 @@ const warmDomainInner = async (env: Env, domain: string): Promise<DomainResult> 
 			status: 'warmed',
 			referenceTime: upstream.reference_time,
 			previousReferenceTime: ours?.reference_time ?? null,
+			validTimes: cappedValidTimes,
 			files: fileStats,
 			deletedOldFiles,
 			wallMs: Date.now() - t0

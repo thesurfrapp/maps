@@ -10,3 +10,9 @@ crons = ["*/5 * * * *"]
 [observability.logs]
 enabled = true
 invocation_logs = true
+
+# Plaintext vars. CF_PURGE_TOKEN is a secret — set with:
+#   wrangler secret put CF_PURGE_TOKEN
+# It must be a CF API token scoped to Zone: Cache Purge on the thesurfr.app zone.
+[vars]
+CF_ZONE_ID = "f5f6361a616de5b43d6bc305d452d42c"

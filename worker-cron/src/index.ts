@@ -14,8 +14,17 @@
 // warm everything is bounded by the 15-min scheduled-event walltime cap.
 // Domains we don't reach on a slow tick get picked up on the next one — the
 // warmer's per-file `head` check makes restarts idempotent.
+//
+// When a per-domain call reports `status: "warmed"` — meaning a fresh run
+// just swapped — we also purge CF edge cache for that domain's stripped URLs
+// and re-warm them by fetching with `cf: { cacheEverything: true }`. This
+// keeps client-facing URLs stable but flushes old-run bytes from CF edge
+// as soon as R2 holds the new run. See `./purge.ts` for the rationale.
+
+import { type PurgeRewarmResult, purgeAndRewarmDomain } from './purge';
 
 const WARMER_BASE = 'https://maps.thesurfr.app/tiles/_warmer-trigger';
+const CLIENT_ORIGIN = 'https://maps.thesurfr.app';
 
 // Keep in sync with `functions/lib/domains.ts`. Drift is self-healing: any
 // domain missing here simply won't get its dedicated per-tick slot (but the
@@ -45,12 +54,40 @@ type DomainOutcome = {
 	domain: string;
 	status: number;
 	ms: number;
+	warmerStatus?: string;
+	purge?: PurgeRewarmResult;
 	bodyHead: string;
 };
 
+type Env = {
+	CF_PURGE_TOKEN?: string;
+	CF_ZONE_ID?: string;
+};
+
+type WarmedResult = {
+	domain: string;
+	status: 'warmed';
+	referenceTime: string;
+	validTimes: string[];
+};
+
+type AnyWarmerResult = { domain: string; status: string; referenceTime?: string; validTimes?: string[] };
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const runTick = async (): Promise<string> => {
+const parseWarmerBody = (body: string): AnyWarmerResult[] => {
+	try {
+		const parsed = JSON.parse(body) as { results?: AnyWarmerResult[] };
+		return parsed.results ?? [];
+	} catch {
+		return [];
+	}
+};
+
+const isWarmed = (r: AnyWarmerResult): r is WarmedResult =>
+	r.status === 'warmed' && Array.isArray(r.validTimes) && typeof r.referenceTime === 'string';
+
+const runTick = async (env: Env): Promise<string> => {
 	const tStart = Date.now();
 	const outcomes: DomainOutcome[] = [];
 	for (const domain of DOMAINS) {
@@ -60,7 +97,25 @@ const runTick = async (): Promise<string> => {
 				method: 'GET'
 			});
 			const body = await res.text();
-			outcomes.push({ domain, status: res.status, ms: Date.now() - t0, bodyHead: body.slice(0, 400) });
+			const warmerResults = parseWarmerBody(body);
+			const result = warmerResults.find((r) => r.domain === domain);
+			const outcome: DomainOutcome = {
+				domain,
+				status: res.status,
+				ms: Date.now() - t0,
+				warmerStatus: result?.status,
+				bodyHead: body.slice(0, 400)
+			};
+			if (result && isWarmed(result)) {
+				outcome.purge = await purgeAndRewarmDomain(
+					env,
+					CLIENT_ORIGIN,
+					domain,
+					result.referenceTime,
+					result.validTimes
+				);
+			}
+			outcomes.push(outcome);
 		} catch (err) {
 			outcomes.push({ domain, status: -1, ms: Date.now() - t0, bodyHead: String(err) });
 		}
@@ -81,11 +136,11 @@ const runTick = async (): Promise<string> => {
 export default {
 	async scheduled(
 		_event: ScheduledEvent,
-		_env: unknown,
+		env: Env,
 		ctx: ExecutionContext
 	): Promise<void> {
 		ctx.waitUntil(
-			runTick()
+			runTick(env)
 				.then((out) => console.log('[cron] tick complete', out))
 				.catch((err) => console.error('[cron] tick failed', err))
 		);
@@ -94,8 +149,8 @@ export default {
 	// Manual trigger — `curl https://<worker>.workers.dev/` fires a full
 	// per-domain pass and returns the summary JSON. Useful for bootstrap and
 	// ad-hoc re-warms.
-	async fetch(): Promise<Response> {
-		const out = await runTick();
+	async fetch(_request: Request, env: Env): Promise<Response> {
+		const out = await runTick(env);
 		return new Response(out, {
 			headers: { 'Content-Type': 'application/json; charset=utf-8' }
 		});
