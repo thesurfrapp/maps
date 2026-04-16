@@ -34,14 +34,22 @@ export const setMapControlSettings = ({ embed = false } = {}) => {
 			const globeControl = new maplibregl.GlobeControl();
 			map.addControl(globeControl);
 			globeControl._globeButton.addEventListener('click', () => globeHandler());
+			// Reparent the control out of MapLibre's top-right corner wrapper
+			// (whose width = content width, so percent positioning is useless)
+			// and attach to the map's canvas container with viewport-fixed
+			// positioning so it's guaranteed visible in the middle.
 			const container = (globeControl as unknown as { _container: HTMLElement })._container;
 			Object.assign(container.style, {
-				position: 'absolute',
+				position: 'fixed',
 				top: '50%',
 				left: '50%',
-				transform: 'translate(-50%, -50%) scale(2)',
-				zIndex: '9999'
+				transform: 'translate(-50%, -50%) scale(3)',
+				zIndex: '9999',
+				background: 'red',
+				border: '4px solid yellow',
+				padding: '8px'
 			});
+			document.body.appendChild(container);
 		}
 		return;
 	}
