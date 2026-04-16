@@ -227,6 +227,13 @@
 
 	let getInitialMetaDataPromise: Promise<void> | undefined;
 	const domainSubscription = domain.subscribe(async (newDomain) => {
+		// Capture the previous modelRun BEFORE we reset it, so we can restore
+		// it if the metadata fetch fails. Without this, a transient network
+		// blip leaves `modelRun` undefined permanently, and every subsequent
+		// changeOMfileURL() call bails at the `!omUrl` guard in layers.ts —
+		// only an app kill recovers it. See layers.ts:353.
+		const prevModelRun = $modelRun;
+
 		if ($domain !== newDomain) {
 			await tick(); // await the selectedDomain to be set
 			updateUrl('domain', newDomain);
@@ -234,25 +241,63 @@
 			toast('Domain set to: ' + $selectedDomain.label);
 		}
 
-		getInitialMetaDataPromise = (async () => {
-			await getInitialMetaData();
-			$metaJson = await getMetaData();
+		// Retry with exponential backoff (500ms, 1s, 2s). Most failures here
+		// are transient: edge 5xx during a model-run publish, a flaky mobile
+		// network, or a cold R2 miss. Three tries is enough to recover without
+		// annoying the user.
+		const maxAttempts = 3;
+		let lastErr: unknown;
+		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+			try {
+				getInitialMetaDataPromise = (async () => {
+					await getInitialMetaData();
+					$metaJson = await getMetaData();
 
-			const timeSteps = $metaJson?.valid_times.map((validTime: string) => new Date(validTime));
-			const timeStep = findTimeStep($time, timeSteps);
-			// clamp time to valid times in meta data
-			if (timeStep) {
-				$time = timeStep;
-				updateUrl('time', formatISOWithoutTimezone($time));
-			} else {
-				// otherwise use first valid time
-				$time = timeSteps[0];
-				updateUrl('time', formatISOWithoutTimezone($time));
+					const timeSteps = $metaJson?.valid_times.map(
+						(validTime: string) => new Date(validTime)
+					);
+					const timeStep = findTimeStep($time, timeSteps);
+					// clamp time to valid times in meta data
+					if (timeStep) {
+						$time = timeStep;
+						updateUrl('time', formatISOWithoutTimezone($time));
+					} else {
+						// otherwise use first valid time
+						$time = timeSteps[0];
+						updateUrl('time', formatISOWithoutTimezone($time));
+					}
+
+					matchVariableOrFirst();
+				})();
+				await getInitialMetaDataPromise;
+				lastErr = undefined;
+				break;
+			} catch (err) {
+				lastErr = err;
+				console.warn(
+					`[domain-subscription] metadata fetch failed (attempt ${attempt}/${maxAttempts})`,
+					err
+				);
+				if (attempt < maxAttempts) {
+					await new Promise((r) => setTimeout(r, 500 * 2 ** (attempt - 1)));
+				}
 			}
+		}
 
-			matchVariableOrFirst();
-		})();
-		await getInitialMetaDataPromise;
+		if (lastErr !== undefined) {
+			// All retries exhausted. Restore the previous modelRun (if we had
+			// one) so `getOMUrl()` can keep serving the last-known-good URL
+			// until the next user interaction retriggers this subscription.
+			if (prevModelRun) {
+				$modelRun = prevModelRun;
+				toast('Could not load latest data — keeping previous run');
+			} else {
+				toast('Could not load map data — please try again');
+			}
+			console.error('[domain-subscription] gave up after retries', lastErr);
+			return;
+		}
+
 		changeOMfileURL();
 		// Fire the per-PoP cache warm for this domain's 72 h of .om URLs.
 		// Fire-and-forget: the warm runs in the background while the first
