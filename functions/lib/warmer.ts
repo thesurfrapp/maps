@@ -255,7 +255,35 @@ export type DomainResult =
 	  }
 	| { domain: string; status: 'error'; error: string };
 
+// Persisted per-domain tick record. The admin page reads
+// `_warmer/last-run.json` which is only written by the batched `warmAll` path
+// — once we shifted to the cron worker calling `warmDomain` per domain, that
+// file stopped updating. Writing a small per-domain file + a last-tick
+// pointer lets the admin show accurate "last cron" info either way.
+const persistLastTick = async (env: Env, result: DomainResult): Promise<void> => {
+	const at = new Date().toISOString();
+	const record = JSON.stringify({ at, ...result });
+	try {
+		await env.TILE_CACHE.put(`_warmer/last-domain-${result.domain}.json`, record, {
+			httpMetadata: { contentType: 'application/json' }
+		});
+		await env.TILE_CACHE.put(
+			'_warmer/last-tick.json',
+			JSON.stringify({ at, domain: result.domain, status: result.status }),
+			{ httpMetadata: { contentType: 'application/json' } }
+		);
+	} catch (err) {
+		console.warn('[warmer] failed to persist last-tick', err);
+	}
+};
+
 export const warmDomain = async (env: Env, domain: string): Promise<DomainResult> => {
+	const result = await warmDomainInner(env, domain);
+	await persistLastTick(env, result);
+	return result;
+};
+
+const warmDomainInner = async (env: Env, domain: string): Promise<DomainResult> => {
 	const t0 = Date.now();
 	const deadline = t0 + PER_DOMAIN_TIMEOUT_MS;
 	try {

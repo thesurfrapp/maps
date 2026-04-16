@@ -151,7 +151,24 @@ const escapeHtml = (v: string | null | undefined): string => {
 		.replace(/"/g, '&quot;');
 };
 
-const renderHtml = (rows: DomainRow[], lastCron: unknown): string => {
+const relativeAge = (iso: string | null | undefined): string => {
+	if (!iso) return '—';
+	const ms = Date.now() - new Date(iso).getTime();
+	if (isNaN(ms)) return '—';
+	const s = Math.floor(ms / 1000);
+	if (s < 60) return `${s}s ago`;
+	const m = Math.floor(s / 60);
+	if (m < 60) return `${m}m ago`;
+	const h = Math.floor(m / 60);
+	if (h < 24) return `${h}h ago`;
+	return `${Math.floor(h / 24)}d ago`;
+};
+
+const renderHtml = (
+	rows: DomainRow[],
+	lastCron: unknown,
+	perDomainTicks: Record<string, unknown>
+): string => {
 	const rowsHtml = rows
 		.map((r) => {
 			const color = STATUS_COLORS[r.status];
@@ -164,6 +181,13 @@ const renderHtml = (rows: DomainRow[], lastCron: unknown): string => {
 				r.r2Latest && r.r2Meta && r.r2Latest !== r.r2Meta
 					? `<br><span style="color:#ef4444;font-size:11px">meta.json out of sync: ${escapeHtml(r.r2Meta)}</span>`
 					: '';
+			const tick = perDomainTicks[r.domain] as
+				| { at?: string; status?: string; error?: string; wallMs?: number }
+				| undefined
+				| null;
+			const tickCell = tick
+				? `<div style="font-size:11px">${escapeHtml(relativeAge(tick.at))}<br><span style="color:#6b7280">${escapeHtml(tick.status ?? '')}${tick.wallMs ? ` &middot; ${tick.wallMs}ms` : ''}</span></div>`
+				: '<span style="color:#9ca3af">never</span>';
 			return `<tr>
 				<td><strong>${escapeHtml(r.domain)}</strong></td>
 				<td>${statusPill}</td>
@@ -172,20 +196,20 @@ const renderHtml = (rows: DomainRow[], lastCron: unknown): string => {
 				<td style="text-align:right">${r.totalMb.toFixed(1)}&nbsp;MB</td>
 				<td><code>${escapeHtml(r.oldestValid)}</code></td>
 				<td><code>${escapeHtml(r.newestValid)}</code></td>
+				<td>${tickCell}</td>
 			</tr>`;
 		})
 		.join('');
 
 	const totalMb = rows.reduce((s, r) => s + r.totalMb, 0);
 	const totalFiles = rows.reduce((s, r) => s + r.fileCount, 0);
+	const cronAt =
+		(lastCron as { at?: string } | null)?.at ??
+		(lastCron as { finishedAt?: string } | null)?.finishedAt ??
+		(lastCron as { startedAt?: string } | null)?.startedAt ??
+		null;
 	const cronDetails = lastCron
-		? `<details><summary>Last cron: ${escapeHtml(
-				(lastCron as { finishedAt?: string }).finishedAt ??
-					(lastCron as { startedAt?: string }).startedAt ??
-					'?'
-			)} (${escapeHtml(
-				JSON.stringify((lastCron as { byStatus?: unknown }).byStatus ?? {})
-			)})</summary><pre style="background:#0b0b0f;color:#d1d5db;padding:12px;border-radius:6px;overflow:auto;font-size:12px">${escapeHtml(
+		? `<details><summary>Last cron: ${escapeHtml(cronAt)} (${escapeHtml(relativeAge(cronAt))})</summary><pre style="background:#0b0b0f;color:#d1d5db;padding:12px;border-radius:6px;overflow:auto;font-size:12px">${escapeHtml(
 				JSON.stringify(lastCron, null, 2)
 			)}</pre></details>`
 		: `<p style="color:#ef4444">No cron has run yet.</p>`;
@@ -242,6 +266,7 @@ ${cronDetails}
 	<th>Size</th>
 	<th>Oldest valid</th>
 	<th>Newest valid</th>
+	<th>Last tick</th>
 </tr>
 </thead>
 <tbody>${rowsHtml}</tbody>
@@ -250,20 +275,35 @@ ${cronDetails}
 </html>`;
 };
 
+const readJson = async (bucket: R2Bucket, key: string): Promise<unknown> => {
+	try {
+		const obj = await bucket.get(key);
+		if (!obj) return null;
+		return JSON.parse(await obj.text());
+	} catch {
+		return null;
+	}
+};
+
 export const onRequestGet: PagesFunction<Env> = async (context) => {
 	const rows = await Promise.all(
 		WARMED_DOMAINS.map((d) => collectRow(context.env.TILE_CACHE, d))
 	);
 
-	let lastCron: unknown = null;
-	try {
-		const obj = await context.env.TILE_CACHE.get('_warmer/last-run.json');
-		if (obj) lastCron = JSON.parse(await obj.text());
-	} catch {
-		/* noop */
-	}
+	// `last-tick.json` is written on every `warmDomain` (sharded cron path).
+	// `last-run.json` is only written by the legacy `warmAll` path. Prefer the
+	// tick file; fall back to the batch file if no sharded tick has happened yet.
+	const lastTick = await readJson(context.env.TILE_CACHE, '_warmer/last-tick.json');
+	const lastRun = await readJson(context.env.TILE_CACHE, '_warmer/last-run.json');
+	const perDomainTicks = await Promise.all(
+		WARMED_DOMAINS.map((d) =>
+			readJson(context.env.TILE_CACHE, `_warmer/last-domain-${d}.json`).then((v) => ({ domain: d, v }))
+		)
+	);
+	const domainTickByName = Object.fromEntries(perDomainTicks.map((x) => [x.domain, x.v]));
+	const lastCron = lastTick ?? lastRun;
 
-	return new Response(renderHtml(rows, lastCron), {
+	return new Response(renderHtml(rows, lastCron, domainTickByName), {
 		headers: {
 			'Content-Type': 'text/html; charset=utf-8',
 			'Cache-Control': 'no-store'

@@ -7,6 +7,9 @@
 
 	import { Toaster } from '$lib/components/ui/sonner';
 
+	// Must run before anything constructs an OmFileReader — monkey-patches the
+	// prototype to parallelise index-block reads.
+	import '$lib/om-reader-patch';
 	import { METADATA_REFRESH_INTERVAL, MILLISECONDS_PER_MINUTE } from '$lib/constants';
 	import { getInitialMetaData } from '$lib/metadata';
 
