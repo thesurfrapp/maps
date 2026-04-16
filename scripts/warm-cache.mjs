@@ -161,7 +161,17 @@ async function processDomain(domain, state) {
 					const url = `${PROXY_BASE}/data_spatial/${domain}/${runPath}/${fmtValidTime(validTime)}.om`;
 					const req = performance.now();
 					try {
-						const res = await fetch(url, FULL_GET ? {} : { headers: { Range: 'bytes=0-65535' } });
+						// Prefer the dedicated X-Surfr-Warm path on the Pages Function:
+						// the Function drains + caches the upstream body via
+						// `waitUntil`, returning 202 immediately. More reliable
+						// than relying on the normal path to fully fill cache
+						// when the warmer reads the body client-side.
+						const res = await fetch(url, {
+							headers: {
+								'X-Surfr-Warm': '1',
+								...(FULL_GET ? {} : { Range: 'bytes=0-65535' })
+							}
+						});
 						const ms = performance.now() - req;
 						totalMs += ms;
 						if (!res.ok && res.status !== 206) {
