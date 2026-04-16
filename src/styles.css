@@ -438,3 +438,10 @@
 	border: none !important;
 	background: none !important;
 }
+
+/* Hide informational sonner toasts — the blue "Domain set to…" / "Variable
+   set to…" etc. popups are noisy in embed mode. Error toasts still render
+   so genuine failures (load errors, retry-exhausted) reach the user. */
+[data-sonner-toast]:not([data-type='error']) {
+	display: none !important;
+}

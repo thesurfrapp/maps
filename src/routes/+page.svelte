@@ -302,7 +302,7 @@
 			// for the active run — our .om URL deliberately omits the run path
 			// (see url.ts:getOMUrl). Next domain/variable/time interaction
 			// will retrigger the subscription and retry.
-			toast('Could not load map data — please try again');
+			toast.error('Could not load map data — please try again');
 			console.error('[domain-subscription] gave up after retries', lastErr);
 			return;
 		}
