@@ -14,19 +14,26 @@ const KT_TO_MPS = 0.514444;
 // OpenFreeMap's dark style; raised to 0.35 so calm sits readably over both
 // light and dark basemaps. Global raster-opacity preference still multiplies
 // on top.
-// Anchors in knots — RGB synced with WindguruService.WIND_COLOR_ANCHORS in /frontend.
+//
+// RGB hues come from WindguruService.WIND_COLOR_ANCHORS in /frontend, but each
+// anchor's dominant channel is pushed to 255. The forecast-table cells in RN
+// render against their own solid backgrounds so the original mid-saturated
+// values work there; the MAP renders over a dark basemap where those same
+// RGBs read as muddy. Boosting to max brightness per anchor preserves hue
+// family (blue-cyan-green-lime-yellow-orange-red-pink-magenta-purple) but
+// makes each band pop against black.
 const anchors: [number, number, number, number, number][] = [
 	// kt, R, G, B, alpha
-	[0, 80, 112, 192, 0.35],
-	[5, 64, 184, 200, 0.45],
-	[10, 80, 200, 120, 0.55],
-	[15, 144, 216, 64, 0.65],
-	[20, 208, 216, 40, 0.7],
-	[25, 232, 168, 48, 0.75],
-	[30, 224, 104, 72, 0.8],
-	[35, 224, 72, 152, 0.85],
-	[40, 208, 72, 192, 0.9],
-	[50, 136, 88, 200, 0.95]
+	[0, 106, 149, 255, 0.35], //  blue (was 80,112,192)
+	[5, 82, 235, 255, 0.45], //   cyan (was 64,184,200)
+	[10, 102, 255, 153, 0.55], // green (was 80,200,120)
+	[15, 170, 255, 75, 0.65], //  lime (was 144,216,64)
+	[20, 245, 255, 47, 0.7], //   yellow (was 208,216,40)
+	[25, 255, 185, 53, 0.75], //  orange (was 232,168,48)
+	[30, 255, 118, 82, 0.8], //   red-orange (was 224,104,72)
+	[35, 255, 82, 173, 0.85], //  pink (was 224,72,152)
+	[40, 255, 88, 235, 0.9], //   magenta (was 208,72,192)
+	[50, 173, 112, 255, 0.95] //  purple (was 136,88,200)
 ];
 
 // Densify to 1-knot resolution. Both RGB and alpha are interpolated between
