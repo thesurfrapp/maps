@@ -146,13 +146,58 @@ export default {
 		);
 	},
 
-	// Manual trigger — `curl https://<worker>.workers.dev/` fires a full
-	// per-domain pass and returns the summary JSON. Useful for bootstrap and
-	// ad-hoc re-warms.
-	async fetch(_request: Request, env: Env): Promise<Response> {
+	// HTTP entry-points:
+	//   GET /              → full per-domain cron pass (same as scheduled tick)
+	//   GET /force?domain=X → purge + re-warm CF edge cache for ONE domain,
+	//                         regardless of whether the run just swapped. Used
+	//                         for bootstrap and manual recovery.
+	async fetch(request: Request, env: Env): Promise<Response> {
+		const url = new URL(request.url);
+		if (url.pathname === '/force') {
+			const domain = url.searchParams.get('domain');
+			if (!domain || !DOMAINS.includes(domain as (typeof DOMAINS)[number])) {
+				return new Response(
+					JSON.stringify({ error: 'unknown or missing domain', known: DOMAINS }, null, 2),
+					{ status: 400, headers: { 'Content-Type': 'application/json' } }
+				);
+			}
+			const meta = await fetchMetaJson(domain);
+			if (!meta) {
+				return new Response(
+					JSON.stringify({ error: 'meta.json unreachable', domain }, null, 2),
+					{ status: 502, headers: { 'Content-Type': 'application/json' } }
+				);
+			}
+			const purge = await purgeAndRewarmDomain(
+				env,
+				CLIENT_ORIGIN,
+				domain,
+				meta.reference_time,
+				meta.valid_times
+			);
+			return new Response(JSON.stringify({ domain, referenceTime: meta.reference_time, purge }, null, 2), {
+				headers: { 'Content-Type': 'application/json; charset=utf-8' }
+			});
+		}
 		const out = await runTick(env);
 		return new Response(out, {
 			headers: { 'Content-Type': 'application/json; charset=utf-8' }
 		});
+	}
+};
+
+// Fetches meta.json for a domain (served by the Pages Function from R2) and
+// returns the essentials needed for purge + re-warm.
+const fetchMetaJson = async (
+	domain: string
+): Promise<{ reference_time: string; valid_times: string[] } | null> => {
+	try {
+		const res = await fetch(`${CLIENT_ORIGIN}/tiles/data_spatial/${domain}/meta.json`);
+		if (!res.ok) return null;
+		const parsed = (await res.json()) as { reference_time?: string; valid_times?: string[] };
+		if (!parsed.reference_time || !Array.isArray(parsed.valid_times)) return null;
+		return { reference_time: parsed.reference_time, valid_times: parsed.valid_times };
+	} catch {
+		return null;
 	}
 };

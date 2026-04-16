@@ -26,7 +26,11 @@
 const API_BASE = 'https://api.cloudflare.com/client/v4';
 const PURGE_BATCH = 30; // Free-plan limit per purge_cache call.
 const REWARM_CONCURRENCY = 4;
-const REWARM_HORIZON_HOURS = 24;
+// Match the server-side warmer cap (MAX_HORIZON_HOURS in functions/lib/warmer.ts)
+// so anything R2 holds also gets CF-edge-pre-warmed — otherwise hours 24-72
+// cost the first visitor a MISS even though R2 has the bytes. Traffic from
+// cron → Pages Function → R2 stays inside CF network (free), so no egress hit.
+const REWARM_HORIZON_HOURS = 72;
 
 type PurgeEnv = {
 	CF_PURGE_TOKEN?: string;
@@ -75,7 +79,17 @@ const purgeBatch = async (
 	return { ok: res.ok, status: res.status, body: body.slice(0, 300) };
 };
 
-const rewarmOne = async (url: string): Promise<{ url: string; status: number; ms: number }> => {
+type RewarmOutcome = {
+	url: string;
+	status: number;
+	ms: number;
+	bytes: number;
+	contentLength: number;
+	cfCacheStatus: string | null;
+	error?: string;
+};
+
+const rewarmOne = async (url: string): Promise<RewarmOutcome> => {
 	const t0 = Date.now();
 	try {
 		// GET without a Range header so the Pages Function returns the full 200
@@ -87,11 +101,38 @@ const rewarmOne = async (url: string): Promise<{ url: string; status: number; ms
 				cacheTtl: 30 * 86400
 			}
 		});
-		// Must consume the body or CF won't finalise the cache write.
-		await res.arrayBuffer().catch(() => undefined);
-		return { url, status: res.status, ms: Date.now() - t0 };
+		const contentLength = Number(res.headers.get('Content-Length') ?? '0');
+		const cfCacheStatus = res.headers.get('CF-Cache-Status');
+		// Drain the body as a stream — lower memory than arrayBuffer() (which
+		// would buffer all 30+ MB in the isolate, then at concurrency=4 bump us
+		// into OOM). CF finalises the cache write as bytes pass through.
+		let bytes = 0;
+		const reader = res.body?.getReader();
+		if (reader) {
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				if (value) bytes += value.byteLength;
+			}
+		}
+		return {
+			url,
+			status: res.status,
+			ms: Date.now() - t0,
+			bytes,
+			contentLength,
+			cfCacheStatus
+		};
 	} catch (err) {
-		return { url, status: -1, ms: Date.now() - t0 };
+		return {
+			url,
+			status: -1,
+			ms: Date.now() - t0,
+			bytes: 0,
+			contentLength: 0,
+			cfCacheStatus: null,
+			error: String(err)
+		};
 	}
 };
 
@@ -117,7 +158,15 @@ export type PurgeRewarmResult = {
 	domain: string;
 	urls: number;
 	purgeBatches: Array<{ ok: boolean; status: number }>;
-	rewarmed: { ok: number; fail: number; totalMs: number };
+	rewarmed: {
+		ok: number;
+		fail: number;
+		totalMs: number;
+		totalBytes: number;
+		totalContentLength: number;
+		byCfCacheStatus: Record<string, number>;
+		shortBodies: Array<{ url: string; bytes: number; contentLength: number }>;
+	};
 };
 
 export const purgeAndRewarmDomain = async (
@@ -145,11 +194,31 @@ export const purgeAndRewarmDomain = async (
 	const rewarmResults = await runBounded(urls, REWARM_CONCURRENCY, rewarmOne);
 	const ok = rewarmResults.filter((r) => r.status >= 200 && r.status < 400).length;
 	const fail = rewarmResults.length - ok;
+	const totalBytes = rewarmResults.reduce((s, r) => s + r.bytes, 0);
+	const totalContentLength = rewarmResults.reduce((s, r) => s + r.contentLength, 0);
+	const byCfCacheStatus: Record<string, number> = {};
+	for (const r of rewarmResults) {
+		const key = r.cfCacheStatus ?? 'null';
+		byCfCacheStatus[key] = (byCfCacheStatus[key] ?? 0) + 1;
+	}
+	// Catch silently-truncated downloads: if bytes < Content-Length, cache didn't
+	// get the full file — the re-warm didn't do what we think it did.
+	const shortBodies = rewarmResults
+		.filter((r) => r.contentLength > 0 && r.bytes < r.contentLength)
+		.map((r) => ({ url: r.url, bytes: r.bytes, contentLength: r.contentLength }));
 
 	return {
 		domain,
 		urls: urls.length,
 		purgeBatches,
-		rewarmed: { ok, fail, totalMs: Date.now() - t0 }
+		rewarmed: {
+			ok,
+			fail,
+			totalMs: Date.now() - t0,
+			totalBytes,
+			totalContentLength,
+			byCfCacheStatus,
+			shortBodies
+		}
 	};
 };
