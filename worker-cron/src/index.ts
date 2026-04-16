@@ -50,15 +50,16 @@ const DOMAINS = [
 // even when several domains have new runs queued up in one tick.
 const BETWEEN_DOMAIN_MS = 1500;
 
-// Domains with big-enough files that first-user-per-PoP cold fills feel
-// slow (several seconds) and are therefore worth rewarming to populate
-// Cache Reserve globally. The cron dispatches each URL to the separate
-// `surfr-tile-rewarmer` Worker so each drain has its own 30s CPU budget.
-const REWARM_DOMAINS: ReadonlySet<string> = new Set([
-	'dwd_icon',        // global 0.1°, ~168 MB/file
-	'ncep_gfs013',     // global 0.13°, ~130 MB/file
-	'ecmwf_ifs025'     // global 0.25°, ~80 MB/file
-]);
+// Rewarm disabled pending CF support response about Cache Reserve.
+// Empirically CR stores content but never serves cross-PoP on our Pro/
+// Smart-Shield-Free tier — the rewarm traffic populates the feature but
+// clients never benefit, so it's wasted ~12 GB + 2 min per dwd_icon swap.
+// Add domains back to this Set once CF confirms CR works for our setup.
+//
+// Everything else (rewarmer Worker, service binding, /force endpoint,
+// admin per-domain buttons) stays in place so we can re-enable instantly
+// with a one-line edit + redeploy.
+const REWARM_DOMAINS: ReadonlySet<string> = new Set<string>();
 
 type DomainOutcome = {
 	domain: string;
