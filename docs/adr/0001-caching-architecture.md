@@ -1,6 +1,6 @@
 # ADR 0001 — Tile caching architecture on Cloudflare
 
-- Status: **Accepted**
+- Status: **Accepted — with active Cache Reserve investigation (see Update 2026-04-16)**
 - Date: 2026-04-16
 - Scope: `functions/tiles/*`, `functions/lib/*`, `worker-cron/*`, `src/lib/url.ts`,
   `src/lib/stores/om-protocol-settings.ts`, CF Pages project `maps`, CF Worker
@@ -346,6 +346,77 @@ latency — it represents the cost of being the "first warmer" for every URL
 at your PoP. That cost is paid once per (URL, PoP) per 30 days in
 production. With N users per PoP, only 1-in-N pays it.
 
+## Update 2026-04-16 — Cache Reserve findings and current PoP-warming mitigation
+
+After the initial deploy we revisited Cache Reserve as a way to eliminate
+the per-PoP first-miss cost (the "first warmer" tax called out above).
+Cache Reserve, in theory, should behave like a global persistent tier that
+sits between per-PoP edge caches and origin — so any PoP's MISS would fall
+through to Cache Reserve (global HIT) instead of to our Pages Function
+→ R2 path. Combined with our existing cron-driven purge-and-refill loop,
+the goal was: one warm pass per run swap → every PoP is effectively hot
+from the next request onward.
+
+**What we found:**
+
+1. **Cache Reserve does not catch our traffic.** Despite the `.om` Cache
+   Rule being eligible and `CF-Cache-Status` reporting `MISS` at the edge,
+   subsequent cold-PoP hits do **not** come back as `HIT` from Cache
+   Reserve — they fall straight through to our Pages Function / R2.
+   Responses lack the `cf-cache-reserve-*` markers we would expect on a
+   reserve HIT. Empirically, Cache Reserve behaves as if it's disabled for
+   our zone even with the feature toggled on.
+2. **Cron-driven warm probes are not being "caught" by Cache Reserve
+   either.** The cron worker's stripped-URL fetches after a run swap
+   (intended, in the re-warm version of the design, to populate Cache
+   Reserve from one well-connected PoP and thereby warm every downstream
+   PoP) do not end up in the reserve. As a result re-warming from the cron
+   has no global benefit — it only warms the cron's own PoP, which is
+   exactly the trade-off that led us to remove re-warm from the cron in the
+   first place.
+3. **Support ticket is open with Cloudflare** to determine whether this is
+   a plan-gating issue, a zone-configuration issue, or a product limitation
+   (e.g. Cache Reserve only engages for specific content types, size
+   thresholds, or origin types, and our Pages-Function-fronted R2 traffic
+   isn't one of them). Ticket status will be tracked on the internal
+   engineering doc; update this ADR once resolved.
+
+**Consequences while the ticket is open:**
+
+- The **cron worker does not re-warm**. It purges globally on run swap and
+  stops. There is no point spending internal traffic on probing URLs that
+  won't land in a shared tier. This matches the code already committed in
+  `worker-cron/src/index.ts` and the "purge-only, no re-warm" line under
+  *PoPs and edge warming* above — but the reason is now "Cache Reserve is
+  not catching probes" rather than "re-warm only warms the cron's PoP".
+  Both are true; the current one is load-bearing.
+- **PoP warm-up is therefore a client-side concern.** The
+  `postReadCallback` prefetch documented under *The prefetch — per-PoP
+  self-warming* (see `src/lib/stores/om-protocol-settings.ts`) is, in
+  effect, how PoPs get warm for a given user session today: the user's
+  first scrub at a PoP fetches prev/next-hour files in the background,
+  which — because CF caches the full file on any range request against a
+  cacheable URL — populates that PoP's edge for every adjacent hour the
+  user is likely to scrub to next.
+- This means **the first user at a cold PoP still pays the MISS cost** on
+  the very first `.om` URL they touch. There is no server-side mechanism
+  that will warm their PoP before they hit it. Anything else a user scrubs
+  to gets pre-warmed by the prefetch they just triggered.
+- The **R2 tier remains load-bearing** as the fallback for every cold-PoP
+  MISS. Without Cache Reserve catching anything, the path for a cold-PoP
+  first request is always: edge MISS → Pages Function → R2 HIT → 206.
+  Latency sits in the 400–600 ms band we document in the *Why first-hit
+  latency looks bad in isolation* section.
+
+**If / when Cloudflare resolves the ticket** and Cache Reserve starts
+catching our probes, the minimal change is to flip the cron worker from
+purge-only back to purge + re-warm: after `purgeDomain` completes, fire a
+bounded-concurrency `fetch(strippedUrl, { cf: { cacheEverything: true } })`
+for each validTime so the next tier above the PoPs is primed. Code
+location: `worker-cron/src/index.ts:runTick`, right after the `purgeDomain`
+call. The re-warm itself is ~1 GB of internal traffic per domain per swap
+and was measured cheap when we had it enabled earlier.
+
 ## Observability
 
 Response headers on `.om` responses carry enough telemetry to diagnose any
@@ -400,19 +471,16 @@ All internal traffic, all free.
 
 ## Future work
 
-- **Smart Tiered Cache validation.** Smart Tiered Cache is **enabled** on
-  the zone (`thesurfr.app` → Caching → Tiered Cache → Smart Tiered Cache
-  Topology = ON). In theory this means the cron worker's writes should
-  populate an upper-tier PoP, and any user PoP's cache miss should then
-  query that upper tier (MISS → tier HIT → ~200 ms instead of origin's
-  ~1 s). Empirically we saw cold-URL user MISSes taking ~500 ms–1 s, which
-  suggests the tier isn't catching Worker-originated fetches reliably — or
-  the timing was dominated by the cold R2 read once the tier did miss. To
-  confirm, instrument a cold-URL curl from a non-cron PoP right after a
-  cron purge and measure TTFB. If the tier is effective the right next
-  move is to re-enable the cron worker's re-warm (a pure `fetch(url, {
-  cf: { cacheEverything: true } })` per stripped URL, no content
-  inspection) so the tier is always primed after a purge.
+- **Cache Reserve / Smart Tiered Cache resolution (blocked on CF support
+  ticket).** Smart Tiered Cache is enabled on the zone and Cache Reserve
+  was evaluated as the next escalation, but — as documented in the
+  *Update 2026-04-16* section above — neither is catching our traffic
+  today. Support ticket is open with Cloudflare; when resolved, re-enable
+  the cron worker's re-warm step (a pure `fetch(url, { cf: {
+  cacheEverything: true } })` per stripped URL after `purgeDomain`) so the
+  shared tier is primed on every run swap. Code location:
+  `worker-cron/src/index.ts:runTick`. Until the ticket is resolved,
+  continue relying on the client-side prefetch for per-PoP warming.
 - **Pre-populate PoPs globally.** CF does not expose a primitive to push a
   cache entry into every PoP. If first-user-per-PoP latency proves painful
   after Smart Tiered Cache is ruled out, options include:
