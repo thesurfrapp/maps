@@ -22,7 +22,11 @@ export interface Env {
 }
 
 const UPSTREAM_HOST = 'https://map-tiles.open-meteo.com';
-const OM_FILE_CONCURRENCY = 8;
+// Per-domain parallel file warms. Kept low so upstream Open-Meteo never sees
+// more than a handful of concurrent requests from us. The cron worker also
+// serialises domains (one at a time) so total concurrent upstream load is
+// capped at this number.
+const OM_FILE_CONCURRENCY = 4;
 
 // Cap each domain's warm at +72 h from the reference_time. Most kiters don't
 // look beyond that horizon; shaving longer-range files cuts R2 writes + storage.

@@ -360,10 +360,14 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 	// legacy full (`/data_spatial/<d>/<runPath>/<validTime>.om`) — we read R2
 	// latest.json for the domain and always build the canonical path from it.
 	let upstreamPath = rawPath;
+	let referenceTime: string | null = null;
+	let latestMs = 0;
 	if (rawPath.endsWith('.om')) {
 		const domain = extractDomain(rawPath);
 		if (domain) {
+			const tLatest = Date.now();
 			const ourLatest = await readR2LatestCached(env.TILE_CACHE, domain);
+			latestMs = Date.now() - tLatest;
 			if (!ourLatest) {
 				return new Response(
 					JSON.stringify({
@@ -383,6 +387,7 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 			}
 			const canonical = buildCanonicalOmPath(rawPath, ourLatest.reference_time);
 			if (canonical) upstreamPath = canonical.path;
+			referenceTime = ourLatest.reference_time;
 		}
 	}
 
@@ -418,7 +423,10 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 				range ? { range: { offset: range.offset, length: range.length } } : undefined
 			);
 			if (r2Obj) {
-				return r2ToResponse(r2Obj, range, r2Obj.size, ttl, 'HIT-R2');
+				const response = r2ToResponse(r2Obj, range, r2Obj.size, ttl, 'HIT-R2');
+				if (referenceTime) response.headers.set('X-Surfr-Reference-Time', referenceTime);
+				if (latestMs) response.headers.set('X-Surfr-Latest-Ms', String(latestMs));
+				return response;
 			}
 		} catch (err) {
 			console.warn('[r2-get] failed', r2Key, err);
@@ -467,6 +475,8 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 	headers.set('Cache-Control', `public, max-age=${ttl}`);
 	headers.set(CACHE_STATUS_HEADER, edgeStatus);
 	headers.set('X-Surfr-Upstream-Ms', String(upstreamMs));
+	if (referenceTime) headers.set('X-Surfr-Reference-Time', referenceTime);
+	if (latestMs) headers.set('X-Surfr-Latest-Ms', String(latestMs));
 	if (forceRefresh) headers.set('X-Surfr-Refreshed', '1');
 
 	return new Response(upstream.body, {
