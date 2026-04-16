@@ -1,0 +1,8 @@
+name = "surfr-tile-warmer-cron"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+# Every 5 minutes. Checks upstream latest.json per domain; most ticks are
+# no-ops since model runs publish every 1–12 h.
+[triggers]
+crons = ["*/5 * * * *"]

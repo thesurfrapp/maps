@@ -169,7 +169,12 @@ export const getOMUrl = () => {
 	if (!modelRun) return undefined;
 	const selectedTime = get(time);
 
-	let result = `${base}/${fmtModelRun(modelRun)}/${fmtSelectedTime(selectedTime)}.om`;
+	// NOTE: the URL intentionally OMITS the run-path (YYYY/MM/DD/HHmmZ). The
+	// server (our Pages Function backed by R2) is the single source of truth
+	// for "which run is current" — it reads R2 latest.json and fills in the
+	// runPath when fetching/serving the .om file. Stripping the runPath client-
+	// side eliminates stale-URL races after a new run publishes.
+	let result = `${base}/${fmtSelectedTime(selectedTime)}.om`;
 	result += `?variable=${get(v)}`;
 
 	if (mode.current === 'dark') result += '&dark=true';
@@ -242,11 +247,15 @@ export const getNextOmUrls = (
 	const prevModelRun = clampRun(closestModelRun(prevDate, domain.model_interval));
 	const nextModelRun = clampRun(closestModelRun(nextDate, domain.model_interval));
 
+	// Strip runPath: the server fills it in from R2 latest.json. Same pattern
+	// as getOMUrl above.
+	void prevModelRun;
+	void nextModelRun;
 	const prevUrl = !isNaN(prevDate.getTime())
-		? `${base}/${fmtModelRun(prevModelRun)}/${fmtSelectedTime(prevDate)}.om`
+		? `${base}/${fmtSelectedTime(prevDate)}.om`
 		: undefined;
 	const nextUrl = !isNaN(nextDate.getTime())
-		? `${base}/${fmtModelRun(nextModelRun)}/${fmtSelectedTime(nextDate)}.om`
+		? `${base}/${fmtSelectedTime(nextDate)}.om`
 		: undefined;
 
 	return [prevUrl, nextUrl];

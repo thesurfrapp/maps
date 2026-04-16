@@ -1,32 +1,16 @@
-// Cloudflare Pages Function — tile proxy with three-tier caching.
+// Cloudflare Pages Function — tile proxy backed by R2.
 //
-//   Browser ─► CF edge cache (auto-cached via our Cache-Control headers)
+//   Browser ─► CF edge cache (auto-populated from our Cache-Control headers)
 //              └► miss ─► this Function runs
-//                         ├► R2 (persistent cache — our DIY Cache Reserve)
-//                         │   └► HIT: serve from R2 (edge auto-caches the response)
-//                         │   └► MISS: go to origin, tee body, stream to R2 + client
-//                         └► origin (Open-Meteo) — last resort
-//
-// Why R2 instead of CF Cache Reserve?
-//   CF Cache Reserve is gated behind Smart Shield Advanced ($50/mo). R2 gives us
-//   the same persistence (single global store, readable from any PoP) for ~$0.08/mo
-//   at our volume, with egress free inside the CF network.
-//
-// Range handling:
-//   R2 natively supports byte-range reads, so `GET` with `Range` on an R2-HIT
-//   is served directly with `206 Partial Content`. On R2-MISS with a Range, we
-//   forward the Range to origin (fast 206 for the client) AND kick off a
-//   background full-file R2 fill via waitUntil so the next user hits R2.
+//                         ├► For `.om`  : rewrite run-path to our R2 latest.json
+//                         │               then serve from R2 (HIT-R2) or origin (MISS).
+//                         ├► For json   : serve from R2 *only* — 503 if missing.
+//                         │               No origin fallback, since origin could
+//                         │               advertise a run the cron hasn't warmed.
+//                         └► Debug      : /tiles/_debug/cache — JSON inventory.
 //
 // Bindings (configured in the Pages project dashboard):
-//   TILE_CACHE — R2 bucket (see Pages project → Settings → Functions → R2 bindings)
-//
-// Cache-lifetime model:
-//   * `.om` files       — immutable per (domain, ref_time, forecast_time). 30 days.
-//   * `meta.json`       — per-run, immutable. 30 days.
-//   * `latest.json`     — flips on new run publish. 5 min so clients lag warmer.
-//   * `in-progress.json`— writing run. 30 s.
-//   * 404s — 1 hour (horizon doesn't change within a run).
+//   TILE_CACHE — R2 bucket. See Pages project → Settings → Functions → R2 bindings.
 
 interface Env {
 	TILE_CACHE: R2Bucket;
@@ -44,9 +28,14 @@ const FORCE_REFRESH_HEADER = 'X-Surfr-Force-Refresh';
 const WARM_HEADER = 'X-Surfr-Warm';
 const CACHE_STATUS_HEADER = 'X-Surfr-Cache-Status';
 
-// Don't persist JSON indexes to R2 — they change with every new model run and
-// don't benefit from the persistence. Only .om tile files go through R2.
-const R2_CACHEABLE = (path: string) => path.endsWith('.om');
+const R2_OM_CACHEABLE = (path: string) => path.endsWith('.om');
+const R2_JSON_KEY = (path: string): string | null => {
+	// Only `latest.json` and `meta.json` are R2-canonical. `in-progress.json`
+	// falls through to origin (transient state, not worth persisting).
+	if (path.endsWith('/latest.json')) return path.replace(/^\//, '');
+	if (path.endsWith('/meta.json')) return path.replace(/^\//, '');
+	return null;
+};
 
 const corsHeaders = {
 	'Access-Control-Allow-Origin': '*',
@@ -74,8 +63,6 @@ const parseRange = (
 	const offset = Number(match[1]);
 	if (!Number.isFinite(offset)) return null;
 	if (match[2] === '') {
-		// Open-ended (rare from our library, but support it): we'll cap after
-		// reading R2 object size.
 		return { offset, length: Number.MAX_SAFE_INTEGER, end: Number.MAX_SAFE_INTEGER };
 	}
 	const end = Number(match[2]);
@@ -83,8 +70,132 @@ const parseRange = (
 	return { offset, length: end - offset + 1, end };
 };
 
-// Background fill: fetch full file from origin (no Range) and put into R2 once.
-// Uses waitUntil so it outlives the request. Skips if the object already exists.
+// Build a Response from an R2 object body. Handles Range (206) vs full (200).
+const r2ToResponse = (
+	r2Obj: R2ObjectBody,
+	rangeReq: { offset: number; end: number } | null,
+	totalSize: number,
+	ttl: number,
+	cacheStatus: string
+): Response => {
+	const headers = new Headers();
+	for (const [k, v] of Object.entries(corsHeaders)) headers.set(k, v);
+	headers.set(
+		'Content-Type',
+		r2Obj.httpMetadata?.contentType ?? 'application/octet-stream'
+	);
+	headers.set('Cache-Control', `public, max-age=${ttl}`);
+	headers.set(CACHE_STATUS_HEADER, cacheStatus);
+	headers.set('Accept-Ranges', 'bytes');
+	if (r2Obj.httpEtag) headers.set('ETag', r2Obj.httpEtag);
+
+	if (rangeReq) {
+		const effectiveEnd = Math.min(rangeReq.end, totalSize - 1);
+		const length = effectiveEnd - rangeReq.offset + 1;
+		headers.set('Content-Range', `bytes ${rangeReq.offset}-${effectiveEnd}/${totalSize}`);
+		headers.set('Content-Length', String(length));
+		return new Response(r2Obj.body, { status: 206, headers });
+	}
+
+	headers.set('Content-Length', String(totalSize));
+	return new Response(r2Obj.body, { status: 200, headers });
+};
+
+// Read our canonical latest.json from R2 for a given domain. Returns null if
+// the cron hasn't populated it yet.
+const readR2Latest = async (
+	bucket: R2Bucket,
+	domain: string
+): Promise<{ reference_time: string } | null> => {
+	try {
+		const obj = await bucket.get(`data_spatial/${domain}/latest.json`);
+		if (!obj) return null;
+		const parsed = JSON.parse(await obj.text()) as { reference_time?: string };
+		return parsed.reference_time ? { reference_time: parsed.reference_time } : null;
+	} catch {
+		return null;
+	}
+};
+
+// Module-level in-memory cache so we don't R2-read latest.json on every `.om`
+// request. Each Pages Function isolate gets its own map; isolates are
+// ephemeral (CF evicts them aperiodically) so staleness is bounded by both the
+// TTL *and* isolate lifetime. Staleness window (30s) is tiny relative to the
+// 1–12 h cadence at which new runs publish — briefly serving a just-past-run
+// latest.json is harmless since its .om files are still in R2 (we only delete
+// them AFTER swapping latest.json).
+const LATEST_MEM_CACHE_TTL_MS = 30_000;
+const latestMemCache = new Map<
+	string,
+	{ value: { reference_time: string } | null; cachedAt: number }
+>();
+
+const readR2LatestCached = async (
+	bucket: R2Bucket,
+	domain: string
+): Promise<{ reference_time: string } | null> => {
+	const hit = latestMemCache.get(domain);
+	if (hit && Date.now() - hit.cachedAt < LATEST_MEM_CACHE_TTL_MS) {
+		return hit.value;
+	}
+	const fresh = await readR2Latest(bucket, domain);
+	latestMemCache.set(domain, { value: fresh, cachedAt: Date.now() });
+	return fresh;
+};
+
+// Format an ISO UTC reference time → "YYYY/MM/DD/HHmmZ" run-path segment.
+const fmtRunPath = (isoRefTime: string): string => {
+	const d = new Date(isoRefTime);
+	const pad = (n: number) => String(n).padStart(2, '0');
+	return `${d.getUTCFullYear()}/${pad(d.getUTCMonth() + 1)}/${pad(d.getUTCDate())}/${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}Z`;
+};
+
+// Parse the client's stripped .om path. Client sends:
+//   /data_spatial/<domain>/<validTime>.om
+// We fill in the runPath from R2 latest.json to construct the canonical path:
+//   /data_spatial/<domain>/<YYYY>/<MM>/<DD>/<HHmm>Z/<validTime>.om
+// The client never knows which run it's getting — R2 is the single source of truth.
+const buildCanonicalOmPath = (
+	requestedPath: string,
+	currentReferenceTime: string
+): { path: string; domain: string | null } | null => {
+	// Stripped shape: ['', 'data_spatial', domain, '<validTime>.om']  (4 segments)
+	// Legacy full shape: ['', 'data_spatial', domain, YYYY, MM, DD, HHmmZ, '<validTime>.om']  (8 segments)
+	const segments = requestedPath.split('/');
+	if (segments[1] !== 'data_spatial') return null;
+	const last = segments[segments.length - 1];
+	if (!last.endsWith('.om')) return null;
+
+	if (segments.length === 4) {
+		// Client sent stripped path — fill in canonical runPath.
+		const domain = segments[2];
+		return {
+			path: `/data_spatial/${domain}/${fmtRunPath(currentReferenceTime)}/${last}`,
+			domain
+		};
+	}
+
+	if (segments.length === 8) {
+		// Legacy full path — replace runPath with current. Keeps working with any
+		// old deployed clients during the transition.
+		const domain = segments[2];
+		return {
+			path: `/data_spatial/${domain}/${fmtRunPath(currentReferenceTime)}/${last}`,
+			domain
+		};
+	}
+
+	return null; // unrecognised shape
+};
+
+// Extract domain from any structured tile path that starts `/data_spatial/<domain>/...`
+const extractDomain = (path: string): string | null => {
+	const m = /^\/data_spatial\/([^/]+)(\/|$)/.exec(path);
+	return m ? m[1] : null;
+};
+
+// Background fill: fetch full file from origin (no Range) and put into R2.
+// Called via waitUntil after an R2-miss on an .om request.
 const warmR2 = async (env: Env, r2Key: string, upstreamUrl: string): Promise<void> => {
 	try {
 		const existing = await env.TILE_CACHE.head(r2Key);
@@ -105,37 +216,7 @@ const warmR2 = async (env: Env, r2Key: string, upstreamUrl: string): Promise<voi
 	}
 };
 
-// Build a Response from an R2 object. Handles Range (206) vs full (200).
-const r2ToResponse = (
-	r2Obj: R2ObjectBody,
-	rangeReq: { offset: number; end: number } | null,
-	totalSize: number,
-	ttl: number
-): Response => {
-	const headers = new Headers();
-	for (const [k, v] of Object.entries(corsHeaders)) headers.set(k, v);
-	headers.set(
-		'Content-Type',
-		r2Obj.httpMetadata?.contentType ?? 'application/octet-stream'
-	);
-	headers.set('Cache-Control', `public, max-age=${ttl}`);
-	headers.set(CACHE_STATUS_HEADER, 'HIT-R2');
-	headers.set('Accept-Ranges', 'bytes');
-	if (r2Obj.httpEtag) headers.set('ETag', r2Obj.httpEtag);
-
-	if (rangeReq) {
-		const effectiveEnd = Math.min(rangeReq.end, totalSize - 1);
-		const length = effectiveEnd - rangeReq.offset + 1;
-		headers.set('Content-Range', `bytes ${rangeReq.offset}-${effectiveEnd}/${totalSize}`);
-		headers.set('Content-Length', String(length));
-		return new Response(r2Obj.body, { status: 206, headers });
-	}
-
-	headers.set('Content-Length', String(totalSize));
-	return new Response(r2Obj.body, { status: 200, headers });
-};
-
-// Debug endpoint — visible at /tiles/_debug/cache?prefix=...&limit=...
+// Debug endpoint — /tiles/_debug/cache?prefix=...&limit=...
 const debugCache = async (bucket: R2Bucket, url: URL): Promise<Response> => {
 	const prefix = url.searchParams.get('prefix') ?? '';
 	const limit = Math.min(Number(url.searchParams.get('limit') ?? '1000'), 1000);
@@ -144,6 +225,16 @@ const debugCache = async (bucket: R2Bucket, url: URL): Promise<Response> => {
 
 	const listing = await bucket.list({ prefix, limit, cursor: startAfter });
 
+	// Read warmer's last-run record (written by the cron on every tick) so
+	// the inventory also tells you when the warmer actually ran.
+	let lastCron: unknown = null;
+	try {
+		const lr = await bucket.get('_warmer/last-run.json');
+		if (lr) lastCron = JSON.parse(await lr.text());
+	} catch {
+		/* noop */
+	}
+
 	let totalBytes = 0;
 	const byDomain = new Map<
 		string,
@@ -151,7 +242,6 @@ const debugCache = async (bucket: R2Bucket, url: URL): Promise<Response> => {
 	>();
 	for (const obj of listing.objects) {
 		totalBytes += obj.size;
-		// Keys look like: data_spatial/<domain>/<runPath>/<validTime>.om
 		const parts = obj.key.split('/');
 		const domain = parts[1] ?? '(unknown)';
 		const uploaded = obj.uploaded.toISOString();
@@ -174,6 +264,8 @@ const debugCache = async (bucket: R2Bucket, url: URL): Promise<Response> => {
 		.sort((a, b) => b.mb - a.mb);
 
 	const body = {
+		generatedAt: new Date().toISOString(),
+		lastCron,
 		prefix,
 		count: listing.objects.length,
 		totalMb: +(totalBytes / 1e6).toFixed(1),
@@ -196,6 +288,42 @@ const debugCache = async (bucket: R2Bucket, url: URL): Promise<Response> => {
 	});
 };
 
+// JSON request — serve from R2 only. If we don't have it, 503 (never origin).
+// This guarantees clients only see runs the warmer has finished filling.
+const serveJsonFromR2 = async (
+	bucket: R2Bucket,
+	r2Key: string,
+	ttl: number
+): Promise<Response> => {
+	const obj = await bucket.get(r2Key);
+	if (!obj) {
+		return new Response(
+			JSON.stringify({
+				error: 'cold-r2',
+				message:
+					'This model has not been warmed yet. Wait for the next cron tick (≤5 min) or hit /tiles/_warmer-trigger to bootstrap.',
+				key: r2Key
+			}),
+			{
+				status: 503,
+				headers: {
+					'Content-Type': 'application/json',
+					'Retry-After': '60',
+					...corsHeaders
+				}
+			}
+		);
+	}
+	const headers = new Headers();
+	for (const [k, v] of Object.entries(corsHeaders)) headers.set(k, v);
+	headers.set('Content-Type', 'application/json');
+	headers.set('Cache-Control', `public, max-age=${ttl}`);
+	headers.set(CACHE_STATUS_HEADER, 'HIT-R2');
+	if (obj.httpEtag) headers.set('ETag', obj.httpEtag);
+	headers.set('Content-Length', String(obj.size));
+	return new Response(obj.body, { status: 200, headers });
+};
+
 export const onRequest: PagesFunction<Env> = async (context) => {
 	const { request, env } = context;
 
@@ -207,51 +335,74 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 	}
 
 	const url = new URL(request.url);
-	const upstreamPath = url.pathname.replace(/^\/tiles/, '') || '/';
+	const rawPath = url.pathname.replace(/^\/tiles/, '') || '/';
 
 	// Debug endpoint.
-	if (upstreamPath === '/_debug/cache' || upstreamPath === '/_debug/cache.json') {
+	if (rawPath === '/_debug/cache' || rawPath === '/_debug/cache.json') {
 		return debugCache(env.TILE_CACHE, url);
+	}
+
+	const forceRefresh = request.headers.get(FORCE_REFRESH_HEADER) === '1';
+	const warm = request.headers.get(WARM_HEADER) === '1';
+
+	// ── JSON indexes: R2 only, never origin. ─────────────────────────────────
+	const r2JsonKey = R2_JSON_KEY(rawPath);
+	if (r2JsonKey) {
+		// `latest.json` and `meta.json` are written exclusively by the warmer.
+		// Force-refresh is meaningless here (the warmer owns their lifecycle) —
+		// ignore the header.
+		const ttl = pickTtl(rawPath);
+		return serveJsonFromR2(env.TILE_CACHE, r2JsonKey, ttl);
+	}
+
+	// ── .om — construct canonical path from R2 latest.json. ─────────────────
+	// Client sends either stripped (`/data_spatial/<d>/<validTime>.om`) or
+	// legacy full (`/data_spatial/<d>/<runPath>/<validTime>.om`) — we read R2
+	// latest.json for the domain and always build the canonical path from it.
+	let upstreamPath = rawPath;
+	if (rawPath.endsWith('.om')) {
+		const domain = extractDomain(rawPath);
+		if (domain) {
+			const ourLatest = await readR2LatestCached(env.TILE_CACHE, domain);
+			if (!ourLatest) {
+				return new Response(
+					JSON.stringify({
+						error: 'cold-r2',
+						message: `No R2 latest.json for ${domain} yet; warmer will populate.`,
+						domain
+					}),
+					{
+						status: 503,
+						headers: {
+							'Content-Type': 'application/json',
+							'Retry-After': '60',
+							...corsHeaders
+						}
+					}
+				);
+			}
+			const canonical = buildCanonicalOmPath(rawPath, ourLatest.reference_time);
+			if (canonical) upstreamPath = canonical.path;
+		}
 	}
 
 	const upstreamUrl = `${UPSTREAM_HOST}${upstreamPath}`;
 	const r2Key = upstreamPath.replace(/^\//, '');
 	const ttl = pickTtl(upstreamPath);
-	const forceRefresh = request.headers.get(FORCE_REFRESH_HEADER) === '1';
-	const warm = request.headers.get(WARM_HEADER) === '1';
-	const r2Eligible = R2_CACHEABLE(upstreamPath);
+	const r2Eligible = R2_OM_CACHEABLE(upstreamPath);
 
 	if (forceRefresh) {
-		// Evict from R2 + CF's internal cache (delete is best-effort).
 		if (r2Eligible) {
 			await env.TILE_CACHE.delete(r2Key).catch(() => {});
 		}
 		await caches.default.delete(upstreamUrl).catch(() => {});
 	}
 
-	// Warm path — fire-and-forget R2 fill, return 202 immediately. Used by
-	// scripts/warm-cache.mjs so the cron fills R2 (which is global) rather than
-	// per-PoP edge cache (which evicts under pressure).
+	// Warm header is still supported for backward-compat (old scripts may send
+	// it) but `_warmer-trigger.ts` is now the canonical warm entry point.
 	if (warm) {
 		if (r2Eligible) {
 			context.waitUntil(warmR2(env, r2Key, upstreamUrl));
-		} else {
-			// For JSON indexes, prime CF's own cache via a throwaway fetch.
-			context.waitUntil(
-				(async () => {
-					try {
-						const up = await fetch(upstreamUrl, {
-							cf: {
-								cacheEverything: true,
-								cacheTtl: ttl
-							}
-						});
-						if (up.body) await up.body.pipeTo(new WritableStream());
-					} catch {
-						/* noop */
-					}
-				})()
-			);
 		}
 		return new Response(null, { status: 202, headers: corsHeaders });
 	}
@@ -259,7 +410,7 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 	const rangeHeader = request.headers.get('Range');
 	const range = rangeHeader ? parseRange(rangeHeader) : null;
 
-	// TIER 2: R2 (only for .om files).
+	// ── TIER 2: R2 (only for .om files). ─────────────────────────────────────
 	if (r2Eligible) {
 		try {
 			const r2Obj = await env.TILE_CACHE.get(
@@ -267,15 +418,19 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 				range ? { range: { offset: range.offset, length: range.length } } : undefined
 			);
 			if (r2Obj) {
-				// R2 returns the full-object size in `.size`, regardless of range.
-				return r2ToResponse(r2Obj, range, r2Obj.size, ttl);
+				return r2ToResponse(r2Obj, range, r2Obj.size, ttl, 'HIT-R2');
 			}
 		} catch (err) {
 			console.warn('[r2-get] failed', r2Key, err);
 		}
 	}
 
-	// TIER 3: origin (with CF's edge cache in front via cacheEverything).
+	// ── TIER 3: origin (with CF's edge cache in front). ──────────────────────
+	// This path should be rare for `.om` files once the warmer is running — the
+	// warmer ensures R2 has everything for the current run, and the rewrite
+	// above points clients at that run. Hit here means either (a) the client
+	// asked for a validTime not in the current run (→ origin 404), (b) R2 is
+	// cold for this specific file, or (c) something weird happened.
 	const upstreamHeaders = new Headers();
 	if (rangeHeader) upstreamHeaders.set('Range', rangeHeader);
 
@@ -295,14 +450,13 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 	});
 	const upstreamMs = Date.now() - fetchStart;
 
-	// If the origin response is a successful tile, kick off an R2 fill in
-	// background (full file, so next user hits R2 regardless of their range).
+	// If origin gave us a tile, kick off an R2 fill in background so the next
+	// user hits R2 directly regardless of their range.
 	if (r2Eligible && upstream.ok) {
 		context.waitUntil(warmR2(env, r2Key, upstreamUrl));
 	}
 
-	// Same latency heuristic as before for the CF-edge layer.
-	const edgeStatus: 'HIT-EDGE' | 'MISS' | 'BYPASS' = forceRefresh
+	const edgeStatus: string = forceRefresh
 		? 'BYPASS'
 		: upstreamMs < 200
 			? 'HIT-EDGE'
