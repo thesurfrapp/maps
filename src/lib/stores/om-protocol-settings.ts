@@ -145,7 +145,11 @@ export const omProtocolSettings: Writable<OmProtocolSettings> = writable({
 				try {
 					await omFileReader.setToOmFile(nextOmUrl);
 					if (signal.aborted) return;
-					await omFileReader.prefetchVariable(state.dataOptions.variable, null, signal);
+					// 'not_a_real_variable' makes the library issue only the header
+					// probe + ~65 KB footer read — no data-block fetches. Restores
+					// the pre-revert behaviour that warms just enough of the next-
+					// hour file so a subsequent scrub starts with hot index state.
+					await omFileReader.prefetchVariable('not_a_real_variable', null, signal);
 				} catch (err) {
 					if ((err as { name?: string } | undefined)?.name === 'AbortError') return;
 					console.debug('[prefetch] skipped', nextOmUrl, err);

@@ -415,6 +415,30 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 	const rangeHeader = request.headers.get('Range');
 	const range = rangeHeader ? parseRange(rangeHeader) : null;
 
+	// ── TIER 1.5: CF edge cache via Cache API, keyed by CANONICAL URL. ──────
+	// Pages Function responses are CF-Cache-Status=DYNAMIC by default, so
+	// nothing auto-populates the edge cache. We use the Workers Cache API
+	// explicitly. The key is the canonical URL (includes the runPath) so that
+	// when a new run publishes and our client-side stripped URL translates to a
+	// new canonical path, we naturally miss the cache and pull fresh from R2
+	// — no purge logic needed. Old-run entries age out at the Cache-Control TTL.
+	let cacheKey: Request | null = null;
+	if (r2Eligible) {
+		const cacheKeyInit: RequestInit = { method: 'GET' };
+		if (rangeHeader) cacheKeyInit.headers = { Range: rangeHeader };
+		cacheKey = new Request(`${new URL(request.url).origin}${upstreamPath}`, cacheKeyInit);
+		const tEdge = Date.now();
+		const edgeCached = await caches.default.match(cacheKey);
+		if (edgeCached) {
+			const resp = new Response(edgeCached.body, edgeCached);
+			resp.headers.set(CACHE_STATUS_HEADER, 'HIT-EDGE');
+			resp.headers.set('X-Surfr-Edge-Ms', String(Date.now() - tEdge));
+			if (referenceTime) resp.headers.set('X-Surfr-Reference-Time', referenceTime);
+			if (latestMs) resp.headers.set('X-Surfr-Latest-Ms', String(latestMs));
+			return resp;
+		}
+	}
+
 	// ── TIER 2: R2 (only for .om files). ─────────────────────────────────────
 	if (r2Eligible) {
 		try {
@@ -426,6 +450,11 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 				const response = r2ToResponse(r2Obj, range, r2Obj.size, ttl, 'HIT-R2');
 				if (referenceTime) response.headers.set('X-Surfr-Reference-Time', referenceTime);
 				if (latestMs) response.headers.set('X-Surfr-Latest-Ms', String(latestMs));
+				// Populate the edge cache with this exact (canonical URL, Range)
+				// so the next hit at this PoP skips R2 entirely.
+				if (cacheKey) {
+					context.waitUntil(caches.default.put(cacheKey, response.clone()));
+				}
 				return response;
 			}
 		} catch (err) {
@@ -464,24 +493,32 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 		context.waitUntil(warmR2(env, r2Key, upstreamUrl));
 	}
 
-	const edgeStatus: string = forceRefresh
+	// Label reflects whether the upstream `fetch` itself came back from CF's
+	// edge cache of the origin URL (fast) or was a true origin round-trip.
+	const originStatus: string = forceRefresh
 		? 'BYPASS'
 		: upstreamMs < 200
-			? 'HIT-EDGE'
-			: 'MISS';
+			? 'HIT-ORIGIN-EDGE'
+			: 'MISS-ORIGIN';
 
 	const headers = new Headers(upstream.headers);
 	for (const [k, v] of Object.entries(corsHeaders)) headers.set(k, v);
 	headers.set('Cache-Control', `public, max-age=${ttl}`);
-	headers.set(CACHE_STATUS_HEADER, edgeStatus);
+	headers.set(CACHE_STATUS_HEADER, originStatus);
 	headers.set('X-Surfr-Upstream-Ms', String(upstreamMs));
 	if (referenceTime) headers.set('X-Surfr-Reference-Time', referenceTime);
 	if (latestMs) headers.set('X-Surfr-Latest-Ms', String(latestMs));
 	if (forceRefresh) headers.set('X-Surfr-Refreshed', '1');
 
-	return new Response(upstream.body, {
+	const finalResponse = new Response(upstream.body, {
 		status: upstream.status,
 		statusText: upstream.statusText,
 		headers
 	});
+	// Put the origin response into our Cache-API tier so the next byte-range
+	// hit at this PoP skips R2 and origin.
+	if (cacheKey && upstream.ok) {
+		context.waitUntil(caches.default.put(cacheKey, finalResponse.clone()));
+	}
+	return finalResponse;
 };
