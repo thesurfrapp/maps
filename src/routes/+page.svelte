@@ -67,6 +67,10 @@
 	onMount(async () => {
 		$url = new URL(document.location.href);
 		embed = isEmbedMode();
+		// Tag the body so CSS can tweak layout in embed mode (e.g. move the
+		// MapLibre GlobeControl out of the RN app's top-right overlap zone
+		// for debugging).
+		if (embed) document.body.classList.add('embed');
 
 		// Optional ?clearCache=1 wipes the BrowserBlockCache before the library
 		// initialises so we can A/B test cold-start performance from a known
@@ -301,8 +305,11 @@
 	<TimeSelector />
 	<KeyboardHandler />
 	<Settings />
-	<PopWarmToast />
 {/if}
+
+<!-- Also rendered in embed so the RN WebView shows the cache-warm progress
+     toast on domain switch — useful debugging feedback for the user. -->
+<PopWarmToast />
 
 <style>
 	/* Stacked in the top-left column under ModelPills + OverlayPills. */

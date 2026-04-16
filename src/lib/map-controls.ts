@@ -20,16 +20,9 @@ export const setMapControlSettings = ({ embed = false } = {}) => {
 	map.scrollZoom.setZoomRate(1 / 85);
 	map.scrollZoom.setWheelZoomRate(1 / 85);
 
-	// GlobeControl stays visible in both standalone and embed — we're using
-	// it to debug the `setZoom -> flip to globe` path from the RN bridge.
-	// If the control's button works but programmatic setGlobeProjection()
-	// doesn't, the issue is in our helper, not MapLibre's projection API.
-	const globeControl = new maplibregl.GlobeControl();
-	map.addControl(globeControl);
-	globeControl._globeButton.addEventListener('click', () => globeHandler());
-
-	// In embed mode the RN app owns all other UI — don't render MapLibre's
-	// NavigationControl / GeolocateControl or our SettingsButton.
+	// In embed mode the RN app owns all UI — don't render any MapLibre
+	// default controls or our own SettingsButton/GlobeControl. RN handles
+	// zoom/globe via postMessage (setZoom / setGlobeProjection bridge).
 	if (embed) return;
 
 	map.addControl(
@@ -43,8 +36,15 @@ export const setMapControlSettings = ({ embed = false } = {}) => {
 		})
 	);
 
-	// Settings sheet trigger — kept on the standalone web UI only. RN app has
-	// its own settings.
+	// GlobeControl — MapLibre's built-in projection toggle. Its own click
+	// handler flips projection; we add `globeHandler()` after it to persist
+	// the preference to localStorage + URL. Added after Navigation + Geo so
+	// it lines up below them in the top-right stack.
+	const globeControl = new maplibregl.GlobeControl();
+	map.addControl(globeControl);
+	globeControl._globeButton.addEventListener('click', () => globeHandler());
+
+	// Settings sheet trigger — standalone web UI only.
 	map.addControl(new SettingsButton());
 };
 

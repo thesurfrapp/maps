@@ -188,7 +188,12 @@
 @media (prefers-color-scheme: light) {
 	:root {
 		color: #213547;
-		background-color: #ffffff;
+		/* Always paint the HTML body with the dark-grey app backdrop, even
+		   when the OS is in light mode. The weather map never runs light —
+		   and in RN WebView the host's light OS would otherwise leak through
+		   as a white halo around the globe (no one wants a sunbathing
+		   sphere). */
+		background-color: #14141c;
 	}
 }
 
@@ -214,6 +219,7 @@
 	width: 100%;
 	min-height: 100%;
 }
+
 
 /* =============================================================================
    MapLibre Controls

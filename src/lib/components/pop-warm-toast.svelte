@@ -61,7 +61,10 @@
 <style>
 	.warm-toast {
 		position: fixed;
-		top: 16px;
+		/* Pushed below iPhone status bar + RN app's top chrome (search bar
+		   etc). The standalone web UI has no top chrome, but 120px is still
+		   a comfortable reading zone under the native MapLibre controls. */
+		top: 120px;
 		left: 50%;
 		transform: translateX(-50%);
 		z-index: 100;
