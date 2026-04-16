@@ -36,9 +36,15 @@ const matchesModelRun = (referenceTime: Date | undefined, modelRun: Date): boole
 const fetchMetaData = async (
 	uri: string,
 	domain: string,
-	modelRun: Date
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars
+	_modelRun: Date
 ): Promise<DomainMetaDataJson> => {
-	const url = `${uri}/data_spatial/${domain}/${fmtModelRun(modelRun)}/meta.json`;
+	// Our Pages Function + R2 store meta.json at `data_spatial/{domain}/meta.json`
+	// (no runPath prefix) — it's a single "current run" snapshot written by the
+	// warmer. Including a runPath here produces a 503 cold-r2 every time because
+	// the key doesn't exist. See `functions/lib/warmer.ts:82` (r2MetaKey) and
+	// `functions/tiles/[[path]].ts:R2_JSON_KEY`.
+	const url = `${uri}/data_spatial/${domain}/meta.json`;
 	const res = await fetch(url);
 
 	if (!res.ok) {
