@@ -8,6 +8,7 @@ import { defaultPreferences, preferences as p } from '$lib/stores/preferences';
 
 import { BEFORE_LAYER_RASTER, HILLSHADE_LAYER } from '$lib/constants';
 
+import { SettingsButton } from './components/buttons';
 import { addOmFileLayers } from './layers';
 import { updateUrl } from './url';
 
@@ -19,8 +20,16 @@ export const setMapControlSettings = ({ embed = false } = {}) => {
 	map.scrollZoom.setZoomRate(1 / 85);
 	map.scrollZoom.setWheelZoomRate(1 / 85);
 
-	// In embed mode the RN app owns all UI — don't render MapLibre's default
-	// NavigationControl / GeolocateControl / GlobeControl.
+	// GlobeControl stays visible in both standalone and embed — we're using
+	// it to debug the `setZoom -> flip to globe` path from the RN bridge.
+	// If the control's button works but programmatic setGlobeProjection()
+	// doesn't, the issue is in our helper, not MapLibre's projection API.
+	const globeControl = new maplibregl.GlobeControl();
+	map.addControl(globeControl);
+	globeControl._globeButton.addEventListener('click', () => globeHandler());
+
+	// In embed mode the RN app owns all other UI — don't render MapLibre's
+	// NavigationControl / GeolocateControl or our SettingsButton.
 	if (embed) return;
 
 	map.addControl(
@@ -34,9 +43,9 @@ export const setMapControlSettings = ({ embed = false } = {}) => {
 		})
 	);
 
-	const globeControl = new maplibregl.GlobeControl();
-	map.addControl(globeControl);
-	globeControl._globeButton.addEventListener('click', () => globeHandler());
+	// Settings sheet trigger — kept on the standalone web UI only. RN app has
+	// its own settings.
+	map.addControl(new SettingsButton());
 };
 
 export const addTerrainSource = (map: maplibregl.Map, name: string = 'terrainSource') => {
@@ -195,6 +204,25 @@ export const globeHandler = () => {
 	preferences.globe = !preferences.globe;
 	p.set(preferences);
 	updateUrl('globe', String(preferences.globe), String(defaultPreferences.globe));
+};
+
+// Programmatically flip projection + persist preference — mirrors what
+// MapLibre's built-in GlobeControl does when its button is clicked, but
+// callable from anywhere (e.g. the RN bridge's setZoom handler).
+export const setGlobeProjection = (globe: boolean) => {
+	const preferences = get(p);
+	if (preferences.globe === globe) return;
+	const map = get(m);
+	if (map) {
+		try {
+			map.setProjection({ type: globe ? 'globe' : 'mercator' });
+		} catch (err) {
+			console.warn('[setGlobeProjection] setProjection failed', err);
+		}
+	}
+	preferences.globe = globe;
+	p.set(preferences);
+	updateUrl('globe', String(globe), String(defaultPreferences.globe));
 };
 
 export const reloadStyles = () => {

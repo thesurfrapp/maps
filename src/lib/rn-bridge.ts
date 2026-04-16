@@ -7,6 +7,7 @@ import { get } from 'svelte/store';
 import type * as maplibregl from 'maplibre-gl';
 
 import { changeOMfileURL } from '$lib/layers';
+import { setGlobeProjection } from '$lib/map-controls';
 import { setSurfrSpotsConfig } from '$lib/surfr-spots';
 
 import { displayTzOffsetSeconds } from '$lib/stores/preferences';
@@ -43,7 +44,19 @@ type InMsg =
 	| { type: 'setDomain'; domain: string }
 	| { type: 'setTime'; time: string }
 	| { type: 'setTzOffsetSeconds'; offsetSeconds: number }
-	| { type: 'setSpotsConfig'; endpoint?: string; token?: string };
+	| { type: 'setSpotsConfig'; endpoint?: string; token?: string }
+	// Zoom / projection control for the RN app's "world" icon. `setZoom`
+	// flies to the target zoom (level 0 = fully zoomed out). Optionally
+	// takes lat/lng to recenter. If `projection` is not set, we implicitly
+	// flip to globe when zooming out below ~2 and to mercator above ~3 —
+	// matches the RN UX where the "world" button feels like a globe view.
+	| {
+			type: 'setZoom';
+			zoom: number;
+			lat?: number;
+			lng?: number;
+			projection?: 'globe' | 'mercator';
+	  };
 
 declare global {
 	interface Window {
@@ -270,6 +283,23 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 			}
 			case 'setSpotsConfig': {
 				setSurfrSpotsConfig({ endpoint: msg.endpoint, token: msg.token });
+				break;
+			}
+			case 'setZoom': {
+				const center = map.getCenter();
+				// Projection flip — explicit via msg.projection, or implicit when
+				// zooming out below 2 (feels right: world icon = globe view).
+				const targetProjection =
+					msg.projection ??
+					(msg.zoom <= 2 ? 'globe' : msg.zoom > 3 ? 'mercator' : undefined);
+				if (targetProjection) {
+					setGlobeProjection(targetProjection === 'globe');
+				}
+				map.flyTo({
+					center: [msg.lng ?? center.lng, msg.lat ?? center.lat],
+					zoom: msg.zoom,
+					essential: true
+				});
 				break;
 			}
 		}

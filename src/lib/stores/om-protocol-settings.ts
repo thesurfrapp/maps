@@ -124,38 +124,39 @@ export const omProtocolSettings: Writable<OmProtocolSettings> = writable({
 	},
 
 	postReadCallback: (omFileReader: WeatherMapLayerFileReader, data: Data, state: OmUrlState) => {
-		// Prefetch the prev/next-hour .om files so the next scrub click feels
-		// instant. We abort any in-flight prefetch before starting a new one —
-		// that was the bit missing previously (the footer fetch used to linger
-		// on the HTTP/2 connection, blocking the user's next click for ~10 s).
-		// With the `_iterateDataBlocks` parallel patch in `om-reader-patch.ts`
-		// the initial index-block reads now land in ~1 s instead of N×RTT, so
-		// lingering prefetch is small even on slow networks.
-		if (currentPrefetchController) {
-			currentPrefetchController.abort();
-		}
-		currentPrefetchController = new AbortController();
-		const signal = currentPrefetchController.signal;
-		const nextOmUrls = getNextOmUrls(state.omFileUrl, get(selectedDomain), get(metaJson));
-		for (const nextOmUrl of nextOmUrls) {
-			if (nextOmUrl === undefined) continue;
-			// setToOmFile reads the .om header; swallow errors so one bad URL
-			// doesn't kill the other direction's prefetch.
-			void (async () => {
-				try {
-					await omFileReader.setToOmFile(nextOmUrl);
-					if (signal.aborted) return;
-					// 'not_a_real_variable' makes the library issue only the header
-					// probe + ~65 KB footer read — no data-block fetches. Restores
-					// the pre-revert behaviour that warms just enough of the next-
-					// hour file so a subsequent scrub starts with hot index state.
-					await omFileReader.prefetchVariable('not_a_real_variable', null, signal);
-				} catch (err) {
-					if ((err as { name?: string } | undefined)?.name === 'AbortError') return;
-					console.debug('[prefetch] skipped', nextOmUrl, err);
-				}
-			})();
-		}
+		// PER-HOUR PREFETCH DISABLED — replaced by a whole-domain PoP warm that
+		// runs once on model switch (see `src/lib/pop-warm.ts`, triggered from
+		// `src/routes/+page.svelte`'s domain.subscribe). That warm fires 1-byte
+		// range requests for all validTimes in the next 72 h, letting CF's
+		// cache-on-range pull each full file into local-PoP edge cache. After
+		// it finishes, scrubbing anywhere in that window is an instant local-
+		// edge HIT, making the per-scrub prefetch redundant.
+		//
+		// Left as reference — original per-hour prefetch code. Uncomment if we
+		// ever want to go back to lazy prev/next-hour warming instead of the
+		// upfront whole-domain approach.
+		//
+		// if (currentPrefetchController) {
+		// 	currentPrefetchController.abort();
+		// }
+		// currentPrefetchController = new AbortController();
+		// const signal = currentPrefetchController.signal;
+		// const nextOmUrls = getNextOmUrls(state.omFileUrl, get(selectedDomain), get(metaJson));
+		// for (const nextOmUrl of nextOmUrls) {
+		// 	if (nextOmUrl === undefined) continue;
+		// 	void (async () => {
+		// 		try {
+		// 			await omFileReader.setToOmFile(nextOmUrl);
+		// 			if (signal.aborted) return;
+		// 			await omFileReader.prefetchVariable('not_a_real_variable', null, signal);
+		// 		} catch (err) {
+		// 			if ((err as { name?: string } | undefined)?.name === 'AbortError') return;
+		// 			console.debug('[prefetch] skipped', nextOmUrl, err);
+		// 		}
+		// 	})();
+		// }
+		void omFileReader;
+		void state;
 		if (
 			state.dataOptions.domain.value === 'ecmwf_ifs' &&
 			state.dataOptions.variable === 'pressure_msl'

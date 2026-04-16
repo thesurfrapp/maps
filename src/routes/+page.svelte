@@ -35,6 +35,8 @@
 	import Spinner from '$lib/components/loading/spinner.svelte';
 	import ModelPills from '$lib/components/overlay-pills/model-pills.svelte';
 	import OverlayPills from '$lib/components/overlay-pills/overlay-pills.svelte';
+	import PopWarmToast from '$lib/components/pop-warm-toast.svelte';
+	import Settings from '$lib/components/settings/settings.svelte';
 	import TimeSelector from '$lib/components/time/time-selector.svelte';
 	import TimezoneSelector from '$lib/components/timezone/TimezoneSelector.svelte';
 
@@ -47,6 +49,7 @@
 	import { installRnBridge, isEmbedMode } from '$lib/rn-bridge';
 	import { addTerrainSource, getStyle, setMapControlSettings } from '$lib/map-controls';
 	import { getInitialMetaData, getMetaData, matchVariableOrFirst } from '$lib/metadata';
+	import { warmCurrentPoP } from '$lib/pop-warm';
 	import { addPopup } from '$lib/popup';
 	import { formatISOWithoutTimezone } from '$lib/time-format';
 	import { findTimeStep } from '$lib/time-utils';
@@ -247,6 +250,10 @@
 		})();
 		await getInitialMetaDataPromise;
 		changeOMfileURL();
+		// Fire the per-PoP cache warm for this domain's 72 h of .om URLs.
+		// Fire-and-forget: the warm runs in the background while the first
+		// scrub renders from R2, and subsequent scrubs hit the now-warm edge.
+		void warmCurrentPoP(newDomain);
 	});
 
 	const variableSubscription = variable.subscribe(async (newVar) => {
@@ -293,6 +300,8 @@
 	</div>
 	<TimeSelector />
 	<KeyboardHandler />
+	<Settings />
+	<PopWarmToast />
 {/if}
 
 <style>
