@@ -58,6 +58,11 @@ function createBlockCache() {
 // unambiguous way to make it stick for every wind-family variable.
 const WIND_VARIABLE_PATTERN = /^wind_(speed|gusts|u_component|v_component)(_|$)/;
 
+// Single in-flight prefetch — aborted every time the user triggers a new read.
+// Prevents the old stalling behaviour where a slow prefetch held up HTTP/2
+// streams behind the user's next click.
+let currentPrefetchController: AbortController | null = null;
+
 
 export const omProtocolSettings: Writable<OmProtocolSettings> = writable({
 	...defaultOmProtocolSettings,
@@ -119,22 +124,34 @@ export const omProtocolSettings: Writable<OmProtocolSettings> = writable({
 	},
 
 	postReadCallback: (omFileReader: WeatherMapLayerFileReader, data: Data, state: OmUrlState) => {
-		// PREFETCH DISABLED — the upstream behaviour was to fetch the
-		// prev/next-hour file index after each load (a `200 1KB` probe + a
-		// `206 ~65KB` end-of-file footer read). On a real network the footer
-		// fetch consistently took 7-8 s and remained in-flight on the same
-		// HTTP/2 connection. When the user clicked the next hour while it
-		// was still pending, their new range reads queued behind it,
-		// producing the visible ~10 s "second click is slow" effect.
-		// Trade-off: we lose the next-click "feels instant" benefit on
-		// slow scrubbing in exchange for predictable per-click latency on
-		// fast scrubbing. Re-enable + add AbortController if we want both.
-		// const nextOmUrls = getNextOmUrls(state.omFileUrl, get(selectedDomain), get(metaJson));
-		// for (const nextOmUrl of nextOmUrls) {
-		// 	if (nextOmUrl === undefined) continue;
-		// 	omFileReader.setToOmFile(nextOmUrl);
-		// 	omFileReader.prefetchVariable('not_a_real_variable');
-		// }
+		// Prefetch the prev/next-hour .om files so the next scrub click feels
+		// instant. We abort any in-flight prefetch before starting a new one —
+		// that was the bit missing previously (the footer fetch used to linger
+		// on the HTTP/2 connection, blocking the user's next click for ~10 s).
+		// With the `_iterateDataBlocks` parallel patch in `om-reader-patch.ts`
+		// the initial index-block reads now land in ~1 s instead of N×RTT, so
+		// lingering prefetch is small even on slow networks.
+		if (currentPrefetchController) {
+			currentPrefetchController.abort();
+		}
+		currentPrefetchController = new AbortController();
+		const signal = currentPrefetchController.signal;
+		const nextOmUrls = getNextOmUrls(state.omFileUrl, get(selectedDomain), get(metaJson));
+		for (const nextOmUrl of nextOmUrls) {
+			if (nextOmUrl === undefined) continue;
+			// setToOmFile reads the .om header; swallow errors so one bad URL
+			// doesn't kill the other direction's prefetch.
+			void (async () => {
+				try {
+					await omFileReader.setToOmFile(nextOmUrl);
+					if (signal.aborted) return;
+					await omFileReader.prefetchVariable(state.dataOptions.variable, null, signal);
+				} catch (err) {
+					if ((err as { name?: string } | undefined)?.name === 'AbortError') return;
+					console.debug('[prefetch] skipped', nextOmUrl, err);
+				}
+			})();
+		}
 		if (
 			state.dataOptions.domain.value === 'ecmwf_ifs' &&
 			state.dataOptions.variable === 'pressure_msl'

@@ -33,12 +33,10 @@ export const BEFORE_LAYER_VECTOR_WATER_CLIP = 'waterway_line_label';
 export const DEFAULT_TILE_SIZE = 512;
 export const DEFAULT_OPACITY = 75;
 
-// Cache defaults (in KB and MB for UI display)
-// Bumped from 64 → 192 KB. Each range-GET pulls 3× more data, so the library
-// fires ~3× fewer requests per viewport render. Less HTTP/2 multiplexing
-// contention, less CF-edge cold-miss risk on first-time viewports, and the
-// extra bytes are negligible over modern mobile networks.
-export const DEFAULT_CACHE_BLOCK_SIZE_KB = 192;
+// Cache block size. 64 KB is the library's original default, restored now
+// that `om-reader-patch.ts` parallelises index-block reads — the earlier bump
+// to 192 KB was compensating for the per-RTT cost of serial reads.
+export const DEFAULT_CACHE_BLOCK_SIZE_KB = 64;
 export const DEFAULT_CACHE_MAX_BYTES_MB = 400;
 
 // Measured HTTP/2 overhead per range request (~1342 bytes: HPACK headers + framing).
