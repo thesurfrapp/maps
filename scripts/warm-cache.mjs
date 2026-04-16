@@ -69,7 +69,11 @@ const args = Object.fromEntries(
 const HOURS_AHEAD = Number(args.hours ?? 72);
 const CONCURRENCY = Number(args.concurrency ?? 8);
 const DOMAINS = args.domains ? String(args.domains).split(',') : DEFAULT_DOMAINS;
-const RANGE_HEADER = 'bytes=0-65535'; // ~64 KB probe per file
+// IMPORTANT: do NOT send a Range header. CF with cacheEverything caches per-range.
+// A Range warm only caches that slice; the library's first request is always the
+// file FOOTER (last 64KB) which would still be a miss. A full GET forces CF to
+// download + cache the entire file (~34–110 MB), after which ANY range is instant.
+const FULL_GET = true;
 const FORCE = args.force === true || args.force === 'true';
 
 // ─── State helpers ───────────────────────────────────────────────────────────
@@ -157,7 +161,7 @@ async function processDomain(domain, state) {
 					const url = `${PROXY_BASE}/data_spatial/${domain}/${runPath}/${fmtValidTime(validTime)}.om`;
 					const req = performance.now();
 					try {
-						const res = await fetch(url, { headers: { Range: RANGE_HEADER } });
+						const res = await fetch(url, FULL_GET ? {} : { headers: { Range: 'bytes=0-65535' } });
 						const ms = performance.now() - req;
 						totalMs += ms;
 						if (!res.ok && res.status !== 206) {

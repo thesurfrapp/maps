@@ -103,14 +103,17 @@ export const onRequest: PagesFunction = async (context) => {
 		return new Response(null, { status: 202, headers: corsHeaders });
 	}
 
-	// Normal client request — forward Range etc. and rely on cf.cacheEverything.
+	// Normal client request — forward Range only. DO NOT forward If-None-Match
+	// or If-Modified-Since: with cf.cacheEverything those conditional headers
+	// cause CF to revalidate against origin on every request (so the edge-
+	// cache entry appears to get "re-freshened" → age: 0 on repeat requests),
+	// even when CF actually has the data. Stripping them lets CF serve from
+	// its own cache based on our cacheTtl. The 304 revalidation path is not
+	// useful to us — our .om files never change within a ref_time, and the
+	// cacheTtl we set is already much shorter than the file's lifetime.
 	const upstreamHeaders = new Headers();
 	const range = request.headers.get('Range');
 	if (range) upstreamHeaders.set('Range', range);
-	const ifNoneMatch = request.headers.get('If-None-Match');
-	if (ifNoneMatch) upstreamHeaders.set('If-None-Match', ifNoneMatch);
-	const ifModifiedSince = request.headers.get('If-Modified-Since');
-	if (ifModifiedSince) upstreamHeaders.set('If-Modified-Since', ifModifiedSince);
 
 	const fetchStart = Date.now();
 	const upstream = await fetch(upstreamUrl, {
