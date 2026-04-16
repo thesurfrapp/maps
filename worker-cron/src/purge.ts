@@ -1,28 +1,37 @@
-// CF cache purge, called by the cron worker AFTER a per-domain
+// CF cache purge + re-warm, called by the cron worker AFTER a per-domain
 // `/tiles/_warmer-trigger` call reports a fresh `warmed` run.
 //
 // Why this lives in the cron worker (not the Pages Function):
-//   * Purge is a scheduled-only concern — no client request should ever cause
-//     a purge. Keeping the CF API token out of the Pages Function shrinks the
-//     blast radius.
+//   * Purge is a scheduled-only concern — no client request should ever
+//     cause a purge. Keeping the CF API token out of the Pages Function
+//     shrinks the blast radius.
 //
-// Why no re-warm here:
-//   * CF purge is global (all PoPs drop the old bytes simultaneously).
-//   * A re-warm from the cron worker only populates its own PoP's cache
-//     (plus, ideally, the upper tier via Smart Tiered Cache). Since first-
-//     miss cost at other PoPs is unavoidable regardless, the extra ~1 GB of
-//     internal traffic per domain swap is wasted unless the upper tier
-//     reliably serves it — which we couldn't confirm.
-//   * First user at each cold PoP pays one miss per URL (reads the full
-//     file from R2 via the Pages Function, populates local edge cache).
-//     Subsequent users at the same PoP hit the 30-day edge cache.
+// Cache Reserve makes the re-warm globally meaningful:
+//   * A single `fetch(url, { cf: { cacheEverything: true } })` from this
+//     cron worker populates Cache Reserve (the global, persistent tier
+//     sitting between edge PoPs and origin).
+//   * After a purge, the re-warm fills Cache Reserve. Subsequent user
+//     misses at any PoP worldwide get Cache Reserve HITs (~100-200 ms),
+//     instead of going all the way to our Pages Function + R2 (up to 6 s
+//     for the 168 MB icon-global).
+//   * Without Cache Reserve enabled, this fetch would only fill the
+//     cron-worker PoP's own edge — useless for other PoPs. We enabled
+//     Cache Reserve on the zone so this is now genuinely useful.
 
 const API_BASE = 'https://api.cloudflare.com/client/v4';
 const PURGE_BATCH = 30; // Free-plan limit per purge_cache call.
 
-// Only purge validTimes that any user might reach from the scrubber. Hours
-// beyond this land as cold-edge-first-MISS, which is fine.
+// Match the cron-side warm horizon to the server-side warm horizon
+// (MAX_HORIZON_HOURS in functions/lib/warmer.ts). Any validTime R2 has,
+// CF Cache Reserve should also have pre-filled.
 const PURGE_HORIZON_HOURS = 72;
+
+// Per-URL warm concurrency. Kept low so we don't saturate the cron PoP's
+// outbound, and Open-Meteo sees at most a handful of fetches per cron
+// tick (each stripped URL -> Pages Function -> R2, so upstream is not
+// touched on the warm path — but R2/Pages Function still have capacity
+// limits).
+const REWARM_CONCURRENCY = 4;
 
 type PurgeEnv = {
 	CF_PURGE_TOKEN?: string;
@@ -71,28 +80,123 @@ const purgeBatch = async (
 	return { ok: res.ok, status: res.status, body: body.slice(0, 300) };
 };
 
-export type PurgeResult = {
-	domain: string;
-	urls: number;
-	batches: Array<{ ok: boolean; status: number }>;
-	totalMs: number;
+type RewarmOutcome = {
+	url: string;
+	status: number;
+	ms: number;
+	bytes: number;
+	contentLength: number;
+	cfCacheStatus: string | null;
 };
 
-export const purgeDomain = async (
+// Full-file GET with cacheEverything. The Pages Function returns a 200 with
+// the full body from R2; CF's Cache Rule + cacheEverything populate Cache
+// Reserve on the way back. Body is drained as a stream (low memory) and
+// discarded.
+const rewarmOne = async (url: string): Promise<RewarmOutcome> => {
+	const t0 = Date.now();
+	try {
+		const res = await fetch(url, {
+			method: 'GET',
+			cf: { cacheEverything: true, cacheTtl: 30 * 86400 }
+		});
+		const contentLength = Number(res.headers.get('Content-Length') ?? '0');
+		const cfCacheStatus = res.headers.get('CF-Cache-Status');
+		let bytes = 0;
+		const reader = res.body?.getReader();
+		if (reader) {
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				if (value) bytes += value.byteLength;
+			}
+		}
+		return { url, status: res.status, ms: Date.now() - t0, bytes, contentLength, cfCacheStatus };
+	} catch {
+		return { url, status: -1, ms: Date.now() - t0, bytes: 0, contentLength: 0, cfCacheStatus: null };
+	}
+};
+
+const runBounded = async <T, R>(
+	items: T[],
+	limit: number,
+	fn: (item: T) => Promise<R>
+): Promise<R[]> => {
+	const results: R[] = new Array(items.length);
+	let i = 0;
+	const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+		while (true) {
+			const idx = i++;
+			if (idx >= items.length) return;
+			results[idx] = await fn(items[idx]);
+		}
+	});
+	await Promise.all(workers);
+	return results;
+};
+
+export type PurgeAndRewarmResult = {
+	domain: string;
+	urls: number;
+	purge: { batches: Array<{ ok: boolean; status: number }>; totalMs: number };
+	rewarm: {
+		ok: number;
+		fail: number;
+		totalMs: number;
+		totalBytes: number;
+		byCfCacheStatus: Record<string, number>;
+		shortBodies: Array<{ url: string; bytes: number; contentLength: number }>;
+	};
+};
+
+export const purgeAndRewarmDomain = async (
 	env: PurgeEnv,
 	origin: string,
 	domain: string,
 	referenceTime: string,
 	validTimes: string[]
-): Promise<PurgeResult> => {
-	const t0 = Date.now();
+): Promise<PurgeAndRewarmResult> => {
 	const capped = capValidTimes(validTimes, referenceTime);
 	const urls = capped.map((iso) => strippedUrl(origin, domain, iso));
-	const batches: PurgeResult['batches'] = [];
+
+	// Step 1: purge (global, all tiers including Cache Reserve).
+	const tPurge = Date.now();
+	const batches: Array<{ ok: boolean; status: number }> = [];
 	for (const batch of chunk(urls, PURGE_BATCH)) {
 		const res = await purgeBatch(env, batch);
 		batches.push({ ok: res.ok, status: res.status });
 		if (!res.ok) console.warn('[purge] batch failed', res.status, res.body);
 	}
-	return { domain, urls: urls.length, batches, totalMs: Date.now() - t0 };
+	const purgeMs = Date.now() - tPurge;
+
+	// Step 2: re-warm. Single fetch per URL populates Cache Reserve globally.
+	const tRewarm = Date.now();
+	const rewarmResults = await runBounded(urls, REWARM_CONCURRENCY, rewarmOne);
+	const ok = rewarmResults.filter((r) => r.status >= 200 && r.status < 400).length;
+	const fail = rewarmResults.length - ok;
+	const totalBytes = rewarmResults.reduce((s, r) => s + r.bytes, 0);
+	const byCfCacheStatus: Record<string, number> = {};
+	for (const r of rewarmResults) {
+		const k = r.cfCacheStatus ?? 'null';
+		byCfCacheStatus[k] = (byCfCacheStatus[k] ?? 0) + 1;
+	}
+	// A body that came back short of Content-Length means the stream was cut
+	// (OOM, abort, etc) and CF likely didn't finalise the cache entry.
+	const shortBodies = rewarmResults
+		.filter((r) => r.contentLength > 0 && r.bytes < r.contentLength)
+		.map((r) => ({ url: r.url, bytes: r.bytes, contentLength: r.contentLength }));
+
+	return {
+		domain,
+		urls: urls.length,
+		purge: { batches, totalMs: purgeMs },
+		rewarm: {
+			ok,
+			fail,
+			totalMs: Date.now() - tRewarm,
+			totalBytes,
+			byCfCacheStatus,
+			shortBodies
+		}
+	};
 };

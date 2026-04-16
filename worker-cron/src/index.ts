@@ -21,7 +21,7 @@
 // keeps client-facing URLs stable but flushes old-run bytes from CF edge
 // as soon as R2 holds the new run. See `./purge.ts` for the rationale.
 
-import { type PurgeResult, purgeDomain } from './purge';
+import { type PurgeAndRewarmResult, purgeAndRewarmDomain } from './purge';
 
 const WARMER_BASE = 'https://maps.thesurfr.app/tiles/_warmer-trigger';
 const CLIENT_ORIGIN = 'https://maps.thesurfr.app';
@@ -55,7 +55,7 @@ type DomainOutcome = {
 	status: number;
 	ms: number;
 	warmerStatus?: string;
-	purge?: PurgeResult;
+	purge?: PurgeAndRewarmResult;
 	bodyHead: string;
 };
 
@@ -107,7 +107,7 @@ const runTick = async (env: Env): Promise<string> => {
 				bodyHead: body.slice(0, 400)
 			};
 			if (result && isWarmed(result)) {
-				outcome.purge = await purgeDomain(
+				outcome.purge = await purgeAndRewarmDomain(
 					env,
 					CLIENT_ORIGIN,
 					domain,
@@ -168,7 +168,7 @@ export default {
 					{ status: 502, headers: { 'Content-Type': 'application/json' } }
 				);
 			}
-			const purge = await purgeDomain(
+			const purge = await purgeAndRewarmDomain(
 				env,
 				CLIENT_ORIGIN,
 				domain,
