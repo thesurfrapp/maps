@@ -226,32 +226,42 @@
 	});
 
 	let getInitialMetaDataPromise: Promise<void> | undefined;
-	const domainSubscription = domain.subscribe(async (newDomain) => {
-		// Capture the previous modelRun BEFORE we reset it, so we can restore
-		// it if the metadata fetch fails. Without this, a transient network
-		// blip leaves `modelRun` undefined permanently, and every subsequent
-		// changeOMfileURL() call bails at the `!omUrl` guard in layers.ts —
-		// only an app kill recovers it. See layers.ts:353.
-		const prevModelRun = $modelRun;
 
+	// Serialize domain-load work. Without this, Svelte fires the subscription
+	// multiple times during startup (initial value + `urlParamsToPreferences`
+	// override + RN bridge `setDomain` after 'ready'), and the async callbacks
+	// run in parallel — mutating shared stores (`latest`, `inProgress`, `mR`,
+	// `$metaJson`) out of order. That produces a stuck state where
+	// `mR.set(latestReferenceTime)` lands with `latestReferenceTime=undefined`
+	// because the other callback hasn't populated `latest` yet, so modelRun
+	// becomes `undefined as Date`, `fetchMetaData` builds `.../undefined/meta.json`,
+	// 404, throw, stuck. Roughly 50% of cold starts per user report.
+	let domainLoadChain: Promise<void> = Promise.resolve();
+	let latestDomainReq = 0;
+
+	const runDomainLoad = async (newDomain: string, reqId: number): Promise<void> => {
 		if ($domain !== newDomain) {
 			await tick(); // await the selectedDomain to be set
+			if (reqId !== latestDomainReq) return; // superseded while awaiting tick
 			updateUrl('domain', newDomain);
 			$modelRun = undefined;
 			toast('Domain set to: ' + $selectedDomain.label);
 		}
 
-		// Retry with exponential backoff (500ms, 1s, 2s). Most failures here
-		// are transient: edge 5xx during a model-run publish, a flaky mobile
-		// network, or a cold R2 miss. Three tries is enough to recover without
-		// annoying the user.
+		// Retry with exponential backoff (500ms, 1s, 2s). Handles transient
+		// edge 5xx during a model-run publish, flaky mobile networks, cold
+		// R2 misses. With the serialization above, retries no longer race
+		// with a competing in-flight callback; each retry is clean.
 		const maxAttempts = 3;
 		let lastErr: unknown;
 		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+			if (reqId !== latestDomainReq) return; // superseded between attempts
 			try {
 				getInitialMetaDataPromise = (async () => {
 					await getInitialMetaData();
+					if (reqId !== latestDomainReq) return; // superseded mid-fetch
 					$metaJson = await getMetaData();
+					if (reqId !== latestDomainReq) return;
 
 					const timeSteps = $metaJson?.valid_times.map(
 						(validTime: string) => new Date(validTime)
@@ -284,16 +294,15 @@
 			}
 		}
 
+		if (reqId !== latestDomainReq) return; // superseded after retries
+
 		if (lastErr !== undefined) {
-			// All retries exhausted. Restore the previous modelRun (if we had
-			// one) so `getOMUrl()` can keep serving the last-known-good URL
-			// until the next user interaction retriggers this subscription.
-			if (prevModelRun) {
-				$modelRun = prevModelRun;
-				toast('Could not load latest data — keeping previous run');
-			} else {
-				toast('Could not load map data — please try again');
-			}
+			// All retries exhausted. We don't restore a previous modelRun
+			// because the server (Pages Function → R2) is the source of truth
+			// for the active run — our .om URL deliberately omits the run path
+			// (see url.ts:getOMUrl). Next domain/variable/time interaction
+			// will retrigger the subscription and retry.
+			toast('Could not load map data — please try again');
 			console.error('[domain-subscription] gave up after retries', lastErr);
 			return;
 		}
@@ -303,6 +312,15 @@
 		// Fire-and-forget: the warm runs in the background while the first
 		// scrub renders from R2, and subsequent scrubs hit the now-warm edge.
 		void warmCurrentPoP(newDomain);
+	};
+
+	const domainSubscription = domain.subscribe((newDomain) => {
+		const reqId = ++latestDomainReq;
+		// Chain onto the previous load so runs are strictly serial. `.catch`
+		// swallows prior errors so one failure doesn't break the chain.
+		domainLoadChain = domainLoadChain
+			.catch(() => {})
+			.then(() => runDomainLoad(newDomain, reqId));
 	});
 
 	const variableSubscription = variable.subscribe(async (newVar) => {
