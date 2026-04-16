@@ -23,7 +23,28 @@ export const setMapControlSettings = ({ embed = false } = {}) => {
 	// In embed mode the RN app owns all UI — don't render any MapLibre
 	// default controls or our own SettingsButton/GlobeControl. RN handles
 	// zoom/globe via postMessage (setZoom / setGlobeProjection bridge).
-	if (embed) return;
+	if (embed) {
+		// Diagnostic: `?globeTest=1` re-adds MapLibre's built-in GlobeControl
+		// in the middle of the canvas so we can verify device-side globe
+		// rendering independently of the RN → WebView bridge. Temporary.
+		if (
+			typeof window !== 'undefined' &&
+			new URLSearchParams(window.location.search).get('globeTest') === '1'
+		) {
+			const globeControl = new maplibregl.GlobeControl();
+			map.addControl(globeControl);
+			globeControl._globeButton.addEventListener('click', () => globeHandler());
+			const container = (globeControl as unknown as { _container: HTMLElement })._container;
+			Object.assign(container.style, {
+				position: 'absolute',
+				top: '50%',
+				left: '50%',
+				transform: 'translate(-50%, -50%) scale(2)',
+				zIndex: '9999'
+			});
+		}
+		return;
+	}
 
 	map.addControl(
 		new maplibregl.NavigationControl({ visualizePitch: true, showZoom: true, showCompass: true })
