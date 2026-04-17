@@ -201,19 +201,37 @@ export class SlotManager {
 			if (warningTimeout !== undefined) clearTimeout(warningTimeout);
 			this.map.off('sourcedata', onSourceData);
 			this.map.off('error', onError);
+			this.map.off('idle', onIdle);
 			this.cleanupListener = null;
 		};
 
-		const onSourceData = (e: maplibregl.MapSourceDataEvent): void => {
-			if (e.sourceId !== sourceId || !e.isSourceLoaded || e.dataType !== 'source') return;
+		const tryCommit = (): boolean => {
 			if (this.pendingSlot !== nextSlot) {
 				cleanup();
-				return;
+				return true;
 			}
 			if (this.map.style.getSource(sourceId)?.loaded()) {
 				cleanup();
 				this.commit(nextSlot, previousSlot);
+				return true;
 			}
+			return false;
+		};
+
+		const onSourceData = (e: maplibregl.MapSourceDataEvent): void => {
+			if (e.sourceId !== sourceId || !e.isSourceLoaded || e.dataType !== 'source') return;
+			tryCommit();
+		};
+
+		// Fallback — the `om://` protocol resolves the source synchronously fast
+		// enough that the `sourcedata` event with isSourceLoaded=true can fire
+		// BEFORE our subscription is attached. When that happens, `sourcedata`
+		// above never gets called and the spinner hangs forever (reproducible
+		// by cold-starting a deeplink). `map.on('idle')` fires whenever MapLibre
+		// finishes a render pass with no in-flight work — guaranteed to fire at
+		// least once after the source is fully loaded, so we re-check there.
+		const onIdle = (): void => {
+			tryCommit();
 		};
 
 		const onError = (e: maplibregl.MapSourceDataEvent): void => {
@@ -223,6 +241,7 @@ export class SlotManager {
 		};
 
 		this.map.on('sourcedata', onSourceData);
+		this.map.on('idle', onIdle);
 		this.map.on('error', onError);
 		this.cleanupListener = cleanup;
 	}
