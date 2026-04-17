@@ -53,17 +53,26 @@ const anchors: [number, number, number, number, number][] = [
 // match the desktop scale byte-for-byte so forecast-table / legend / map stay
 // aligned on the hot half of the ramp.
 const anchorsEmbed: [number, number, number, number, number][] = [
-	// kt, R, G, B, alpha
-	[0, 32, 45, 77, 1], //     blue       (was 106,149,255 × 0.30)
-	[5, 37, 106, 115, 1], //   cyan       (was 82,235,255 × 0.45)
-	[10, 61, 153, 92, 1], //   green      (was 102,255,153 × 0.60)
-	[15, 136, 204, 60, 1], //  lime       (was 170,255,75 × 0.80)
-	[20, 245, 255, 47, 1], //  yellow     (= desktop)
-	[25, 255, 185, 53, 1], //  orange     (= desktop)
-	[30, 255, 118, 82, 1], //  red-orange (= desktop — max-saturated already)
-	[35, 255, 82, 173, 1], //  pink       (= desktop)
-	[40, 255, 88, 235, 1], //  magenta    (= desktop)
-	[50, 173, 112, 255, 1] //  purple     (= desktop)
+	// Alpha is pinned to 1 because the RN WebView's WebGL pipeline ignores
+	// per-pixel alpha from the color-scale texture — overall overlay dimming
+	// is done RN-side via `?opacity=…`. To compensate for that fixed alpha,
+	// anchors below 20 kt are darkened toward black so calm conditions still
+	// read as "less intense" even without an alpha gradient. ≥20 kt stays
+	// byte-for-byte identical to the desktop scale.
+	//
+	// Anchor knots also shifted: cyan 5 → 8 kt, green 10 → 12 kt. This pushes
+	// the cold-to-warm transition later in the ramp so "green" maps to rideable
+	// conditions rather than still-calm.
+	[0, 64, 89, 153, 1], //    blue        (106,149,255 × 0.60)
+	[8, 57, 165, 179, 1], //   cyan        (82,235,255  × 0.70) — was at 5 kt
+	[12, 82, 204, 122, 1], //  green       (102,255,153 × 0.80) — was at 10 kt
+	[15, 153, 230, 68, 1], //  lime        (170,255,75  × 0.90)
+	[20, 245, 255, 47, 1], //  yellow      (= desktop)
+	[25, 255, 185, 53, 1], //  orange      (= desktop)
+	[30, 255, 118, 82, 1], //  red-orange  (= desktop)
+	[35, 255, 82, 173, 1], //  pink        (= desktop)
+	[40, 255, 88, 235, 1], //  magenta     (= desktop)
+	[50, 173, 112, 255, 1] //  purple      (= desktop)
 ];
 
 // Densify to 1-knot resolution. Both RGB and alpha are interpolated between
