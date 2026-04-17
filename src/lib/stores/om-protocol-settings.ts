@@ -76,7 +76,7 @@ export const omProtocolSettings: Writable<OmProtocolSettings> = writable({
 	...defaultOmProtocolSettings,
 	// static
 	fileReaderConfig: {
-		useSAB: true,
+		useSAB: typeof SharedArrayBuffer !== 'undefined' && (typeof crossOriginIsolated === 'undefined' || crossOriginIsolated),
 		cache: createBlockCache()
 	},
 
