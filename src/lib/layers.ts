@@ -276,9 +276,6 @@ export const createManagers = (): void => {
 
 	const preferences = get(p);
 
-	// Expose for live diagnostics in Safari Web Inspector while debugging the
-	// cold-start hang. Safe to keep — no functional impact.
-	(window as unknown as Record<string, unknown>).__map = map;
 	rasterManager = new SlotManager(map, {
 		sourceIdPrefix: 'omRasterSource',
 		beforeLayer: resolveBeforeLayer(
@@ -328,8 +325,6 @@ export const createManagers = (): void => {
 		sourceSpec: (sourceUrl) => ({ url: sourceUrl, type: 'vector' }),
 		removeDelayMs: 250
 	});
-	(window as unknown as Record<string, unknown>).__rasterMgr = rasterManager;
-	(window as unknown as Record<string, unknown>).__vectorMgr = vectorManager;
 };
 
 // =============================================================================

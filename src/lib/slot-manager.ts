@@ -1,19 +1,5 @@
 import * as maplibregl from 'maplibre-gl';
 
-// Bridge diagnostic lines out to the RN host so they show up in Metro logs.
-// Safe no-op when not running inside the WebView.
-function dbg(prefix: string, data?: Record<string, unknown>): void {
-	try {
-		const rn = (window as unknown as { ReactNativeWebView?: { postMessage: (s: string) => void } })
-			.ReactNativeWebView;
-		rn?.postMessage(
-			JSON.stringify({ type: 'slotmgr', tag: prefix, t: Math.round(performance.now()), ...data })
-		);
-	} catch {
-		/* noop */
-	}
-}
-
 /**
  * SlotManager: double-buffered A/B slot system for MapLibre layers.
  *
@@ -89,7 +75,6 @@ export class SlotManager {
 	}
 
 	update(sourceUrl: string): void {
-		dbg('update', { prefix: this.opts.sourceIdPrefix, url: sourceUrl, activeSlot: this.activeSlot, pendingSlot: this.pendingSlot });
 		this.cleanupListener?.();
 		this.cleanupListener = null;
 
@@ -109,7 +94,6 @@ export class SlotManager {
 
 		const sourceId = this.sourceId(nextSlot);
 		if (!this.map.style.getSource(sourceId)) {
-			dbg('update-abort', { prefix: this.opts.sourceIdPrefix, reason: 'source-not-added', sourceId });
 			if (this.activeSlot) {
 				this.forceRemoveSlot(this.activeSlot);
 			}
@@ -118,8 +102,6 @@ export class SlotManager {
 			return;
 		}
 
-		const loadedAtAdd = this.map.style.getSource(sourceId)?.loaded() ?? null;
-		dbg('update-after-add', { prefix: this.opts.sourceIdPrefix, sourceId, loaded: loadedAtAdd });
 		this.waitForLoad(nextSlot, sourceId, this.activeSlot);
 	}
 
@@ -184,7 +166,6 @@ export class SlotManager {
 	}
 
 	private commit(nextSlot: Slot, previousSlot: Slot | null): void {
-		dbg('commit', { prefix: this.opts.sourceIdPrefix, nextSlot, previousSlot });
 		this.activeSlot = nextSlot;
 		this.pendingSlot = null;
 
@@ -206,9 +187,7 @@ export class SlotManager {
 	}
 
 	private waitForLoad(nextSlot: Slot, sourceId: string, previousSlot: Slot | null): void {
-		const initialLoaded = this.map.style.getSource(sourceId)?.loaded() ?? null;
-		dbg('waitForLoad-enter', { prefix: this.opts.sourceIdPrefix, sourceId, initialLoaded });
-		if (initialLoaded) {
+		if (this.map.style.getSource(sourceId)?.loaded()) {
 			this.commit(nextSlot, previousSlot);
 			return;
 		}
@@ -227,7 +206,6 @@ export class SlotManager {
 
 		const onSourceData = (e: maplibregl.MapSourceDataEvent): void => {
 			if (e.sourceId !== sourceId || !e.isSourceLoaded || e.dataType !== 'source') return;
-			dbg('sourcedata', { prefix: this.opts.sourceIdPrefix, sourceId, loaded: this.map.style.getSource(sourceId)?.loaded() });
 			if (this.pendingSlot !== nextSlot) {
 				cleanup();
 				return;
