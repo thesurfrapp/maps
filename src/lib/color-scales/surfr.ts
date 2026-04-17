@@ -64,7 +64,7 @@ const anchorsEmbed: [number, number, number, number, number][] = [
 	// the cold-to-warm transition later in the ramp so "green" maps to rideable
 	// conditions rather than still-calm.
 	[0, 64, 89, 153, 1], //    blue        (106,149,255 × 0.60)
-	[8, 57, 165, 179, 1], //   cyan        (82,235,255  × 0.70) — was at 5 kt
+	[8, 110, 221, 235, 1], //  cyan        (desktop 82,235,255 × 0.9, then blended 20% toward white) — was at 5 kt
 	[12, 82, 204, 122, 1], //  green       (102,255,153 × 0.80) — was at 10 kt
 	[15, 153, 230, 68, 1], //  lime        (170,255,75  × 0.90)
 	[20, 245, 255, 47, 1], //  yellow      (= desktop)
