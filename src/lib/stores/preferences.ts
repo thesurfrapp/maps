@@ -16,7 +16,7 @@ import {
 import { getInitialMetaData, getMetaData } from '$lib/metadata';
 
 import { cacheBlockSizeKb, cacheMaxBytesMb, customColorScales } from './om-protocol-settings';
-import { inProgress, latest, metaJson, modelRun, modelRunLocked, now, time } from './time';
+import { latest, metaJson, modelRun, now, time } from './time';
 import {
 	DEFAULT_PRECIPITATION_UNIT,
 	DEFAULT_TEMPERATURE_UNIT,
@@ -97,10 +97,7 @@ export const helpOpen = writable(false);
 export const typing = writable(false);
 
 export const resetStates = async () => {
-	modelRunLocked.set(false);
-
 	latest.set(undefined);
-	inProgress.set(undefined);
 	modelRun.set(undefined);
 	await getInitialMetaData();
 	metaJson.set(await getMetaData());

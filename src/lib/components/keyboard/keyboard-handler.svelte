@@ -82,26 +82,20 @@
 				'ArrowRight',
 				'ArrowDown',
 				'ArrowUp',
-				'c',
-				'm',
-				'n'
+				'c'
 			].includes(event.key);
 			if (!isTimeAction) return;
 
 			const { timeNavigationDisabled } = get(timeSelectorActions);
 
-			if (timeNavigationDisabled && event.key !== 'm') return;
+			if (timeNavigationDisabled) return;
 
 			const actions = get(timeSelectorActions);
-			if (event.key === 'ArrowLeft')
-				(event.ctrlKey ? actions.previousModel : actions.previousHour)?.();
-			else if (event.key === 'ArrowRight')
-				(event.ctrlKey ? actions.nextModel : actions.nextHour)?.();
+			if (event.key === 'ArrowLeft') actions.previousHour?.();
+			else if (event.key === 'ArrowRight') actions.nextHour?.();
 			else if (event.key === 'ArrowDown') actions.previousDay?.();
 			else if (event.key === 'ArrowUp') actions.nextDay?.();
 			else if (event.key === 'c') actions.jumpToCurrentTime?.();
-			else if (event.key === 'm') actions.toggleModelRunLock?.();
-			else if (event.key === 'n') actions.setLatestModelRun?.();
 		}
 	};
 

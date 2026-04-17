@@ -33,6 +33,12 @@ const OM_FILE_CONCURRENCY = 4;
 // Models with shorter horizons (HRRR ~18 h) naturally stay under this cap.
 const MAX_HORIZON_HOURS = 72;
 
+// Keep this many previous runs on R2 in addition to the current run. Protects
+// long-open tabs: a client that loaded before a run swap keeps the old runPath
+// in its URLs until reload, so the old files must still resolve. Three runs
+// total (current + 2 prior) covers 2–12 h of idle for most cadences.
+const HISTORICAL_RUNS_TO_KEEP = 2;
+
 // Per-domain budget (ms) so one slow domain doesn't starve the others within a
 // single 15-min scheduled-event cap. Domains are processed sequentially; a
 // domain that runs out of budget gets completed on the next cron tick (its
@@ -79,7 +85,6 @@ const upstreamOmUrl = (domain: string, runPath: string, validTime: string) =>
 	`${UPSTREAM_HOST}/data_spatial/${domain}/${runPath}/${validTime}.om`;
 
 const r2LatestKey = (domain: string) => `data_spatial/${domain}/latest.json`;
-const r2MetaKey = (domain: string) => `data_spatial/${domain}/meta.json`;
 const r2OmKey = (domain: string, runPath: string, validTime: string) =>
 	`data_spatial/${domain}/${runPath}/${validTime}.om`;
 
@@ -194,40 +199,51 @@ const warmAllFiles = async (
 	return { ok, skip, fail, notYetUpstream, timedOut, stoppedAt404 };
 };
 
-// List + delete all `.om` keys under `data_spatial/<domain>/` whose run-path
-// segment isn't the one we just warmed. We scan in pages (list max 1000).
-const deleteOldRunFiles = async (
+// List all `.om` keys under `data_spatial/<domain>/`, group by runPath, keep
+// the newest `keepN + 1` runPaths (= current + keepN historical), delete the
+// rest. `YYYY/MM/DD/HHmmZ` sorts lexicographically in chronological order,
+// which is why we can rank purely by string compare.
+const pruneOldRunFiles = async (
 	env: Env,
 	domain: string,
-	keepRunPath: string
-): Promise<number> => {
+	keepN: number
+): Promise<{ deleted: number; keptRunPaths: string[] }> => {
 	let cursor: string | undefined;
-	let deleted = 0;
 	const prefix = `data_spatial/${domain}/`;
-	// Loop at most a few times — even a 384-hour forecast + retention history
+	const keysByRunPath = new Map<string, string[]>();
+	// Loop at most a few times — even a 72-hour forecast × (keepN+1) runs
 	// shouldn't produce more than a few thousand keys per domain.
 	for (let page = 0; page < 20; page++) {
 		const listing = await env.TILE_CACHE.list({ prefix, cursor, limit: 1000 });
-		const oldOmKeys: string[] = [];
 		for (const obj of listing.objects) {
 			if (!obj.key.endsWith('.om')) continue;
 			// key: data_spatial/<domain>/<YYYY/MM/DD/HHmmZ>/<validTime>.om
-			// Extract run path = segment between domain and the final filename.
 			const parts = obj.key.slice(prefix.length).split('/');
 			if (parts.length < 5) continue; // Not a run-path structured key — ignore.
 			const runPath = parts.slice(0, 4).join('/');
-			if (runPath !== keepRunPath) oldOmKeys.push(obj.key);
-		}
-		if (oldOmKeys.length) {
-			// R2 batch delete: supports up to 1000 keys per call.
-			await env.TILE_CACHE.delete(oldOmKeys);
-			deleted += oldOmKeys.length;
+			const bucket = keysByRunPath.get(runPath) ?? [];
+			bucket.push(obj.key);
+			keysByRunPath.set(runPath, bucket);
 		}
 		if (!listing.truncated) break;
 		cursor = (listing as { cursor?: string }).cursor;
 		if (!cursor) break;
 	}
-	return deleted;
+
+	const runPathsNewestFirst = Array.from(keysByRunPath.keys()).sort().reverse();
+	const keptRunPaths = runPathsNewestFirst.slice(0, keepN + 1);
+	const prunedRunPaths = runPathsNewestFirst.slice(keepN + 1);
+
+	let deleted = 0;
+	for (const rp of prunedRunPaths) {
+		const keys = keysByRunPath.get(rp) ?? [];
+		// R2 batch delete: up to 1000 keys per call.
+		for (let i = 0; i < keys.length; i += 1000) {
+			await env.TILE_CACHE.delete(keys.slice(i, i + 1000));
+		}
+		deleted += keys.length;
+	}
+	return { deleted, keptRunPaths };
 };
 
 // Fetch upstream JSON, return parsed or null on any failure.
@@ -254,7 +270,8 @@ export type DomainResult =
 			// purge + re-warm after a run swap.
 			validTimes: string[];
 			files: { ok: number; skip: number; fail: number; timedOut: boolean };
-			deletedOldFiles: number;
+			prunedOldFiles: number;
+			keptRunPaths: string[];
 			wallMs: number;
 	  }
 	| { domain: string; status: 'error'; error: string };
@@ -356,16 +373,9 @@ const warmDomainInner = async (env: Env, domain: string): Promise<DomainResult> 
 			};
 		}
 
-		// Atomic swap: write meta.json first, then latest.json. Clients reading
-		// latest.json have a consistent snapshot — when they see the new
-		// reference_time they can immediately fetch meta.json for it.
-		await env.TILE_CACHE.put(r2MetaKey(domain), JSON.stringify(meta), {
-			httpMetadata: { contentType: 'application/json' },
-			customMetadata: {
-				refTime: upstream.reference_time,
-				cachedAt: new Date().toISOString()
-			}
-		});
+		// Flip the pointer. Upstream's latest.json already contains the full
+		// valid_times / variables payload (byte-identical to its meta.json),
+		// so a single put is enough — no separate meta.json swap.
 		await env.TILE_CACHE.put(r2LatestKey(domain), JSON.stringify(upstream), {
 			httpMetadata: { contentType: 'application/json' },
 			customMetadata: {
@@ -374,8 +384,18 @@ const warmDomainInner = async (env: Env, domain: string): Promise<DomainResult> 
 			}
 		});
 
-		// Cleanup: drop .om files from the previous run.
-		const deletedOldFiles = await deleteOldRunFiles(env, domain, newRunPath);
+		// Cleanup: keep current run + HISTORICAL_RUNS_TO_KEEP prior runs.
+		const { deleted: prunedOldFiles, keptRunPaths } = await pruneOldRunFiles(
+			env,
+			domain,
+			HISTORICAL_RUNS_TO_KEEP
+		);
+
+		// One-time sweep of legacy meta.json keys — we stopped writing these
+		// once we consolidated on latest.json (upstream's latest.json already
+		// carries valid_times + variables). Safe to keep calling every tick;
+		// if the key doesn't exist, delete is a noop.
+		await env.TILE_CACHE.delete(`data_spatial/${domain}/meta.json`).catch(() => {});
 
 		return {
 			domain,
@@ -384,7 +404,8 @@ const warmDomainInner = async (env: Env, domain: string): Promise<DomainResult> 
 			previousReferenceTime: ours?.reference_time ?? null,
 			validTimes: cappedValidTimes,
 			files: fileStats,
-			deletedOldFiles,
+			prunedOldFiles,
+			keptRunPaths,
 			wallMs: Date.now() - t0
 		};
 	} catch (err) {

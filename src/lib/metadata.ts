@@ -3,80 +3,43 @@ import { get } from 'svelte/store';
 import { type DomainMetaDataJson, VARIABLE_PREFIX } from '@openmeteo/weather-map-layer';
 
 import { loading } from '$lib/stores/preferences';
-import { inProgress as iP, latest as l, metaJson as mJ, modelRun as mR } from '$lib/stores/time';
-import { domain as d, selectedDomain, variable as v } from '$lib/stores/variables';
+import { latest as l, metaJson as mJ, modelRun as mR } from '$lib/stores/time';
+import { selectedDomain, variable as v } from '$lib/stores/variables';
 
-import { fmtModelRun, getBaseUri } from './helpers';
+import { getBaseUri } from './helpers';
 
 export const getInitialMetaData = async () => {
 	const domain = get(selectedDomain);
 	const uri = getBaseUri(domain.value);
 
-	const [latestRes, inProgressRes] = await Promise.all([
-		fetch(`${uri}/data_spatial/${domain.value}/latest.json`),
-		fetch(`${uri}/data_spatial/${domain.value}/in-progress.json`)
-	]);
+	// Only read latest.json from our proxy. It's served R2-only, and the
+	// warmer writes it LAST in the atomic swap — so its reference_time is
+	// guaranteed to point at a run whose full 72 h of .om files are in R2.
+	// Upstream's latest.json already contains valid_times and variables, so
+	// this is the only metadata fetch we need.
+	const latestRes = await fetch(`${uri}/data_spatial/${domain.value}/latest.json`, {
+		cache: 'no-store'
+	});
 
-	for (const res of [latestRes, inProgressRes]) {
-		if (!res.ok) {
-			loading.set(false);
-			throw new Error(`HTTP ${res.status}`);
-		}
-		if (res.url.includes('latest.json')) l.set(await res.json());
-		if (res.url.includes('in-progress.json')) iP.set(await res.json());
-	}
-};
-
-const toDate = (dateString: string | undefined): Date | undefined =>
-	dateString ? new Date(dateString) : undefined;
-
-const matchesModelRun = (referenceTime: Date | undefined, modelRun: Date): boolean =>
-	referenceTime?.getTime() === modelRun.getTime();
-
-const fetchMetaData = async (
-	uri: string,
-	domain: string,
-	// eslint-disable-next-line @typescript-eslint/no-unused-vars
-	_modelRun: Date
-): Promise<DomainMetaDataJson> => {
-	// Our Pages Function + R2 store meta.json at `data_spatial/{domain}/meta.json`
-	// (no runPath prefix) — it's a single "current run" snapshot written by the
-	// warmer. Including a runPath here produces a 503 cold-r2 every time because
-	// the key doesn't exist. See `functions/lib/warmer.ts:82` (r2MetaKey) and
-	// `functions/tiles/[[path]].ts:R2_JSON_KEY`.
-	const url = `${uri}/data_spatial/${domain}/meta.json`;
-	const res = await fetch(url);
-
-	if (!res.ok) {
+	if (!latestRes.ok) {
 		loading.set(false);
-		throw new Error(`HTTP ${res.status}`);
+		throw new Error(`HTTP ${latestRes.status}`);
 	}
-
-	return res.json();
+	l.set(await latestRes.json());
 };
 
 export const getMetaData = async (): Promise<DomainMetaDataJson> => {
-	const domain = get(d);
-	const uri = getBaseUri(domain);
-
 	const latest = get(l);
-	const latestReferenceTime = toDate(latest?.reference_time);
+	if (!latest) throw new Error('latest.json not loaded');
 
+	// modelRun is always pinned to latest.reference_time — users can't pick
+	// a non-latest run, so latest IS the active metadata.
 	if (get(mR) === undefined) {
-		mR.set(latestReferenceTime);
+		mR.set(new Date(latest.reference_time));
 	}
-	const modelRun = get(mR) as Date;
 
-	const inProgress = get(iP);
-	const inProgressReferenceTime = toDate(inProgress?.reference_time);
-
-	const result: DomainMetaDataJson = matchesModelRun(latestReferenceTime, modelRun)
-		? (latest as DomainMetaDataJson)
-		: matchesModelRun(inProgressReferenceTime, modelRun)
-			? (inProgress as DomainMetaDataJson)
-			: await fetchMetaData(uri, domain, modelRun);
-
-	result.valid_times.sort();
+	const result = { ...latest } as DomainMetaDataJson;
+	result.valid_times = [...latest.valid_times].sort();
 	return result;
 };
 

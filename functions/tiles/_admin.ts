@@ -18,10 +18,15 @@ interface Env {
 
 const UPSTREAM_HOST = 'https://map-tiles.open-meteo.com';
 
+type HistoricalRun = {
+	runPath: string;
+	files: number;
+	mb: number;
+};
+
 type DomainRow = {
 	domain: string;
 	r2Latest: string | null;
-	r2Meta: string | null;
 	upstreamLatest: string | null;
 	upstreamError: string | null;
 	fileCount: number;
@@ -29,6 +34,7 @@ type DomainRow = {
 	oldestValid: string | null;
 	newestValid: string | null;
 	runPath: string | null;
+	historicalRuns: HistoricalRun[];
 	status: 'ok' | 'stale' | 'cold' | 'unknown';
 };
 
@@ -63,40 +69,43 @@ const fetchUpstreamLatest = async (domain: string): Promise<string | null> => {
 	}
 };
 
-const listDomainFiles = async (
+type RunStats = { count: number; bytes: number; oldest: string | null; newest: string | null };
+
+const listDomainRuns = async (
 	bucket: R2Bucket,
-	domain: string,
-	runPath: string
-): Promise<{ count: number; totalBytes: number; oldest: string | null; newest: string | null }> => {
-	const prefix = `data_spatial/${domain}/${runPath}/`;
+	domain: string
+): Promise<Map<string, RunStats>> => {
+	const prefix = `data_spatial/${domain}/`;
+	const byRunPath = new Map<string, RunStats>();
 	let cursor: string | undefined;
-	let count = 0;
-	let totalBytes = 0;
-	let oldest: string | null = null;
-	let newest: string | null = null;
 	for (let page = 0; page < 20; page++) {
 		const listing = await bucket.list({ prefix, cursor, limit: 1000 });
 		for (const obj of listing.objects) {
 			if (!obj.key.endsWith('.om')) continue;
-			count++;
-			totalBytes += obj.size;
-			// Key tail is "<validTime>.om" — pull out validTime.
-			const tail = obj.key.slice(prefix.length).replace(/\.om$/, '');
-			if (!oldest || tail < oldest) oldest = tail;
-			if (!newest || tail > newest) newest = tail;
+			// key: data_spatial/<domain>/<YYYY/MM/DD/HHmmZ>/<validTime>.om
+			const parts = obj.key.slice(prefix.length).split('/');
+			if (parts.length < 5) continue;
+			const runPath = parts.slice(0, 4).join('/');
+			const validTime = parts[4].replace(/\.om$/, '');
+			const stats = byRunPath.get(runPath) ?? { count: 0, bytes: 0, oldest: null, newest: null };
+			stats.count++;
+			stats.bytes += obj.size;
+			if (!stats.oldest || validTime < stats.oldest) stats.oldest = validTime;
+			if (!stats.newest || validTime > stats.newest) stats.newest = validTime;
+			byRunPath.set(runPath, stats);
 		}
 		if (!listing.truncated) break;
 		cursor = (listing as { cursor?: string }).cursor;
 		if (!cursor) break;
 	}
-	return { count, totalBytes, oldest, newest };
+	return byRunPath;
 };
 
 const collectRow = async (bucket: R2Bucket, domain: string): Promise<DomainRow> => {
-	const [r2Latest, r2Meta, upstreamLatest] = await Promise.all([
+	const [r2Latest, upstreamLatest, runsByPath] = await Promise.all([
 		readJsonRefTime(bucket, `data_spatial/${domain}/latest.json`),
-		readJsonRefTime(bucket, `data_spatial/${domain}/meta.json`),
-		fetchUpstreamLatest(domain)
+		fetchUpstreamLatest(domain),
+		listDomainRuns(bucket, domain)
 	]);
 
 	let fileCount = 0;
@@ -104,15 +113,27 @@ const collectRow = async (bucket: R2Bucket, domain: string): Promise<DomainRow> 
 	let oldest: string | null = null;
 	let newest: string | null = null;
 	let runPath: string | null = null;
+	const historicalRuns: HistoricalRun[] = [];
 
 	if (r2Latest) {
 		runPath = fmtRunPath(r2Latest);
-		const listing = await listDomainFiles(bucket, domain, runPath);
-		fileCount = listing.count;
-		totalMb = +(listing.totalBytes / 1e6).toFixed(1);
-		oldest = listing.oldest;
-		newest = listing.newest;
+		const current = runsByPath.get(runPath);
+		if (current) {
+			fileCount = current.count;
+			totalMb = +(current.bytes / 1e6).toFixed(1);
+			oldest = current.oldest;
+			newest = current.newest;
+		}
 	}
+
+	// Every runPath other than the current one is historical (retained for
+	// long-open tabs). Sort newest-first: `YYYY/MM/DD/HHmmZ` sorts
+	// lexicographically in chronological order.
+	for (const [rp, stats] of runsByPath) {
+		if (rp === runPath) continue;
+		historicalRuns.push({ runPath: rp, files: stats.count, mb: +(stats.bytes / 1e6).toFixed(1) });
+	}
+	historicalRuns.sort((a, b) => (a.runPath < b.runPath ? 1 : a.runPath > b.runPath ? -1 : 0));
 
 	let status: DomainRow['status'] = 'unknown';
 	if (!r2Latest) status = 'cold';
@@ -123,7 +144,6 @@ const collectRow = async (bucket: R2Bucket, domain: string): Promise<DomainRow> 
 	return {
 		domain,
 		r2Latest,
-		r2Meta,
 		upstreamLatest,
 		upstreamError: null,
 		fileCount,
@@ -131,6 +151,7 @@ const collectRow = async (bucket: R2Bucket, domain: string): Promise<DomainRow> 
 		oldestValid: oldest,
 		newestValid: newest,
 		runPath,
+		historicalRuns,
 		status
 	};
 };
@@ -177,10 +198,6 @@ const renderHtml = (
 				r.r2Latest && r.upstreamLatest && r.r2Latest !== r.upstreamLatest
 					? `<br><span style="color:#f59e0b;font-size:11px">Upstream: ${escapeHtml(r.upstreamLatest)}</span>`
 					: '';
-			const metaMismatch =
-				r.r2Latest && r.r2Meta && r.r2Latest !== r.r2Meta
-					? `<br><span style="color:#ef4444;font-size:11px">meta.json out of sync: ${escapeHtml(r.r2Meta)}</span>`
-					: '';
 			const tick = perDomainTicks[r.domain] as
 				| { at?: string; status?: string; error?: string; wallMs?: number }
 				| undefined
@@ -193,14 +210,23 @@ const renderHtml = (
 			// even for domains not in the default REWARM_DOMAINS list.
 			const forceUrl = `https://surfr-tile-warmer-cron.herbert-0fd.workers.dev/force?domain=${encodeURIComponent(r.domain)}&rewarm=1`;
 			const forceCell = `<a href="${forceUrl}" target="_blank" rel="noreferrer" class="force-btn">Purge+rewarm</a>`;
+			const historicalCell = r.historicalRuns.length
+				? r.historicalRuns
+						.map(
+							(h) =>
+								`<div style="font-size:11px;line-height:1.5"><code>${escapeHtml(h.runPath)}</code> &middot; ${h.files} files &middot; ${h.mb.toFixed(1)}&nbsp;MB</div>`
+						)
+						.join('')
+				: '<span style="color:#9ca3af">—</span>';
 			return `<tr>
 				<td><strong>${escapeHtml(r.domain)}</strong></td>
 				<td>${statusPill}</td>
-				<td><code>${escapeHtml(r.r2Latest)}</code>${mismatch}${metaMismatch}</td>
+				<td><code>${escapeHtml(r.r2Latest)}</code>${mismatch}</td>
 				<td style="text-align:right">${r.fileCount}</td>
 				<td style="text-align:right">${r.totalMb.toFixed(1)}&nbsp;MB</td>
 				<td><code>${escapeHtml(r.oldestValid)}</code></td>
 				<td><code>${escapeHtml(r.newestValid)}</code></td>
+				<td>${historicalCell}</td>
 				<td>${tickCell}</td>
 				<td>${forceCell}</td>
 			</tr>`;
@@ -274,6 +300,7 @@ ${cronDetails}
 	<th>Size</th>
 	<th>Oldest valid</th>
 	<th>Newest valid</th>
+	<th>Historical runs</th>
 	<th>Last tick</th>
 	<th>Actions</th>
 </tr>

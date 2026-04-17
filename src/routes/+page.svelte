@@ -36,6 +36,7 @@
 	import ModelPills from '$lib/components/overlay-pills/model-pills.svelte';
 	import OverlayPills from '$lib/components/overlay-pills/overlay-pills.svelte';
 	import PopWarmToast from '$lib/components/pop-warm-toast.svelte';
+	import RunDateLabel from '$lib/components/run-date-label.svelte';
 	import Settings from '$lib/components/settings/settings.svelte';
 	import TimeSelector from '$lib/components/time/time-selector.svelte';
 	import TimezoneSelector from '$lib/components/timezone/TimezoneSelector.svelte';
@@ -230,7 +231,7 @@
 	// Serialize domain-load work. Without this, Svelte fires the subscription
 	// multiple times during startup (initial value + `urlParamsToPreferences`
 	// override + RN bridge `setDomain` after 'ready'), and the async callbacks
-	// run in parallel — mutating shared stores (`latest`, `inProgress`, `mR`,
+	// run in parallel — mutating shared stores (`latest`, `mR`,
 	// `$metaJson`) out of order. That produces a stuck state where
 	// `mR.set(latestReferenceTime)` lands with `latestReferenceTime=undefined`
 	// because the other callback hasn't populated `latest` yet, so modelRun
@@ -373,6 +374,11 @@
 <!-- Also rendered in embed so the RN WebView shows the cache-warm progress
      toast on domain switch — useful debugging feedback for the user. -->
 <PopWarmToast />
+
+<!-- Small label showing the current run date. Always rendered (embed + web)
+     so mobile users can see which run their tiles came from. Same 120px top
+     as the pop-warm toast — toast overlays it while warming, which is fine. -->
+<RunDateLabel />
 
 <style>
 	/* Stacked in the top-left column under ModelPills + OverlayPills. */

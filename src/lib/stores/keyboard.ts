@@ -9,11 +9,7 @@ export interface TimeSelectorActions {
 	nextHour?: () => void;
 	previousDay?: () => void;
 	nextDay?: () => void;
-	previousModel?: () => void;
-	nextModel?: () => void;
 	jumpToCurrentTime?: () => void;
-	toggleModelRunLock?: () => void;
-	setLatestModelRun?: () => void;
 	timeNavigationDisabled?: boolean;
 }
 

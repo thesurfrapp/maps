@@ -3,14 +3,14 @@
 	import { SvelteDate } from 'svelte/reactivity';
 	import { fade } from 'svelte/transition';
 
-	import { closestModelRun, domainStep } from '@openmeteo/weather-map-layer';
+	import { domainStep } from '@openmeteo/weather-map-layer';
 	import { mode } from 'mode-watcher';
 	import { toast } from 'svelte-sonner';
 
 	import { timeSelectorActions } from '$lib/stores/keyboard';
 	import { desktop, loading } from '$lib/stores/preferences';
-	import { metaJson, modelRunLocked } from '$lib/stores/time';
-	import { inProgress, latest, modelRun, now, time } from '$lib/stores/time';
+	import { metaJson } from '$lib/stores/time';
+	import { latest, modelRun, now, time } from '$lib/stores/time';
 	import { selectedDomain } from '$lib/stores/variables';
 
 	import PrefetchButton from '$lib/components/time/prefetch-button.svelte';
@@ -24,7 +24,6 @@
 	} from '$lib/constants';
 	import { throttle } from '$lib/helpers';
 	import { changeOMfileURL } from '$lib/layers';
-	import { getMetaData } from '$lib/metadata';
 	import {
 		formatDisplayDate,
 		formatDisplayDateTime,
@@ -50,28 +49,6 @@
 	// Tracks the currently selected date for display and navigation
 	let currentDate = $state(new Date($time));
 
-	// Converts the selected domain's model interval to hours for calculations
-	let modelInterval = $derived.by(() => {
-		let mI = $selectedDomain.model_interval;
-
-		switch (mI) {
-			case 'hourly':
-				return 1;
-			case '3_hourly':
-				return 3;
-			case '6_hourly':
-				return 6;
-			case '12_hourly':
-				return 12;
-			case 'daily':
-				return 24;
-			case 'monthly':
-				return 720;
-			default:
-				return 1;
-		}
-	});
-
 	// Navigate to the previous available time step
 	const previousHour = () => {
 		let date = new SvelteDate($time);
@@ -86,22 +63,6 @@
 				date.setTime(date.getTime() - metaFirstResolution);
 				onDateChange(date);
 			}
-		}
-	};
-
-	const previousModel = () => {
-		const currentIndex = previousModelSteps.findIndex((pMS) =>
-			$modelRun ? $modelRun.getTime() === pMS.getTime() : false
-		);
-		if (currentIndex !== -1) {
-			onModelRunChange(previousModelSteps[currentIndex + 1]);
-		}
-		if (
-			$modelRun &&
-			inProgressReferenceTime &&
-			$modelRun.getTime() === inProgressReferenceTime.getTime()
-		) {
-			onModelRunChange(latestReferenceTime);
 		}
 	};
 
@@ -121,36 +82,6 @@
 				} else {
 					toast.warning('Already on latest timestep');
 				}
-			}
-		}
-	};
-
-	const nextModel = () => {
-		const currentIndex = previousModelSteps.findIndex((pMS) =>
-			$modelRun ? $modelRun.getTime() === pMS.getTime() : false
-		);
-		if (currentIndex !== -1) {
-			if (currentIndex === 0) {
-				if (
-					$modelRun &&
-					inProgressReferenceTime &&
-					inProgressReferenceTime.getTime() !== $modelRun.getTime() &&
-					inProgressReferenceTime.getTime() > latestReferenceTime.getTime()
-				) {
-					onModelRunChange(inProgressReferenceTime);
-				} else {
-					toast.warning('Already on latest model');
-				}
-			} else {
-				onModelRunChange(previousModelSteps[currentIndex - 1]);
-			}
-		} else {
-			if (
-				$modelRun &&
-				inProgressReferenceTime &&
-				inProgressReferenceTime.getTime() === $modelRun.getTime()
-			) {
-				toast.warning('Already on in-progress model');
 			}
 		}
 	};
@@ -186,11 +117,6 @@
 	const checkClosestModelRun = async () => {
 		let timeStep = new Date($time);
 
-		let nearestModelRun = closestModelRun(timeStep, $selectedDomain.model_interval);
-		if (nearestModelRun.getTime() > latestReferenceTime.getTime()) {
-			nearestModelRun = latestReferenceTime;
-		}
-
 		// other than seasonal models, data is not available longer than 7 days
 		if ($selectedDomain.model_interval !== 'monthly') {
 			// check that requested timeStep is not older than 7 days
@@ -219,105 +145,16 @@
 			}
 		}
 
-		let setToModelRun = new SvelteDate($modelRun);
-
-		if (
-			nearestModelRun.getTime() > metaReferenceTime.getTime() &&
-			nearestModelRun.getTime() <= latestReferenceTime.getTime()
-		) {
-			setToModelRun = new SvelteDate(nearestModelRun);
-		} else if ($modelRun && timeStep.getTime() < $modelRun.getTime()) {
-			setToModelRun = new SvelteDate(nearestModelRun);
-		} else {
-			if ($modelRun && latestReferenceTime.getTime() === $modelRun.getTime()) {
-				updateUrl('model_run', undefined); // remove model_run from url when on latest
-			} else if (
-				$modelRun &&
-				timeStep.getTime() > metaReferenceTime.getTime() &&
-				metaReferenceTime.getTime() > $modelRun.getTime()
-			) {
-				setToModelRun = new SvelteDate(metaReferenceTime);
-			} else if (timeStep.getTime() < metaReferenceTime.getTime()) {
-				if ($modelRun && $modelRun.getTime() < nearestModelRun.getTime()) {
-					setToModelRun = new SvelteDate(nearestModelRun);
-				}
-			}
-		}
-
-		if (!$modelRunLocked && $modelRun && setToModelRun.getTime() !== $modelRun.getTime()) {
-			$modelRun = new Date(setToModelRun);
-			try {
-				$metaJson = await getMetaData();
-			} catch (e) {
-				const error = e as Error;
-				toast.warning(error.message);
-				// set to latest
-				$time = new Date(latestReferenceTime);
-				$modelRun = new Date(latestReferenceTime);
-				$metaJson = $latest;
-			}
-			if ($modelRun.getTime() !== latestReferenceTime.getTime()) {
-				updateUrl('model_run', formatISOWithoutTimezone($modelRun));
-			} else {
-				updateUrl('model_run', undefined);
-			}
-		} else {
-			updateUrl();
-		}
+		updateUrl();
 	};
 
 	// updates the selected time and synchronizes with URL and OM file
 	const onDateChange = async (date: Date) => {
-		if ($modelRunLocked) {
-			if (date.getTime() < metaFirstTime.getTime()) {
-				toast.warning("Model run locked, can't go before first time");
-				currentDate = new SvelteDate($time);
-				centerDateButton(currentDate);
-				return;
-			}
-			if (date.getTime() > metaLastTime.getTime()) {
-				toast.warning("Model run locked, can't go after last time");
-				currentDate = new SvelteDate($time);
-				centerDateButton(currentDate);
-				return;
-			}
-		}
-
 		$time = new SvelteDate(date);
 		currentDate = date;
 		updateUrl('time', formatISOWithoutTimezone($time));
 		await checkClosestModelRun();
 		changeOMfileURL();
-	};
-
-	// changes the selected model run and updates available time steps
-	const onModelRunChange = async (step: Date) => {
-		$loading = true;
-		$modelRunLocked = true;
-		$modelRun = step;
-		$metaJson = await getMetaData();
-
-		let closestTime = new SvelteDate($modelRun);
-		for (const vT of $metaJson.valid_times) {
-			const validTime = new Date(vT);
-			if (validTime.getTime() <= $time.getTime()) {
-				closestTime.setTime(validTime.getTime());
-			}
-		}
-
-		onDateChange(closestTime);
-
-		if ($modelRun.getTime() !== latestReferenceTime.getTime()) {
-			updateUrl('model_run', formatISOWithoutTimezone($modelRun));
-		} else {
-			updateUrl('model_run', undefined);
-		}
-
-		await tick();
-		if (dayContainer) {
-			dayContainerScrollLeft = dayContainer.scrollLeft;
-			dayContainerScrollWidth = dayContainer.scrollWidth;
-		}
 	};
 
 	const jumpToCurrentTime = () => {
@@ -330,26 +167,11 @@
 		centerDateButton(date);
 	};
 
-	const toggleModelRunLock = () => {
-		$modelRunLocked = !$modelRunLocked;
-		toast.info($modelRunLocked ? 'Model run locked' : 'Model run unlocked');
-	};
-
-	const setLatestModelRun = () => {
-		if ($modelRun && $modelRun.getTime() === latestReferenceTime.getTime()) {
-			toast.warning('Already on latest model run');
-		} else {
-			onModelRunChange(latestReferenceTime);
-		}
-	};
-
 	// throttled versions of the navigation functions
 	const throttledPreviousHour = throttle(previousHour, 150);
 	const throttledNextHour = throttle(nextHour, 150);
 	const throttledPreviousDay = throttle(previousDay, 150);
 	const throttledNextDay = throttle(nextDay, 150);
-	const throttledPreviousModel = throttle(previousModel, 250);
-	const throttledNextModel = throttle(nextModel, 250);
 
 	$effect(() => {
 		timeSelectorActions.set({
@@ -357,11 +179,7 @@
 			nextHour: throttledNextHour,
 			previousDay: throttledPreviousDay,
 			nextDay: throttledNextDay,
-			previousModel: throttledPreviousModel,
-			nextModel: throttledNextModel,
 			jumpToCurrentTime,
-			toggleModelRunLock,
-			setLatestModelRun,
 			timeNavigationDisabled: disabled
 		});
 		return () => timeSelectorActions.set({});
@@ -700,27 +518,6 @@
 	onDestroy(() => {
 		if (resizeTimeout) clearTimeout(resizeTimeout);
 	});
-
-	let previousModelSteps = $derived.by(() => {
-		const previousModels = [];
-		for (let day of Array.from({ length: Math.floor((6.9 * 24) / modelInterval) }, (_, i) => i)) {
-			const date = new SvelteDate(latestReferenceTime);
-			date.setUTCMinutes(0);
-			date.setUTCSeconds(0);
-			date.setUTCMilliseconds(0);
-			date.setUTCHours(date.getUTCHours() - day * modelInterval);
-			previousModels.push(date);
-		}
-		return previousModels;
-	});
-
-	let inProgressReferenceTime = $derived(
-		$inProgress?.reference_time &&
-			$latest?.reference_time &&
-			$inProgress?.reference_time !== $latest?.reference_time
-			? new Date($inProgress?.reference_time)
-			: undefined
-	);
 </script>
 
 <div

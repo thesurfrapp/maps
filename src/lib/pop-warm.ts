@@ -37,6 +37,12 @@ const fmtValidTime = (iso: string): string => {
 	return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}`;
 };
 
+const fmtRunPath = (iso: string): string => {
+	const d = new Date(iso);
+	const pad = (n: number) => String(n).padStart(2, '0');
+	return `${d.getUTCFullYear()}/${pad(d.getUTCMonth() + 1)}/${pad(d.getUTCDate())}/${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}Z`;
+};
+
 const runBounded = async (
 	items: string[],
 	limit: number,
@@ -75,8 +81,11 @@ export const warmCurrentPoP = async (domain: string): Promise<void> => {
 	});
 
 	try {
-		const metaRes = await fetch(`${META_BASE}/${domain}/meta.json`, { signal });
-		if (!metaRes.ok) throw new Error(`meta.json ${metaRes.status}`);
+		const metaRes = await fetch(`${META_BASE}/${domain}/latest.json`, {
+			cache: 'no-store',
+			signal
+		});
+		if (!metaRes.ok) throw new Error(`latest.json ${metaRes.status}`);
 		const meta = (await metaRes.json()) as {
 			reference_time: string;
 			valid_times: string[];
@@ -84,12 +93,13 @@ export const warmCurrentPoP = async (domain: string): Promise<void> => {
 		const refMs = new Date(meta.reference_time).getTime();
 		const cutoffMs = refMs + WARM_HORIZON_HOURS * 3600 * 1000;
 		const capped = meta.valid_times.filter((iso) => new Date(iso).getTime() <= cutoffMs);
+		const runPath = fmtRunPath(meta.reference_time);
 
 		popWarmProgress.update((s) => ({ ...s, total: capped.length }));
 
 		await runBounded(capped, WARM_CONCURRENCY, async (iso) => {
 			if (signal.aborted) return;
-			const url = `${META_BASE}/${domain}/${fmtValidTime(iso)}.om`;
+			const url = `${META_BASE}/${domain}/${runPath}/${fmtValidTime(iso)}.om`;
 			try {
 				const res = await fetch(url, {
 					method: 'GET',
