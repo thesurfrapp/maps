@@ -25,9 +25,9 @@ Goals:
 ## Decision
 
 A **four-tier cache stack** on Cloudflare, driven by a 5-min cron that writes
-to an R2 bucket and invalidates the CF edge cache on every upstream run swap.
-Every `.om` and `latest.json` request funnels through a Pages Function at
-`maps.thesurfr.app/tiles/*`.
+to an R2 bucket. Every `.om` and `latest.json` request funnels through a
+Pages Function at `maps.thesurfr.app/tiles/*`. URLs include the run path so
+each run has an immutable cache identity — no CF cache purging is needed.
 
 ```
 Client (browser)
@@ -135,8 +135,8 @@ the full 10-day GFS horizon would balloon R2 writes with low payoff.
 
 **Inside the 72 h window:**
 - R2 has the file. Pages Function serves from R2 (HIT-R2 ~100–500 ms).
-- After purge-on-swap, first user at a cold PoP pays one R2-read;
-  subsequently CF edge HIT (~20–120 ms).
+- First user at a cold PoP pays one R2-read; subsequently CF edge HIT
+  (~20–120 ms) until the 30 d Cache Rule TTL expires.
 
 **Outside the 72 h window:**
 1. Client request → CF edge MISS → Pages Function.
@@ -254,7 +254,8 @@ Related endpoints:
 - `/tiles/_warmer-trigger` — run all domains, fire-and-forget.
 - `/tiles/_debug/cache` — JSON inventory of R2 keys grouped by prefix.
 - `https://surfr-tile-warmer-cron.herbert-0fd.workers.dev/force?domain=<d>`
-  — force a CF cache purge for one domain's current run.
+  — re-run the warmer for one domain, bypassing the "unchanged"
+  short-circuit. Useful for recovery.
 
 ### Run-date label
 
@@ -270,19 +271,17 @@ toast overlays the label while warming.
 every user is latency-routed to the closest one. **Edge cache is per-PoP** —
 a HIT at PoP A does not benefit PoP B.
 
-**The cron worker runs at one PoP** (wherever CF schedules it). When the
-cron fires a purge, the purge is global, so every PoP drops the stale entry.
-When the cron *could* re-warm, it would only warm its own PoP (and, via
-Smart Tiered Cache, the upper tier). Cache Reserve — the global persistent
-tier that would make a single re-warm fetch meaningful for every PoP —
-currently does not catch our traffic (support ticket is open). The cron is
-therefore **purge-only, no re-warm**.
+Because every client URL includes the runPath, edge entries are tied to a
+specific run. New runs produce new URL strings; the prior run's entries
+simply go unused and age out at the 30 d Cache Rule TTL. No purge or
+scheduled re-warm is needed.
 
-How edge cache actually gets warmed at other PoPs:
+How edge cache gets warmed at a PoP for a new run:
 
-1. **First user at a cold PoP**: range request → CF edge MISS → Pages
-   Function → R2 → 206 response. CF caches the full file (cache-on-range
-   behavior) and the range response goes back. ~400–1600 ms.
+1. **First user at a cold PoP (for a given URL)**: range request → CF edge
+   MISS → Pages Function → R2 → 206 response. CF caches the full file
+   (cache-on-range behavior) and the range response goes back.
+   ~400–1600 ms.
 2. **Subsequent users at that PoP**: CF edge HIT. ~20–120 ms.
 
 **CF cache-on-range behavior**: when a range request lands on a cacheable
@@ -313,13 +312,14 @@ behind a slow prefetch.
 ### Latency profile
 
 - **p50 TTFB on `.om` ranges**: ~20–120 ms (edge HIT, most traffic).
-- **p99 TTFB**: ~400–600 ms (first user at a PoP, freshly-purged URL, R2
-  read — `X-Surfr-Cache-Status: HIT-R2`, `CF-Cache-Status: MISS`).
+- **p99 TTFB**: ~400–600 ms (first user at a PoP for a URL, R2 read —
+  `X-Surfr-Cache-Status: HIT-R2`, `CF-Cache-Status: MISS`).
 - **p99.9 TTFB** (outside-horizon, never-warmed URL): ~1–2 s origin round
   trip.
 
-First-user-per-PoP pays the miss; subsequent users at that PoP HIT the edge
-until the next run swap purges it.
+First-user-per-PoP pays the miss for any given URL; subsequent users at
+that PoP HIT the edge for 30 d or until the next run renders the URL
+unused.
 
 ## Observability
 
@@ -353,8 +353,6 @@ Debug URLs:
   **zero R2 egress fees**. Client traffic never reads R2 directly — always
   via the Pages Function, which is CF-internal from R2's perspective.
 - CF cron: 288 ticks/day × 14 domain HTTP calls = ~4 k requests/day.
-- Cache purges: ~30 URLs/call on Free plan. Worst-case 14 domains ×
-  ceil(72/30) = 42 purge calls per ~5-min tick during a busy window.
 
 Model run cadences and approximate warm volumes (one swap per run):
 
@@ -372,11 +370,14 @@ All internal traffic, all free.
 
 Positive:
 - Repeat scrubs in the same region are edge-served, sub-100 ms TTFB.
-- Stale data is impossible: cron purges globally on every swap, `latest.json`
-  is R2-only and never cached.
-- Each run has an immutable URL → browsers can cache `.om` bytes forever
-  with no revalidation, `Range` requests always return 206.
-- Tabs left open across a run swap keep working (2 prior runs retained).
+- Stale data is impossible: every `.om` URL is immutable (runPath-keyed),
+  and `latest.json` is R2-only + never cached.
+- Browsers cache `.om` bytes forever with no revalidation; `Range`
+  requests always return 206.
+- Tabs left open across a run swap keep working (2 prior runs retained on
+  R2).
+- Cron worker has no Cloudflare API dependency — it only calls our own
+  Pages Function.
 - One code base, one deploy pipeline, one R2 bucket, two CF projects
   (Pages + Worker).
 
@@ -396,9 +397,7 @@ Negative:
 - `functions/lib/warmer.ts` — per-domain warm logic, atomic swap,
   retention pruning.
 - `functions/lib/domains.ts` — the 14 warmed domain names.
-- `worker-cron/src/index.ts` — cron scheduler + force endpoint.
-- `worker-cron/src/purge.ts` — CF API cache purge client, canonical URL
-  builder.
+- `worker-cron/src/index.ts` — cron scheduler + `/force?domain=X` endpoint.
 - `src/lib/url.ts` — client URL builder (runPath included).
 - `src/lib/metadata.ts` — `latest.json` fetch + metadata derivation.
 - `src/lib/pop-warm.ts` — per-session PoP warm.
@@ -407,5 +406,3 @@ Negative:
 - CF dashboard: Zone `thesurfr.app` → Caching → Cache Rules → `cache-om-tiles`.
 - CF dashboard: Pages project `maps` → Settings → Functions → R2 bindings
   → `TILE_CACHE = surfr-tile-cache`.
-- CF dashboard: Worker `surfr-tile-warmer-cron` → Settings → Variables →
-  `CF_ZONE_ID`, secret `CF_PURGE_TOKEN`.
