@@ -172,6 +172,24 @@ export const getIanaOffsetSeconds = (tz: string, at: Date = new Date()): number 
 };
 
 /**
+ * Best-effort IANA name for an arbitrary offset-in-seconds.
+ * Used when an external source (URL param / RN bridge) supplies a raw offset
+ * and we need displayTimezone to match so downstream subscribers computing
+ * offset-from-tz produce the same value. Whole-hour offsets map to Etc/GMT±H
+ * (note: Etc/GMT uses POSIX-inverted sign, so +7200 s → 'Etc/GMT-2').
+ * Non-hour offsets (India +05:30, etc.) degrade to 'UTC' since Etc zones
+ * don't support partial hours — the caller's own displayTzOffsetSeconds
+ * setter still carries the exact value for label rendering.
+ */
+export const ianaFromOffsetSeconds = (seconds: number): string => {
+	if (!Number.isFinite(seconds) || seconds === 0) return 'UTC';
+	const hours = seconds / 3600;
+	if (!Number.isInteger(hours)) return 'UTC';
+	const sign = hours >= 0 ? '-' : '+';
+	return `Etc/GMT${sign}${Math.abs(hours)}`;
+};
+
+/**
  * Creates a new date with specified local time
  * @param date - The base date to use
  * @param hour - The hour to set (0-23)

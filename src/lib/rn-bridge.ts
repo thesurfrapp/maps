@@ -10,11 +10,11 @@ import { changeOMfileURL } from '$lib/layers';
 import { setGlobeProjection } from '$lib/map-controls';
 import { setSurfrSpotsConfig } from '$lib/surfr-spots';
 
-import { displayTzOffsetSeconds } from '$lib/stores/preferences';
+import { displayTimezone, displayTzOffsetSeconds } from '$lib/stores/preferences';
 import { metaJson, time } from '$lib/stores/time';
 import { domain, variable } from '$lib/stores/variables';
 
-import { formatISOWithoutTimezone, parseISOWithoutTimezone } from './time-format';
+import { formatISOWithoutTimezone, ianaFromOffsetSeconds, parseISOWithoutTimezone } from './time-format';
 
 // Every OutMsg gets stamped with `t` = ms since page load. Lets the RN host
 // reconstruct an accurate timeline (gaps between events tell us where wall
@@ -284,6 +284,11 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 				// reactively via Svelte store subscription.
 				if (Number.isFinite(msg.offsetSeconds)) {
 					displayTzOffsetSeconds.set(msg.offsetSeconds);
+					// Pin displayTimezone to a matching IANA zone so any downstream
+					// subscriber that recomputes offset-from-tz (e.g. TimezoneSelector's
+					// time.subscribe → DST recompute) produces the same offset rather
+					// than pegging back to the viewer's browser timezone.
+					displayTimezone.set(ianaFromOffsetSeconds(msg.offsetSeconds));
 				}
 				break;
 			}

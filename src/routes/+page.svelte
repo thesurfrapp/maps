@@ -45,7 +45,7 @@
 
 	import { checkHighDefinition } from '$lib/helpers';
 	import { initSurfrSpots, setSurfrSpotsConfig } from '$lib/surfr-spots';
-	import { getIanaOffsetSeconds } from '$lib/time-format';
+	import { getIanaOffsetSeconds, ianaFromOffsetSeconds } from '$lib/time-format';
 	import { addOmFileLayers, changeOMfileURL } from '$lib/layers';
 	import { installRnBridge, isEmbedMode } from '$lib/rn-bridge';
 	import { addTerrainSource, getStyle, setMapControlSettings } from '$lib/map-controls';
@@ -109,7 +109,14 @@
 		const tzParam = $url.searchParams.get('tz_offset_seconds');
 		if (tzParam) {
 			const n = Number(tzParam);
-			if (Number.isFinite(n)) displayTzOffsetSeconds.set(n);
+			if (Number.isFinite(n)) {
+				displayTzOffsetSeconds.set(n);
+				// Pin displayTimezone too. Otherwise TimezoneSelector's time-change
+				// subscription recomputes the offset from the persisted IANA name
+				// (usually the viewer's browser tz) and clobbers our value the moment
+				// the user advances the time cursor.
+				displayTimezone.set(ianaFromOffsetSeconds(n));
+			}
 		} else {
 			// Compute from the persisted IANA name, DST-aware for "now".
 			displayTzOffsetSeconds.set(getIanaOffsetSeconds(get(displayTimezone)));
