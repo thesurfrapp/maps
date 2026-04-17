@@ -1,5 +1,19 @@
 import * as maplibregl from 'maplibre-gl';
 
+// Bridge diagnostic lines out to the RN host so they show up in Metro logs.
+// Safe no-op when not running inside the WebView.
+function dbg(prefix: string, data?: Record<string, unknown>): void {
+	try {
+		const rn = (window as unknown as { ReactNativeWebView?: { postMessage: (s: string) => void } })
+			.ReactNativeWebView;
+		rn?.postMessage(
+			JSON.stringify({ type: 'slotmgr', tag: prefix, t: Math.round(performance.now()), ...data })
+		);
+	} catch {
+		/* noop */
+	}
+}
+
 /**
  * SlotManager: double-buffered A/B slot system for MapLibre layers.
  *
@@ -75,6 +89,7 @@ export class SlotManager {
 	}
 
 	update(sourceUrl: string): void {
+		dbg('update', { prefix: this.opts.sourceIdPrefix, url: sourceUrl, activeSlot: this.activeSlot, pendingSlot: this.pendingSlot });
 		this.cleanupListener?.();
 		this.cleanupListener = null;
 
@@ -94,6 +109,7 @@ export class SlotManager {
 
 		const sourceId = this.sourceId(nextSlot);
 		if (!this.map.style.getSource(sourceId)) {
+			dbg('update-abort', { prefix: this.opts.sourceIdPrefix, reason: 'source-not-added', sourceId });
 			if (this.activeSlot) {
 				this.forceRemoveSlot(this.activeSlot);
 			}
@@ -102,6 +118,8 @@ export class SlotManager {
 			return;
 		}
 
+		const loadedAtAdd = this.map.style.getSource(sourceId)?.loaded() ?? null;
+		dbg('update-after-add', { prefix: this.opts.sourceIdPrefix, sourceId, loaded: loadedAtAdd });
 		this.waitForLoad(nextSlot, sourceId, this.activeSlot);
 	}
 
@@ -166,6 +184,7 @@ export class SlotManager {
 	}
 
 	private commit(nextSlot: Slot, previousSlot: Slot | null): void {
+		dbg('commit', { prefix: this.opts.sourceIdPrefix, nextSlot, previousSlot });
 		this.activeSlot = nextSlot;
 		this.pendingSlot = null;
 
@@ -187,7 +206,9 @@ export class SlotManager {
 	}
 
 	private waitForLoad(nextSlot: Slot, sourceId: string, previousSlot: Slot | null): void {
-		if (this.map.style.getSource(sourceId)?.loaded()) {
+		const initialLoaded = this.map.style.getSource(sourceId)?.loaded() ?? null;
+		dbg('waitForLoad-enter', { prefix: this.opts.sourceIdPrefix, sourceId, initialLoaded });
+		if (initialLoaded) {
 			this.commit(nextSlot, previousSlot);
 			return;
 		}
@@ -201,37 +222,20 @@ export class SlotManager {
 			if (warningTimeout !== undefined) clearTimeout(warningTimeout);
 			this.map.off('sourcedata', onSourceData);
 			this.map.off('error', onError);
-			this.map.off('idle', onIdle);
 			this.cleanupListener = null;
-		};
-
-		const tryCommit = (): boolean => {
-			if (this.pendingSlot !== nextSlot) {
-				cleanup();
-				return true;
-			}
-			if (this.map.style.getSource(sourceId)?.loaded()) {
-				cleanup();
-				this.commit(nextSlot, previousSlot);
-				return true;
-			}
-			return false;
 		};
 
 		const onSourceData = (e: maplibregl.MapSourceDataEvent): void => {
 			if (e.sourceId !== sourceId || !e.isSourceLoaded || e.dataType !== 'source') return;
-			tryCommit();
-		};
-
-		// Fallback — the `om://` protocol resolves the source synchronously fast
-		// enough that the `sourcedata` event with isSourceLoaded=true can fire
-		// BEFORE our subscription is attached. When that happens, `sourcedata`
-		// above never gets called and the spinner hangs forever (reproducible
-		// by cold-starting a deeplink). `map.on('idle')` fires whenever MapLibre
-		// finishes a render pass with no in-flight work — guaranteed to fire at
-		// least once after the source is fully loaded, so we re-check there.
-		const onIdle = (): void => {
-			tryCommit();
+			dbg('sourcedata', { prefix: this.opts.sourceIdPrefix, sourceId, loaded: this.map.style.getSource(sourceId)?.loaded() });
+			if (this.pendingSlot !== nextSlot) {
+				cleanup();
+				return;
+			}
+			if (this.map.style.getSource(sourceId)?.loaded()) {
+				cleanup();
+				this.commit(nextSlot, previousSlot);
+			}
 		};
 
 		const onError = (e: maplibregl.MapSourceDataEvent): void => {
@@ -241,7 +245,6 @@ export class SlotManager {
 		};
 
 		this.map.on('sourcedata', onSourceData);
-		this.map.on('idle', onIdle);
 		this.map.on('error', onError);
 		this.cleanupListener = cleanup;
 	}
