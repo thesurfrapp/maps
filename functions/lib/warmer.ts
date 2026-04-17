@@ -298,13 +298,21 @@ const persistLastTick = async (env: Env, result: DomainResult): Promise<void> =>
 	}
 };
 
-export const warmDomain = async (env: Env, domain: string): Promise<DomainResult> => {
-	const result = await warmDomainInner(env, domain);
+export const warmDomain = async (
+	env: Env,
+	domain: string,
+	opts: { force?: boolean } = {}
+): Promise<DomainResult> => {
+	const result = await warmDomainInner(env, domain, opts);
 	await persistLastTick(env, result);
 	return result;
 };
 
-const warmDomainInner = async (env: Env, domain: string): Promise<DomainResult> => {
+const warmDomainInner = async (
+	env: Env,
+	domain: string,
+	opts: { force?: boolean } = {}
+): Promise<DomainResult> => {
 	const t0 = Date.now();
 	const deadline = t0 + PER_DOMAIN_TIMEOUT_MS;
 	try {
@@ -314,7 +322,7 @@ const warmDomainInner = async (env: Env, domain: string): Promise<DomainResult> 
 		}
 
 		const ours = await readR2Latest(env, domain);
-		if (ours?.reference_time === upstream.reference_time) {
+		if (!opts.force && ours?.reference_time === upstream.reference_time) {
 			return { domain, status: 'unchanged', referenceTime: upstream.reference_time };
 		}
 

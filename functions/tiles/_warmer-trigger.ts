@@ -39,9 +39,15 @@ export const onRequestGet: PagesFunction<Env> = async (context) => {
 	// the result inline. Useful for manual testing / bootstrap; the cron
 	// never uses it.
 	const wait = url.searchParams.get('wait') === '1';
+	// ?force=1 skips the "our R2 already has this reference_time" short-
+	// circuit and re-runs the warmer end-to-end. Used for recovery when a
+	// prior warm looks bad. Only applicable with ?domain=<x>.
+	const force = url.searchParams.get('force') === '1';
 
 	const run = async (): Promise<DomainResult[]> =>
-		domainFilter ? [await warmDomain(context.env, domainFilter)] : await warmAll(context.env);
+		domainFilter
+			? [await warmDomain(context.env, domainFilter, { force })]
+			: await warmAll(context.env);
 
 	if (wait) {
 		const results = await run();

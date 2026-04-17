@@ -2,24 +2,12 @@ name = "surfr-tile-warmer-cron"
 main = "src/index.ts"
 compatibility_date = "2025-01-01"
 
-# Every 5 minutes. Checks upstream latest.json per domain; most ticks are
-# no-ops since model runs publish every 1–12 h.
+# Every 5 minutes. Checks upstream latest.json per domain via the Pages
+# Function warmer; most ticks are no-ops since model runs publish every
+# 1–12 h.
 [triggers]
 crons = ["*/5 * * * *"]
 
 [observability.logs]
 enabled = true
 invocation_logs = true
-
-# Plaintext vars. CF_PURGE_TOKEN is a secret — set with:
-#   wrangler secret put CF_PURGE_TOKEN
-# It must be a CF API token scoped to Zone: Cache Purge on the thesurfr.app zone.
-[vars]
-CF_ZONE_ID = "f5f6361a616de5b43d6bc305d452d42c"
-
-# Direct service binding to the companion Worker. Preferred over
-# workers.dev HTTPS subrequests — same-account Worker-to-Worker over
-# that path was failing silently; the service binding routes internally.
-[[services]]
-binding = "REWARMER"
-service = "surfr-tile-rewarmer"

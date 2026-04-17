@@ -157,8 +157,7 @@ End state after one user hits an outside-horizon URL at PoP X:
   edge MISS at Y, but now HITs R2 (~400 ms) instead of origin (~1 s).
 
 Outside-horizon URLs reach the same steady state as in-horizon URLs after
-one user touches them at each PoP; they just don't get the cron's global
-purge-on-swap treatment.
+one user touches them at each PoP.
 
 ### Update flow on a new Open-Meteo run
 
@@ -188,21 +187,29 @@ Inside the Pages Function (`functions/lib/warmer.ts:warmDomain`):
       group by runPath, keep newest 3 (current + 2 prior), delete the rest.
    g. Return `{ status: 'warmed', referenceTime, validTimes, files, prunedOldFiles, keptRunPaths }`.
 
-The cron worker sees `status: 'warmed'` in the JSON response, pulls out
-`validTimes` and `referenceTime`, builds canonical URLs
-(`https://maps.thesurfr.app/tiles/data_spatial/<domain>/<runPath>/<validTime>.om`),
-and calls the CF API to purge them (batched 30 URLs per request, the
-Free-plan limit). Purge is **global**: CF evicts those URLs from every PoP
-simultaneously. The cron currently does **not** re-warm after purge
-(Cache Reserve investigation is open — see *PoPs and edge warming* below).
+The cron worker does no further work after a `warmed` result. Because
+every URL a client builds includes the runPath (the immutable per-run
+segment `YYYY/MM/DD/HHmmZ`), a new run produces entirely new URL strings
+and the previous run's edge-cached URLs are simply never requested again
+— they age out at the 30 d Cache Rule TTL. Nothing needs to be explicitly
+evicted.
 
 Code:
-- `worker-cron/src/index.ts` — driver, inspects per-domain response, calls
-  `purgeDomain`.
-- `worker-cron/src/purge.ts` — CF API client, canonical URL builder.
-- Env required on the cron worker: secret `CF_PURGE_TOKEN`
-  (Zone: Cache Purge scoped to `thesurfr.app`), plaintext var
-  `CF_ZONE_ID`.
+- `worker-cron/src/index.ts` — cron driver (every 5 min) + `/force?domain=X`
+  endpoint for manual recovery. No Cloudflare API dependencies.
+
+### Manual recovery
+
+`GET https://surfr-tile-warmer-cron.herbert-0fd.workers.dev/force?domain=<d>`
+re-runs the warmer for one domain with the "already up-to-date" short-
+circuit disabled (`functions/tiles/_warmer-trigger.ts?force=1` →
+`warmDomain(env, domain, { force: true })`). The warmer re-fetches upstream
+meta.json, re-verifies each `.om` is in R2 (`head` check skips files
+already present, so this is cheap), re-PUTs `latest.json`, and re-prunes.
+Use when a prior warm looks bad and you want to re-verify everything.
+
+The admin dashboard has a per-domain "Force warm" button that hits the
+same endpoint.
 
 ### The Cache Rule
 

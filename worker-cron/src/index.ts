@@ -1,30 +1,21 @@
-// Tiny cron-only Worker. Every 5 min it walks the domain list, firing one
-// blocking HTTP call per domain to the Pages Function warmer. We shard per-
-// domain for two reasons:
-//   1. Each Pages Function invocation gets its own CPU/subrequest budget —
-//      avoids the "metno succeeded but everything else got 'no-upstream'"
-//      tail we saw when warmAll ran in a single invocation.
-//   2. Sequential domains means upstream Open-Meteo never sees more than
-//      `OM_FILE_CONCURRENCY` (currently 4) concurrent requests from us
-//      globally. No bursts, no cross-domain parallelism.
+// Cron-only Worker. Every 5 min it walks the domain list, firing one blocking
+// HTTP call per domain to the Pages Function warmer. Sharding per-domain
+// gives each Pages Function invocation its own CPU/subrequest budget, and
+// sequential domains cap global upstream load at `OM_FILE_CONCURRENCY` (4)
+// concurrent requests.
 //
-// We wait for each domain (`?wait=1`) before moving on. Most ticks are no-ops
+// Each per-domain call waits on `?wait=1`. Most ticks are no-ops
 // (status = "unchanged") and return in < 1 s. A tick that catches a new run
-// for one domain can take 1–3 min; a catastrophic first-tick that needs to
-// warm everything is bounded by the 15-min scheduled-event walltime cap.
+// for one domain takes 1–3 min; the catastrophic first-tick that warms
+// everything is bounded by the 15-min scheduled-event walltime cap.
 // Domains we don't reach on a slow tick get picked up on the next one — the
 // warmer's per-file `head` check makes restarts idempotent.
 //
-// When a per-domain call reports `status: "warmed"` — meaning a fresh run
-// just swapped — we also purge CF edge cache for that domain's stripped URLs
-// and re-warm them by fetching with `cf: { cacheEverything: true }`. This
-// keeps client-facing URLs stable but flushes old-run bytes from CF edge
-// as soon as R2 holds the new run. See `./purge.ts` for the rationale.
-
-import { type PurgeResult, type RewarmResult, purgeDomain, rewarmDomain } from './purge';
+// URLs include the runPath (see ADR 0001), so new runs produce new URLs and
+// old-run edge entries simply age out at the 30 d Cache Rule TTL. No CF
+// cache purge is needed — this worker does not talk to the Cloudflare API.
 
 const WARMER_BASE = 'https://maps.thesurfr.app/tiles/_warmer-trigger';
-const CLIENT_ORIGIN = 'https://maps.thesurfr.app';
 
 // Keep in sync with `functions/lib/domains.ts`. Drift is self-healing: any
 // domain missing here simply won't get its dedicated per-tick slot (but the
@@ -50,42 +41,15 @@ const DOMAINS = [
 // even when several domains have new runs queued up in one tick.
 const BETWEEN_DOMAIN_MS = 1500;
 
-// Rewarm disabled pending CF support response about Cache Reserve.
-// Empirically CR stores content but never serves cross-PoP on our Pro/
-// Smart-Shield-Free tier — the rewarm traffic populates the feature but
-// clients never benefit, so it's wasted ~12 GB + 2 min per dwd_icon swap.
-// Add domains back to this Set once CF confirms CR works for our setup.
-//
-// Everything else (rewarmer Worker, service binding, /force endpoint,
-// admin per-domain buttons) stays in place so we can re-enable instantly
-// with a one-line edit + redeploy.
-const REWARM_DOMAINS: ReadonlySet<string> = new Set<string>();
-
 type DomainOutcome = {
 	domain: string;
 	status: number;
 	ms: number;
 	warmerStatus?: string;
-	purge?: PurgeResult;
-	rewarm?: RewarmResult;
 	bodyHead: string;
 };
 
-type Env = {
-	CF_PURGE_TOKEN?: string;
-	CF_ZONE_ID?: string;
-	// Service binding → companion `surfr-tile-rewarmer` Worker.
-	REWARMER: { fetch(request: Request): Promise<Response> };
-};
-
-type WarmedResult = {
-	domain: string;
-	status: 'warmed';
-	referenceTime: string;
-	validTimes: string[];
-};
-
-type AnyWarmerResult = { domain: string; status: string; referenceTime?: string; validTimes?: string[] };
+type AnyWarmerResult = { domain: string; status: string };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -98,47 +62,22 @@ const parseWarmerBody = (body: string): AnyWarmerResult[] => {
 	}
 };
 
-const isWarmed = (r: AnyWarmerResult): r is WarmedResult =>
-	r.status === 'warmed' && Array.isArray(r.validTimes) && typeof r.referenceTime === 'string';
-
-const runTick = async (env: Env): Promise<string> => {
+const runTick = async (): Promise<string> => {
 	const tStart = Date.now();
 	const outcomes: DomainOutcome[] = [];
 	for (const domain of DOMAINS) {
 		const t0 = Date.now();
 		try {
-			const res = await fetch(`${WARMER_BASE}?domain=${domain}&wait=1`, {
-				method: 'GET'
-			});
+			const res = await fetch(`${WARMER_BASE}?domain=${domain}&wait=1`, { method: 'GET' });
 			const body = await res.text();
-			const warmerResults = parseWarmerBody(body);
-			const result = warmerResults.find((r) => r.domain === domain);
-			const outcome: DomainOutcome = {
+			const result = parseWarmerBody(body).find((r) => r.domain === domain);
+			outcomes.push({
 				domain,
 				status: res.status,
 				ms: Date.now() - t0,
 				warmerStatus: result?.status,
 				bodyHead: body.slice(0, 400)
-			};
-			if (result && isWarmed(result)) {
-				outcome.purge = await purgeDomain(
-					env,
-					CLIENT_ORIGIN,
-					domain,
-					result.referenceTime,
-					result.validTimes
-				);
-				if (REWARM_DOMAINS.has(domain)) {
-					outcome.rewarm = await rewarmDomain(
-						CLIENT_ORIGIN,
-						domain,
-						result.referenceTime,
-						result.validTimes,
-						env.REWARMER
-					);
-				}
-			}
-			outcomes.push(outcome);
+			});
 		} catch (err) {
 			outcomes.push({ domain, status: -1, ms: Date.now() - t0, bodyHead: String(err) });
 		}
@@ -156,14 +95,28 @@ const runTick = async (env: Env): Promise<string> => {
 	);
 };
 
+const runOneDomain = async (domain: string): Promise<string> => {
+	const t0 = Date.now();
+	const res = await fetch(`${WARMER_BASE}?domain=${domain}&wait=1&force=1`, { method: 'GET' });
+	const body = await res.text();
+	const result = parseWarmerBody(body).find((r) => r.domain === domain);
+	return JSON.stringify(
+		{
+			domain,
+			status: res.status,
+			ms: Date.now() - t0,
+			warmerStatus: result?.status,
+			bodyHead: body.slice(0, 400)
+		},
+		null,
+		2
+	);
+};
+
 export default {
-	async scheduled(
-		_event: ScheduledEvent,
-		env: Env,
-		ctx: ExecutionContext
-	): Promise<void> {
+	async scheduled(_event: ScheduledEvent, _env: unknown, ctx: ExecutionContext): Promise<void> {
 		ctx.waitUntil(
-			runTick(env)
+			runTick()
 				.then((out) => console.log('[cron] tick complete', out))
 				.catch((err) => console.error('[cron] tick failed', err))
 		);
@@ -171,15 +124,11 @@ export default {
 
 	// HTTP entry-points:
 	//   GET /              → full per-domain cron pass (same as scheduled tick)
-	//   GET /force?domain=X → purge + (for rewarm-list domains) re-warm CF
-	//                         edge cache for ONE domain, regardless of
-	//                         whether the run just swapped. Used for
+	//   GET /force?domain=X → re-run the warmer for ONE domain, even if its
+	//                         reference_time already matches our R2. Used for
 	//                         bootstrap and manual recovery.
-	//   GET /force?domain=X&rewarm=1 → force re-warm even if domain isn't
-	//                         in the default rewarm list.
-	async fetch(request: Request, env: Env): Promise<Response> {
+	async fetch(request: Request): Promise<Response> {
 		const url = new URL(request.url);
-
 		if (url.pathname === '/force') {
 			const domain = url.searchParams.get('domain');
 			if (!domain || !DOMAINS.includes(domain as (typeof DOMAINS)[number])) {
@@ -188,60 +137,12 @@ export default {
 					{ status: 400, headers: { 'Content-Type': 'application/json' } }
 				);
 			}
-			const meta = await fetchMetaJson(domain);
-			if (!meta) {
-				return new Response(
-					JSON.stringify({ error: 'latest.json unreachable', domain }, null, 2),
-					{ status: 502, headers: { 'Content-Type': 'application/json' } }
-				);
-			}
-			const purge = await purgeDomain(
-				env,
-				CLIENT_ORIGIN,
-				domain,
-				meta.reference_time,
-				meta.valid_times
-			);
-			const shouldRewarm = REWARM_DOMAINS.has(domain) || url.searchParams.get('rewarm') === '1';
-			const rewarm = shouldRewarm
-				? await rewarmDomain(
-						CLIENT_ORIGIN,
-						domain,
-						meta.reference_time,
-						meta.valid_times,
-						env.REWARMER
-					)
-				: null;
-			return new Response(
-				JSON.stringify(
-					{ domain, referenceTime: meta.reference_time, purge, rewarm },
-					null,
-					2
-				),
-				{ headers: { 'Content-Type': 'application/json; charset=utf-8' } }
-			);
+			const out = await runOneDomain(domain);
+			return new Response(out, {
+				headers: { 'Content-Type': 'application/json; charset=utf-8' }
+			});
 		}
-		const out = await runTick(env);
-		return new Response(out, {
-			headers: { 'Content-Type': 'application/json; charset=utf-8' }
-		});
-	}
-};
-
-// Fetches latest.json for a domain (served by the Pages Function from R2) and
-// returns the essentials needed for purge + re-warm. We consolidated on
-// latest.json — upstream's payload is identical to meta.json, so a single
-// pointer file is enough.
-const fetchMetaJson = async (
-	domain: string
-): Promise<{ reference_time: string; valid_times: string[] } | null> => {
-	try {
-		const res = await fetch(`${CLIENT_ORIGIN}/tiles/data_spatial/${domain}/latest.json`);
-		if (!res.ok) return null;
-		const parsed = (await res.json()) as { reference_time?: string; valid_times?: string[] };
-		if (!parsed.reference_time || !Array.isArray(parsed.valid_times)) return null;
-		return { reference_time: parsed.reference_time, valid_times: parsed.valid_times };
-	} catch {
-		return null;
+		const out = await runTick();
+		return new Response(out, { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
 	}
 };

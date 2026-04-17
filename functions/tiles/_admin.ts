@@ -205,11 +205,11 @@ const renderHtml = (
 			const tickCell = tick
 				? `<div style="font-size:11px">${escapeHtml(relativeAge(tick.at))}<br><span style="color:#6b7280">${escapeHtml(tick.status ?? '')}${tick.wallMs ? ` &middot; ${tick.wallMs}ms` : ''}</span></div>`
 				: '<span style="color:#9ca3af">never</span>';
-			// Per-domain purge+rewarm link. Opens in a new tab; response is
-			// raw JSON from the cron worker. `rewarm=1` forces re-warming
-			// even for domains not in the default REWARM_DOMAINS list.
-			const forceUrl = `https://surfr-tile-warmer-cron.herbert-0fd.workers.dev/force?domain=${encodeURIComponent(r.domain)}&rewarm=1`;
-			const forceCell = `<a href="${forceUrl}" target="_blank" rel="noreferrer" class="force-btn">Purge+rewarm</a>`;
+			// Per-domain force-warm link. Re-runs the warmer for this domain
+			// ignoring the "unchanged" short-circuit. URL responses are raw
+			// JSON from the cron worker.
+			const forceUrl = `https://surfr-tile-warmer-cron.herbert-0fd.workers.dev/force?domain=${encodeURIComponent(r.domain)}`;
+			const forceCell = `<a href="${forceUrl}" target="_blank" rel="noreferrer" class="force-btn">Force warm</a>`;
 			const historicalCell = r.historicalRuns.length
 				? r.historicalRuns
 						.map(
