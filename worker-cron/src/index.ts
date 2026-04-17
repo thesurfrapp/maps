@@ -191,7 +191,7 @@ export default {
 			const meta = await fetchMetaJson(domain);
 			if (!meta) {
 				return new Response(
-					JSON.stringify({ error: 'meta.json unreachable', domain }, null, 2),
+					JSON.stringify({ error: 'latest.json unreachable', domain }, null, 2),
 					{ status: 502, headers: { 'Content-Type': 'application/json' } }
 				);
 			}
@@ -228,13 +228,15 @@ export default {
 	}
 };
 
-// Fetches meta.json for a domain (served by the Pages Function from R2) and
-// returns the essentials needed for purge + re-warm.
+// Fetches latest.json for a domain (served by the Pages Function from R2) and
+// returns the essentials needed for purge + re-warm. We consolidated on
+// latest.json — upstream's payload is identical to meta.json, so a single
+// pointer file is enough.
 const fetchMetaJson = async (
 	domain: string
 ): Promise<{ reference_time: string; valid_times: string[] } | null> => {
 	try {
-		const res = await fetch(`${CLIENT_ORIGIN}/tiles/data_spatial/${domain}/meta.json`);
+		const res = await fetch(`${CLIENT_ORIGIN}/tiles/data_spatial/${domain}/latest.json`);
 		if (!res.ok) return null;
 		const parsed = (await res.json()) as { reference_time?: string; valid_times?: string[] };
 		if (!parsed.reference_time || !Array.isArray(parsed.valid_times)) return null;

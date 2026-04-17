@@ -38,16 +38,26 @@ type PurgeEnv = {
 	CF_ZONE_ID?: string;
 };
 
-// Build a stripped client-facing URL for a given (domain, validTime).
-// Must exactly match what the client constructs in `src/lib/url.ts`.
+// Build the canonical client-facing URL for a given (domain, runPath, validTime).
+// Must exactly match what the client constructs in `src/lib/url.ts:getOMUrl`.
 const fmtValidTime = (iso: string): string => {
 	const d = new Date(iso);
 	const pad = (n: number) => String(n).padStart(2, '0');
 	return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}`;
 };
 
-const strippedUrl = (origin: string, domain: string, iso: string): string =>
-	`${origin}/tiles/data_spatial/${domain}/${fmtValidTime(iso)}.om`;
+const fmtRunPath = (isoRefTime: string): string => {
+	const d = new Date(isoRefTime);
+	const pad = (n: number) => String(n).padStart(2, '0');
+	return `${d.getUTCFullYear()}/${pad(d.getUTCMonth() + 1)}/${pad(d.getUTCDate())}/${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}Z`;
+};
+
+const canonicalUrl = (
+	origin: string,
+	domain: string,
+	runPath: string,
+	iso: string
+): string => `${origin}/tiles/data_spatial/${domain}/${runPath}/${fmtValidTime(iso)}.om`;
 
 const capValidTimes = (validTimes: string[], referenceTime: string): string[] => {
 	const refMs = new Date(referenceTime).getTime();
@@ -173,8 +183,9 @@ const buildDomainUrls = (
 	referenceTime: string,
 	validTimes: string[]
 ): string[] => {
+	const runPath = fmtRunPath(referenceTime);
 	const capped = capValidTimes(validTimes, referenceTime);
-	return capped.map((iso) => strippedUrl(origin, domain, iso));
+	return capped.map((iso) => canonicalUrl(origin, domain, runPath, iso));
 };
 
 // Purge old-run bytes for a domain. Safe to call on every run swap — CF
