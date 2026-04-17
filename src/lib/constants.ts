@@ -1,6 +1,21 @@
-// Domain and variable defaults
-export const DEFAULT_DOMAIN = 'dwd_icon';
-export const DEFAULT_VARIABLE = 'temperature_2m';
+// Domain and variable defaults. Public standalone UI only supports three
+// overlays (wind / gusts / rain) via `OverlayPills`, so defaults must resolve
+// to a variable one of those pills renders. GFS 0.13° is the default model —
+// widest coverage, fastest-warming domain in our rotation.
+export const DEFAULT_DOMAIN = 'ncep_gfs013';
+export const DEFAULT_VARIABLE = 'wind_u_component_10m';
+
+// Variables that the simplified UI's pills can display. Anything else is
+// coerced back to DEFAULT_VARIABLE on load (see `urlParamsToPreferences`).
+// Keep in sync with `OVERLAY_VARIABLE_ALIASES` in
+// `src/lib/components/overlay-pills/overlay-pills.svelte`.
+export const SUPPORTED_OVERLAY_VARIABLES = [
+	'wind_speed_10m',
+	'wind_u_component_10m',
+	'wind_gusts_10m',
+	'rain',
+	'precipitation'
+] as const;
 
 // Vector options defaults
 export const DEFAULT_VECTOR_OPTIONS = {

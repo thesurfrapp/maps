@@ -29,7 +29,9 @@ import {
 	parseClipCountriesParam,
 	serializeClipCountriesParam
 } from './clipping';
+import { DEFAULT_VARIABLE, SUPPORTED_OVERLAY_VARIABLES } from './constants';
 import { fmtModelRun, fmtSelectedTime, getBaseUri, hashValue } from './helpers';
+import { isEmbedMode } from './rn-bridge';
 import { clippingCountryCodes } from './stores/clipping';
 import { omProtocolSettings } from './stores/om-protocol-settings';
 import { formatISOUTCWithZ, parseISOWithoutTimezone } from './time-format';
@@ -106,8 +108,20 @@ export const urlParamsToPreferences = () => {
 	const variable = params.get('variable');
 	if (variable) {
 		v.set(variable);
-	} else if (get(v) !== 'temperature_2m') {
+	} else if (get(v) !== DEFAULT_VARIABLE) {
 		url.searchParams.set('variable', get(v));
+	}
+
+	// The public standalone UI only exposes wind / gusts / rain pills, so
+	// coerce any unsupported variable (from URL or persisted localStorage)
+	// back to the default. Embed mode is skipped — RN picks whatever
+	// variable its host spot needs.
+	if (!isEmbedMode()) {
+		const current = get(v);
+		if (!(SUPPORTED_OVERLAY_VARIABLES as readonly string[]).includes(current)) {
+			v.set(DEFAULT_VARIABLE);
+			url.searchParams.delete('variable');
+		}
 	}
 
 	const arrowsRaw = params.get('arrows');
