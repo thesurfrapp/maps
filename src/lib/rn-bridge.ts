@@ -34,6 +34,7 @@ type OutMsg =
 	| { type: 'setTimeReceived'; time: string; t: number }
 	| { type: 'setVariableReceived'; variable: string; t: number }
 	| { type: 'setDomainReceived'; domain: string; t: number }
+	| { type: 'clearStateReceived'; t: number }
 	| { type: 'mapDataLoading'; t: number }
 	| { type: 'mapIdle'; t: number };
 
@@ -56,7 +57,12 @@ type InMsg =
 			lat?: number;
 			lng?: number;
 			projection?: 'globe' | 'mercator';
-	  };
+	  }
+	// Escape hatch for the RN host: wipe persisted state + Cache Storage and
+	// reload the WebView. Used when the map gets stuck (e.g. a stale persisted
+	// domain causing repeated metadata fetch failures) and no in-WebView
+	// interaction un-sticks it.
+	| { type: 'clearState' };
 
 declare global {
 	interface Window {
@@ -300,6 +306,26 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 					zoom: msg.zoom,
 					essential: true
 				});
+				break;
+			}
+			case 'clearState': {
+				// Ack first so the RN side can dismiss its spinner even if the
+				// reload wins the race.
+				postToRN({ type: 'clearStateReceived' });
+				void (async () => {
+					try {
+						const keys = await caches.keys();
+						await Promise.all(keys.map((k) => caches.delete(k)));
+					} catch (err) {
+						console.warn('[rn-bridge] clearState: caches.delete failed', err);
+					}
+					try {
+						localStorage.clear();
+					} catch (err) {
+						console.warn('[rn-bridge] clearState: localStorage.clear failed', err);
+					}
+					window.location.reload();
+				})();
 				break;
 			}
 		}
