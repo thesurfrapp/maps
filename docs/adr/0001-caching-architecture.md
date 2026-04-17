@@ -1,7 +1,6 @@
 # ADR 0001 — Tile caching architecture on Cloudflare
 
-- Status: **Accepted — with active Cache Reserve investigation (see Update 2026-04-16)**
-- Date: 2026-04-16
+- Status: Accepted
 - Scope: `functions/tiles/*`, `functions/lib/*`, `worker-cron/*`, `src/lib/url.ts`,
   `src/lib/stores/om-protocol-settings.ts`, CF Pages project `maps`, CF Worker
   `surfr-tile-warmer-cron`, R2 bucket `surfr-tile-cache`, CF zone `thesurfr.app`.
@@ -20,93 +19,112 @@ Goals:
 2. No stale data after an upstream run publishes.
 3. Free-tier-friendly cost.
 4. No client code split per environment / region.
-5. Transparent observability: admin dashboard + response headers that say where
-   a byte came from.
+5. Transparent observability: admin dashboard + response headers that say
+   where a byte came from.
 
 ## Decision
 
-We run a **four-tier cache stack** on Cloudflare, driven by a scheduled cron
-that writes to an R2 bucket and invalidates the CF edge cache on every
-upstream run swap. Every `.om` request funnels through a Pages Function at
+A **four-tier cache stack** on Cloudflare, driven by a 5-min cron that writes
+to an R2 bucket and invalidates the CF edge cache on every upstream run swap.
+Every `.om` and `latest.json` request funnels through a Pages Function at
 `maps.thesurfr.app/tiles/*`.
 
 ```
 Client (browser)
   │
-  │ 1. Browser cache             (Cache-Control: public, max-age=30d)
+  │ 1. Browser cache   (.om: public, max-age=30d, immutable;
+  │                     latest.json: no-store)
   │     HIT ─► served from disk
   │     MISS
   ▼
-CF edge cache at user's PoP      (Cache Rule: .om URLs, Edge TTL 30d)
+CF edge cache at user's PoP    (Cache Rule: .om URLs, Edge TTL 30d)
   │     HIT (CF-Cache-Status: HIT)  ─► ~20-120 ms, no origin touched
   │     MISS
   ▼
-Pages Function (our code)
+Pages Function
         │
-        ├── For latest.json / meta.json ─►  R2 only, or 503. No origin fallback.
+        ├── latest.json   ─► R2 only; 503 if missing.
+        ├── meta.json     ─► 404 blocked (consolidated onto latest.json).
+        ├── in-progress   ─► 404 blocked (upstream WIP run, not on our R2).
         │
-        └── For .om:
-              1) Read R2 latest.json (in-isolate cache 30 s).
-              2) Build canonical path = /data_spatial/<domain>/YYYY/MM/DD/HHmmZ/<validTime>.om
-              3) R2.get(canonicalKey[, range])  ─► HIT-R2, return 206/200
-              4) R2 MISS ─► fetch(originCanonical, cf.cacheEverything=true)
+        └── *.om:
+              1) R2.get(rawPath, { range })      ─► HIT-R2 → 206/200
+              2) R2 MISS ─► fetch(upstream, cf.cacheEverything=true)
                             + waitUntil(warmR2())   — lazy R2 fill
                             │
                             ▼
-                          Open-Meteo origin  (https://map-tiles.open-meteo.com/...)
+                          Open-Meteo origin
 ```
 
-### Four tiers, three caches
+### Four tiers
 
 | Tier | Where | TTL | Populated by |
 |---|---|---|---|
-| T1 | Browser | 30 d (from `Cache-Control: public, max-age=2592000`) | Any HIT response |
-| T2 | CF edge (per-PoP, + Smart Tiered Cache upper tier) | 30 d (from the Cache Rule, which **ignores** `Cache-Control`) | First user at each PoP; invalidated globally by cron on run swap |
-| T3 | R2 bucket `surfr-tile-cache` (global, ENAM region) | Indefinite (no TTL on R2) | Cron warmer (proactive, 72 h horizon) + Pages Function `waitUntil(warmR2)` lazy fill (files outside the horizon) |
+| T1 | Browser | `.om`: 30 d + `immutable` (URL uniquely identifies a run, bytes never change). `latest.json`: `no-store`, never cached. | Any `.om` HIT response |
+| T2 | CF edge (per-PoP, + Smart Tiered Cache upper tier) | 30 d from the Cache Rule, which ignores `Cache-Control` on `.om`. | First user at each PoP; invalidated globally by cron on run swap |
+| T3 | R2 bucket `surfr-tile-cache` (ENAM region) | Current run + 2 prior runs retained; older pruned on each warm swap. | Cron warmer (proactive, 72 h horizon) + Pages Function `waitUntil(warmR2)` lazy fill (files outside the horizon) |
 | T4 | Open-Meteo origin | n/a | — |
 
-### Client URL shape — runPath stripping
-
-Clients request **stripped URLs**:
+### Client URL shape
 
 ```
-GET /tiles/data_spatial/<domain>/<validTime>.om
+GET /tiles/data_spatial/<domain>/YYYY/MM/DD/HHmmZ/<validTime>.om
 ```
 
-— **no** `YYYY/MM/DD/HHmmZ` run path. The Pages Function fills it in from R2
-`latest.json` on every request. Rationale:
+The runPath segment (`YYYY/MM/DD/HHmmZ`) is included. Each run has a unique,
+immutable URL — ETag is stable, `Range` requests always return 206, browsers
+can cache the bytes with `immutable` and never revalidate.
 
-- **Stripped URL is stable across runs.** The CF edge cache key includes the
-  path, so a stable URL means 30-day cache entries keep working — we just
-  purge them on swap (see below).
-- **Server is the single source of truth** for "which run is current." Client
-  never has to reconcile a stale reference_time it's holding in memory.
-- **Race resistance.** Without stripping, clients that had cached the old
-  reference_time in their `meta.json` would request old-run paths after a
-  swap, miss our cache, and pay an origin round-trip. With stripping the
-  request always lands on whatever R2 says is current.
+Clients derive the runPath from our R2 `latest.json` on page load
+(`src/lib/url.ts:getOMUrl` / `getNextOmUrls` → `fmtModelRun`). The Pages
+Function serves `.om` requests directly from R2 at the exact key — no
+server-side rewriting.
 
-Client code: `src/lib/url.ts:getOMUrl()` and `getNextOmUrls()`.
+### Users cannot pick a run
 
-### JSON indexes — R2 only, 503 on miss
+The Surfr product only cares about "the latest run that is fully warmed on
+our R2". There is no UI or URL parameter to select a different run:
 
-`latest.json` and `meta.json` are served **exclusively from R2**. If R2 has
-no object, the Pages Function returns **503 Service Unavailable** with
-`Retry-After: 60`. **No origin fallback.**
+- No `?model_run=` URL param handling.
+- No model-run dropdown, lock button, or prev/next-run keyboard shortcuts
+  in `src/lib/components/time/time-selector.svelte`.
+- `modelRun` on the client is always `latest.reference_time` from our R2.
 
-Reason: falling through to origin would expose a run that upstream has
-published but our cron **hasn't finished downloading into R2 yet**. Clients
-would then see a `reference_time` whose `.om` files don't exist in R2, pay a
-cold origin pull for every range, and generally undo the whole point of
-`latest.json` being our own canonical pointer. Strict "only serve a run
-once every file for it is in R2" avoids that entire class of bug.
+### Pointer file — `latest.json`
 
-(Note: "cache warming" elsewhere in this doc sometimes refers to CF edge
-cache populating at a PoP — a separate concern. This paragraph is specifically
-about the R2 side: `latest.json` flips to a new `reference_time` only after
-the cron has put all that run's `.om` files into R2.)
+`latest.json` is served **exclusively from R2**, with `Cache-Control:
+no-store`. If R2 has no object, the Pages Function returns `503
+Service Unavailable` + `Retry-After: 60`. No origin fallback.
+
+Serving from R2 only guarantees that clients only ever see a `reference_time`
+whose 72 h of `.om` files are already in R2 (the warmer writes `latest.json`
+after all `.om` files for the run have been PUT). `no-store` prevents the
+browser or CF edge from caching a pointer that moves between runs — a stale
+pointer would let the client build a runPath URL for a run we've pruned.
+
+`latest.json` carries `reference_time`, `valid_times`, and `variables` —
+everything the client needs. Upstream's separate `meta.json` is byte-identical
+to `latest.json`, so we consolidated on `latest.json` only. `/meta.json` and
+`/in-progress.json` both return `404 blocked` from the Pages Function
+(`isBlockedJson` in `functions/tiles/[[path]].ts`).
 
 Code: `functions/tiles/[[path]].ts:R2_JSON_KEY` + `serveJsonFromR2`.
+
+### End-to-end invariant
+
+> If a client sees a `reference_time` in `latest.json`, every `.om` URL
+> derived from it (domain × runPath × validTime within the 72 h horizon)
+> is already in R2.
+
+Because:
+1. The warmer PUTs `latest.json` only **after** every `.om` for the run is
+   in R2 (`functions/lib/warmer.ts`, after all timeout / fail / tail-404
+   guards).
+2. `latest.json` is R2-only and never browser- or edge-cached.
+3. `meta.json` and `in-progress.json` are 404'd — no side channel for a
+   client to learn about a run our R2 doesn't have.
+4. Old runs stay on R2 for 2 swaps beyond the one that retired them, so
+   in-flight tabs holding an older runPath still resolve.
 
 ### The 72 h window and what happens outside it
 
@@ -120,54 +138,33 @@ the full 10-day GFS horizon would balloon R2 writes with low payoff.
 - After purge-on-swap, first user at a cold PoP pays one R2-read;
   subsequently CF edge HIT (~20–120 ms).
 
-**Outside the 72 h window** (hours 73+, or older run paths if a client ever
-sends one):
+**Outside the 72 h window:**
 1. Client request → CF edge MISS → Pages Function.
-2. Pages Function reads R2 `latest.json`, builds canonical path, R2.get → MISS.
-3. Falls through to `fetch(originCanonical, cf.cacheEverything=true)`. The
-   origin response streams back to the client — their specific range is
-   served, nothing blocks. If the client asked for a range, origin returns
-   a 206 for just that range; if they asked for the full file, a 200.
-4. **In parallel, via `waitUntil`**, `warmR2` fires an *independent*
-   `fetch(originCanonical)` **with no Range header** and streams that full
-   response body into R2 via `TILE_CACHE.put`. Client doesn't wait for this
-   — it's background. Once it finishes (a few seconds to tens of seconds
-   depending on file size) R2 has the full file.
-   (Only fires if R2 head-check confirms nothing is already there, to avoid
-   duplicate puts on concurrent misses.)
+2. `R2.get` → null.
+3. Falls through to `fetch(upstream, cf.cacheEverything=true)`. Origin
+   response streams back to the client — their specific range is served,
+   nothing blocks.
+4. **In parallel, via `waitUntil`**, `warmR2` fires an independent
+   `fetch(upstream)` with no Range header and streams the full body into
+   R2 via `TILE_CACHE.put`. Client doesn't wait. (Guarded by a `head`
+   check to avoid duplicate puts on concurrent misses.)
 
 End state after one user hits an outside-horizon URL at PoP X:
-- **CF edge at PoP X has the full file cached** (thanks to `cacheEverything`
-  + our Cache Rule). Subsequent range requests to this URL *at PoP X* are
-  edge HITs, never reach R2 or origin — same as a cron-warmed in-horizon
-  URL.
-- **R2 has the full file** (thanks to `warmR2`). A user at a *different* PoP
-  Y still incurs an edge MISS at Y on their first hit, but now Pages
-  Function's R2 tier HITs instead of falling through to origin — ~400 ms
-  R2 read instead of ~1 s origin round-trip. After that first hit, PoP Y's
-  edge is warm too and subsequent Y users HIT the edge.
+- **CF edge at PoP X has the full file cached** (thanks to
+  `cacheEverything` + our Cache Rule). Subsequent range requests to this
+  URL at PoP X are edge HITs.
+- **R2 has the full file.** A user at a different PoP Y still incurs an
+  edge MISS at Y, but now HITs R2 (~400 ms) instead of origin (~1 s).
 
-So outside-horizon URLs reach the same steady state as in-horizon URLs
-after one user has touched them at each PoP; they just don't get the
-cron's global purge-on-swap treatment.
-
-So outside-horizon still works, just with a first-user-pays-origin cost per
-PoP (and then per-R2 fill). This is deliberate: we trade a slow first access
-on rarely-visited forecast hours for bounded R2 usage.
-
-Caveat: outside-horizon CF edge entries are **not** invalidated by the cron
-on run swap (cron only knows about the 72 h validTimes). A user scrubbing to
-hour 80 of an old run could see stale data until the 30-day CF TTL expires.
-In practice the client's `meta.json` refresh (every 5 min, see
-`METADATA_REFRESH_INTERVAL` in `src/lib/constants.ts`) moves the client to
-the new run within 5 min, and the client never requests the old-run hour 80
-URL again — it asks for the new-run equivalent, which hits a fresh cache path.
+Outside-horizon URLs reach the same steady state as in-horizon URLs after
+one user touches them at each PoP; they just don't get the cron's global
+purge-on-swap treatment.
 
 ### Update flow on a new Open-Meteo run
 
-The cron fires every **5 min** (CF Workers cron trigger
-`*/5 * * * *` on `surfr-tile-warmer-cron`). It walks the 14 domains
-sequentially, one HTTP call per domain to
+The cron fires every 5 min (CF Workers cron `*/5 * * * *` on
+`surfr-tile-warmer-cron`). It walks the 14 domains sequentially, one HTTP
+call per domain to
 `https://maps.thesurfr.app/tiles/_warmer-trigger?domain=<d>&wait=1`.
 
 Inside the Pages Function (`functions/lib/warmer.ts:warmDomain`):
@@ -176,45 +173,45 @@ Inside the Pages Function (`functions/lib/warmer.ts:warmDomain`):
 2. Compare `reference_time` with R2's `latest.json`.
 3. If unchanged → return `{ status: 'unchanged' }` and stop.
 4. Otherwise:
-   a. Fetch upstream `meta.json` for the new run.
-   b. Cap valid_times to +72 h from `reference_time`.
-   c. Warm each capped validTime to R2 with concurrency 4 (stop-on-404, skip
-      already-in-R2 via `head`, per-domain 4 min deadline).
-   d. If any file failed or the run's tail still 404s (model still uploading),
-      bail **without** swapping — next tick resumes from where we left off.
-   e. **Atomic swap**: put new `meta.json` → R2, then put new `latest.json` →
-      R2. Only after both writes do clients see the new run.
-   f. Delete old-run `.om` files from R2 (`deleteOldRunFiles`) by listing
-      `data_spatial/<domain>/` and dropping keys whose run-path segment ≠ the
-      new run.
-   g. Return `{ status: 'warmed', referenceTime, validTimes, files: {...} }`.
+   a. Fetch upstream `meta.json` for the new run (server-side only, to get
+      the full `valid_times` list).
+   b. Cap `valid_times` to +72 h from `reference_time`.
+   c. Warm each capped validTime to R2 with concurrency 4 (stop-on-404 if
+      upstream is still uploading, skip already-in-R2 via `head`,
+      per-domain 4 min deadline).
+   d. If any file failed, the run timed out, or the tail 404s (model still
+      uploading) — bail **without** swapping. Next tick resumes from where
+      we left off; `head` skip makes it cheap.
+   e. **Atomic swap**: one PUT of `latest.json` to R2. Clients see the new
+      run only after this completes.
+   f. `pruneOldRunFiles`: list all `.om` keys under `data_spatial/<domain>/`,
+      group by runPath, keep newest 3 (current + 2 prior), delete the rest.
+   g. Return `{ status: 'warmed', referenceTime, validTimes, files, prunedOldFiles, keptRunPaths }`.
 
-The cron worker then sees `status: 'warmed'` in the JSON response, pulls out
-`validTimes`, builds stripped URLs
-(`https://maps.thesurfr.app/tiles/data_spatial/<domain>/<validTime>.om`),
+The cron worker sees `status: 'warmed'` in the JSON response, pulls out
+`validTimes` and `referenceTime`, builds canonical URLs
+(`https://maps.thesurfr.app/tiles/data_spatial/<domain>/<runPath>/<validTime>.om`),
 and calls the CF API to purge them (batched 30 URLs per request, the
 Free-plan limit). Purge is **global**: CF evicts those URLs from every PoP
-simultaneously. No per-PoP re-warm after purge — first user at each cold PoP
-will lazily refill the edge from R2 on their first hit (documented
-acceptable cost; see "PoPs and edge warming" below).
+simultaneously. The cron currently does **not** re-warm after purge
+(Cache Reserve investigation is open — see *PoPs and edge warming* below).
 
 Code:
 - `worker-cron/src/index.ts` — driver, inspects per-domain response, calls
   `purgeDomain`.
-- `worker-cron/src/purge.ts` — CF API client.
+- `worker-cron/src/purge.ts` — CF API client, canonical URL builder.
 - Env required on the cron worker: secret `CF_PURGE_TOKEN`
   (Zone: Cache Purge scoped to `thesurfr.app`), plaintext var
-  `CF_ZONE_ID = f5f6361a616de5b43d6bc305d452d42c`.
+  `CF_ZONE_ID`.
 
-### The Cache Rule (the thing that makes all of the above actually cache)
+### The Cache Rule
 
 Pages Function responses default to `CF-Cache-Status: DYNAMIC`, meaning CF
-skips the edge cache entirely. **`Cache-Control: public, max-age=…` from the
-function is not enough** — CF only caches file types it recognises as static
+skips the edge cache entirely. `Cache-Control: public, max-age=…` from the
+function is not enough — CF only caches file types it recognises as static
 by default, and `.om` isn't one of them.
 
-The Cache Rule (one-time dashboard setup, zone `thesurfr.app`, Caching →
-Cache Rules):
+One-time dashboard setup (zone `thesurfr.app`, Caching → Cache Rules):
 
 ```
 name:        cache-om-tiles
@@ -222,7 +219,7 @@ expression:  (http.host eq "maps.thesurfr.app"
               and ends_with(http.request.uri.path, ".om"))
 cache:       Eligible for cache
 edge TTL:    30 days, ignore origin Cache-Control
-browser TTL: respect origin (we send max-age=2592000 which matches)
+browser TTL: respect origin (we send max-age=2592000, immutable)
 order:       first (before any broader rule)
 ```
 
@@ -234,28 +231,31 @@ Without this rule, every `.om` hit reaches the Pages Function.
 generated by `functions/tiles/_admin.ts`.
 
 Per domain it shows:
-- Status pill: OK (green) / STALE (orange, upstream has newer run) / COLD
-  (red, never warmed) / UNKNOWN (grey, upstream unreachable).
-- Our R2 `latest.json` `reference_time` + mismatches against `meta.json`
-  or upstream.
+- Status pill: OK / STALE / COLD / UNKNOWN.
+- Our R2 `latest.json` `reference_time` + mismatch against upstream.
 - Number of `.om` files in R2 for the current run + total MB.
 - Oldest / newest validTime in R2.
-- "Last tick" — age and status of the most-recent per-domain warm, from
-  `_warmer/last-domain-<domain>.json`.
+- Historical runs column — retained prior runs (runPath + file count + MB).
+- "Last tick" — age and status of the most-recent per-domain warm.
 
 At the top a collapsible "Last cron" details block shows the most recent
-`_warmer/last-tick.json` (written on every `warmDomain` completion). There
-are also action buttons to trigger the warmer or view the debug inventory.
+`_warmer/last-tick.json`.
 
 Related endpoints:
 - `/tiles/_warmer-trigger?domain=<d>&wait=1` — run warmer for one domain,
   wait for result.
-- `/tiles/_warmer-trigger` — run all domains, fire-and-forget (default used
-  by the cron worker).
+- `/tiles/_warmer-trigger` — run all domains, fire-and-forget.
 - `/tiles/_debug/cache` — JSON inventory of R2 keys grouped by prefix.
 - `https://surfr-tile-warmer-cron.herbert-0fd.workers.dev/force?domain=<d>`
-  — force a CF cache purge for one domain's current run, bypassing the
-  "unchanged" short-circuit (used for bootstrap and manual recovery).
+  — force a CF cache purge for one domain's current run.
+
+### Run-date label
+
+`src/lib/components/run-date-label.svelte` — a small fixed-position label
+at `top: 120px, left: 50%` showing `Run YYYY-MM-DD HH:MMZ`. Rendered in
+both standalone and `?embed=1` modes so mobile users can see which run
+their tiles came from. Shares the 120 px slot with the pop-warm toast; the
+toast overlays the label while warming.
 
 ## PoPs and edge warming
 
@@ -265,15 +265,17 @@ a HIT at PoP A does not benefit PoP B.
 
 **The cron worker runs at one PoP** (wherever CF schedules it). When the
 cron fires a purge, the purge is global, so every PoP drops the stale entry.
-When the cron *could* re-warm, it only warms its own PoP (and, via Smart
-Tiered Cache, the upper tier). We tried the re-warm and found the benefit
-marginal for other PoPs — so the current cron is **purge-only, no re-warm**.
+When the cron *could* re-warm, it would only warm its own PoP (and, via
+Smart Tiered Cache, the upper tier). Cache Reserve — the global persistent
+tier that would make a single re-warm fetch meaningful for every PoP —
+currently does not catch our traffic (support ticket is open). The cron is
+therefore **purge-only, no re-warm**.
 
 How edge cache actually gets warmed at other PoPs:
 
 1. **First user at a cold PoP**: range request → CF edge MISS → Pages
-   Function → R2 → 206 response. CF caches the full file (see note below)
-   and the range response goes back. ~400–1600 ms.
+   Function → R2 → 206 response. CF caches the full file (cache-on-range
+   behavior) and the range response goes back. ~400–1600 ms.
 2. **Subsequent users at that PoP**: CF edge HIT. ~20–120 ms.
 
 **CF cache-on-range behavior**: when a range request lands on a cacheable
@@ -292,137 +294,32 @@ omFileReader.prefetchVariable('not_a_real_variable', null, signal);
 ```
 
 `'not_a_real_variable'` makes the library read only the header + footer
-(~70 KB combined) and stop — no data blocks fetched. But from CF's point of
+(~70 KB combined) and stop — no data blocks fetched. From CF's point of
 view, that range request against an uncached cacheable URL triggers a full
-26 MB fetch + edge cache. Side effect: **by the time the user actually
-scrubs to hour T+1, the PoP already has the full T+1 file cached**. Every
-range on T+1 is instant.
+26 MB fetch + edge cache. Side effect: by the time the user scrubs to hour
+T+1, the PoP already has the full T+1 file cached.
 
 We cancel the in-flight prefetch via an `AbortController` on every new
 `postReadCallback` so fast-scrubbing users don't back up HTTP/2 streams
 behind a slow prefetch.
 
-Trade-off: the prefetch itself is slow (~500 ms–1 s, because CF is doing a
-full-file origin fetch under the hood) and the user sees that as a visible
-green "Waiting" bar in DevTools on every scrub. The browser only needs the
-tiny range, but CF uses the prefetch as the opportunity to warm everything.
+### Latency profile
 
-### Why first-hit latency looks bad in isolation but is benign at scale
-
-When developing alone against a fresh PoP you see the worst-case numbers:
-
-- Every URL is cold at your PoP → every `.om` scrub pays one 400–1600 ms
-  MISS before the 30-day edge HIT streak kicks in.
-- The prefetch for T+1 is *also* cold and pulls the full T+1 file from R2
-  (or origin for outside-horizon), which is the 500 ms–1 s green bar you
-  keep seeing in DevTools.
-
-In production the picture changes in two ways:
-
-1. **PoPs get pre-warmed by the population, not by the cron.** Every user
-   who lands at a given PoP is effectively a cron-like warmer for the next
-   user at that PoP. With ~250 CF PoPs and any meaningful user base (say,
-   tens of users per active PoP per day), each PoP's edge is already hot
-   on every commonly-scrubbed hour long before a new user arrives. That
-   first user at a PoP pays the miss; the next 999 users hit the 30-day
-   edge cache.
-2. **New runs don't reset all that work.** A run swap purges the 72 h of
-   validTime URLs at every PoP globally — so the edge goes cold for those
-   URLs again — but the first user at each PoP after the purge is now
-   fetching a file that R2 already has (cron warmed R2 before the purge),
-   so the miss cost is *R2-read latency* (~400 ms from a far PoP) not
-   *Open-Meteo-origin latency* (~1 s + cold-bucket overhead). Subsequent
-   users at that PoP are edge-HIT again within seconds.
-
-Net effect in production:
 - **p50 TTFB on `.om` ranges**: ~20–120 ms (edge HIT, most traffic).
 - **p99 TTFB**: ~400–600 ms (first user at a PoP, freshly-purged URL, R2
-  read — sees `X-Surfr-Cache-Status: HIT-R2`, `CF-Cache-Status: MISS`).
+  read — `X-Surfr-Cache-Status: HIT-R2`, `CF-Cache-Status: MISS`).
 - **p99.9 TTFB** (outside-horizon, never-warmed URL): ~1–2 s origin round
   trip.
 
-What the solo developer experience does *not* represent is average user
-latency — it represents the cost of being the "first warmer" for every URL
-at your PoP. That cost is paid once per (URL, PoP) per 30 days in
-production. With N users per PoP, only 1-in-N pays it.
-
-## Update 2026-04-16 — Cache Reserve findings and current PoP-warming mitigation
-
-After the initial deploy we revisited Cache Reserve as a way to eliminate
-the per-PoP first-miss cost (the "first warmer" tax called out above).
-Cache Reserve, in theory, should behave like a global persistent tier that
-sits between per-PoP edge caches and origin — so any PoP's MISS would fall
-through to Cache Reserve (global HIT) instead of to our Pages Function
-→ R2 path. Combined with our existing cron-driven purge-and-refill loop,
-the goal was: one warm pass per run swap → every PoP is effectively hot
-from the next request onward.
-
-**What we found:**
-
-1. **Cache Reserve does not catch our traffic.** Despite the `.om` Cache
-   Rule being eligible and `CF-Cache-Status` reporting `MISS` at the edge,
-   subsequent cold-PoP hits do **not** come back as `HIT` from Cache
-   Reserve — they fall straight through to our Pages Function / R2.
-   Responses lack the `cf-cache-reserve-*` markers we would expect on a
-   reserve HIT. Empirically, Cache Reserve behaves as if it's disabled for
-   our zone even with the feature toggled on.
-2. **Cron-driven warm probes are not being "caught" by Cache Reserve
-   either.** The cron worker's stripped-URL fetches after a run swap
-   (intended, in the re-warm version of the design, to populate Cache
-   Reserve from one well-connected PoP and thereby warm every downstream
-   PoP) do not end up in the reserve. As a result re-warming from the cron
-   has no global benefit — it only warms the cron's own PoP, which is
-   exactly the trade-off that led us to remove re-warm from the cron in the
-   first place.
-3. **Support ticket is open with Cloudflare** to determine whether this is
-   a plan-gating issue, a zone-configuration issue, or a product limitation
-   (e.g. Cache Reserve only engages for specific content types, size
-   thresholds, or origin types, and our Pages-Function-fronted R2 traffic
-   isn't one of them). Ticket status will be tracked on the internal
-   engineering doc; update this ADR once resolved.
-
-**Consequences while the ticket is open:**
-
-- The **cron worker does not re-warm**. It purges globally on run swap and
-  stops. There is no point spending internal traffic on probing URLs that
-  won't land in a shared tier. This matches the code already committed in
-  `worker-cron/src/index.ts` and the "purge-only, no re-warm" line under
-  *PoPs and edge warming* above — but the reason is now "Cache Reserve is
-  not catching probes" rather than "re-warm only warms the cron's PoP".
-  Both are true; the current one is load-bearing.
-- **PoP warm-up is therefore a client-side concern.** The
-  `postReadCallback` prefetch documented under *The prefetch — per-PoP
-  self-warming* (see `src/lib/stores/om-protocol-settings.ts`) is, in
-  effect, how PoPs get warm for a given user session today: the user's
-  first scrub at a PoP fetches prev/next-hour files in the background,
-  which — because CF caches the full file on any range request against a
-  cacheable URL — populates that PoP's edge for every adjacent hour the
-  user is likely to scrub to next.
-- This means **the first user at a cold PoP still pays the MISS cost** on
-  the very first `.om` URL they touch. There is no server-side mechanism
-  that will warm their PoP before they hit it. Anything else a user scrubs
-  to gets pre-warmed by the prefetch they just triggered.
-- The **R2 tier remains load-bearing** as the fallback for every cold-PoP
-  MISS. Without Cache Reserve catching anything, the path for a cold-PoP
-  first request is always: edge MISS → Pages Function → R2 HIT → 206.
-  Latency sits in the 400–600 ms band we document in the *Why first-hit
-  latency looks bad in isolation* section.
-
-**If / when Cloudflare resolves the ticket** and Cache Reserve starts
-catching our probes, the minimal change is to flip the cron worker from
-purge-only back to purge + re-warm: after `purgeDomain` completes, fire a
-bounded-concurrency `fetch(strippedUrl, { cf: { cacheEverything: true } })`
-for each validTime so the next tier above the PoPs is primed. Code
-location: `worker-cron/src/index.ts:runTick`, right after the `purgeDomain`
-call. The re-warm itself is ~1 GB of internal traffic per domain per swap
-and was measured cheap when we had it enabled earlier.
+First-user-per-PoP pays the miss; subsequent users at that PoP HIT the edge
+until the next run swap purges it.
 
 ## Observability
 
 Response headers on `.om` responses carry enough telemetry to diagnose any
 tier in the stack. (Note: on an edge HIT our Pages Function doesn't run —
 the only authoritative header is `CF-Cache-Status`; everything else is
-**replayed from the originally-cached response**.)
+replayed from the originally-cached response.)
 
 | Header | Who sets | Meaning |
 |---|---|---|
@@ -430,11 +327,9 @@ the only authoritative header is `CF-Cache-Status`; everything else is
 | `CF-Cache-Status: MISS` | CF edge (authoritative) | Edge didn't have it; function ran. |
 | `CF-Cache-Status: DYNAMIC` | CF edge (authoritative) | URL wasn't eligible for cache — rule didn't match. Flag for investigation. |
 | `Age: N` | CF edge | Seconds since the cached entry was populated. |
-| `X-Surfr-Cache-Status: HIT-R2` | Pages Function | When the cached entry was first populated, it came from R2. |
-| `X-Surfr-Cache-Status: HIT-ORIGIN-EDGE` | Pages Function | Function's origin fetch was itself an edge HIT. |
+| `X-Surfr-Cache-Status: HIT-R2` | Pages Function | Served from R2. |
+| `X-Surfr-Cache-Status: HIT-ORIGIN-EDGE` | Pages Function | Function's origin fetch came back from CF's edge cache of the upstream URL (fast). |
 | `X-Surfr-Cache-Status: MISS-ORIGIN` | Pages Function | Origin round-trip; R2 was cold too. |
-| `X-Surfr-Reference-Time` | Pages Function | The `reference_time` the function used to build the canonical path. |
-| `X-Surfr-Latest-Ms` | Pages Function | Time spent reading R2 `latest.json` (0 = in-isolate cache HIT). |
 | `X-Surfr-Upstream-Ms` | Pages Function | Time spent on the origin fetch, if any. |
 
 Debug URLs:
@@ -447,15 +342,12 @@ Debug URLs:
 - CF Pages: free tier. Workers Paid ($5/mo) required for the subrequest
   budget that `warmDomain` uses during a fresh run warm.
 - R2: `surfr-tile-cache`, location hint ENAM, no jurisdiction. All warmer
-  traffic (cron → Pages Function → R2 → Worker) is internal to CF, which
-  means **zero R2 egress fees**. Client traffic never reads R2 directly —
-  always via the Pages Function, which is still CF-internal from R2's
-  perspective.
-- CF cron: 288 ticks/day × 14 domain HTTP calls = ~4 k requests/day —
-  comfortably free.
+  traffic (cron → Pages Function → R2 → Worker) is internal to CF →
+  **zero R2 egress fees**. Client traffic never reads R2 directly — always
+  via the Pages Function, which is CF-internal from R2's perspective.
+- CF cron: 288 ticks/day × 14 domain HTTP calls = ~4 k requests/day.
 - Cache purges: ~30 URLs/call on Free plan. Worst-case 14 domains ×
   ceil(72/30) = 42 purge calls per ~5-min tick during a busy window.
-  Still well under the rate limit.
 
 Model run cadences and approximate warm volumes (one swap per run):
 
@@ -469,72 +361,42 @@ Model run cadences and approximate warm volumes (one swap per run):
 
 All internal traffic, all free.
 
-## Future work
-
-- **Cache Reserve / Smart Tiered Cache resolution (blocked on CF support
-  ticket).** Smart Tiered Cache is enabled on the zone and Cache Reserve
-  was evaluated as the next escalation, but — as documented in the
-  *Update 2026-04-16* section above — neither is catching our traffic
-  today. Support ticket is open with Cloudflare; when resolved, re-enable
-  the cron worker's re-warm step (a pure `fetch(url, { cf: {
-  cacheEverything: true } })` per stripped URL after `purgeDomain`) so the
-  shared tier is primed on every run swap. Code location:
-  `worker-cron/src/index.ts:runTick`. Until the ticket is resolved,
-  continue relying on the client-side prefetch for per-PoP warming.
-- **Pre-populate PoPs globally.** CF does not expose a primitive to push a
-  cache entry into every PoP. If first-user-per-PoP latency proves painful
-  after Smart Tiered Cache is ruled out, options include:
-  - Running multiple warmer Workers in different regions via explicit
-    regional deployments (CF Workers doesn't support this directly;
-    requires ≥ 1 Worker invocation per region from an external scheduler).
-  - Offering an opt-in "hot mode" endpoint that hits the warmer from the
-    client's own PoP on page load (trivially warms that PoP for the
-    current viewport only).
-  - Accepting the first-miss cost. Our current choice.
-- **Purge outside-horizon files on swap.** On run swap, only the 72 h
-  validTimes are purged. Stale outside-horizon entries (if any ever got
-  cached) linger for 30 days. If this ever matters, purge by domain
-  prefix (requires Enterprise) or enumerate the full horizon from the
-  new `meta.json`.
-- **Rewrite the library's `_iterateDataBlocks`** to parallelise index-
-  block reads. Upstream PR rather than a monkey-patch — we tried the
-  patch in-repo and reverted it because the effect was dominated by CF
-  latency and network RTT, not library waterfalling. Revisit once CF
-  tier propagation is confirmed.
-
 ## Consequences
 
 Positive:
 - Repeat scrubs in the same region are edge-served, sub-100 ms TTFB.
-- Stale data is impossible: cron purges globally on every swap, JSON indexes
-  come from R2 only.
-- Client URLs are stable across runs — no drift when a new run publishes
-  while a user is mid-session.
+- Stale data is impossible: cron purges globally on every swap, `latest.json`
+  is R2-only and never cached.
+- Each run has an immutable URL → browsers can cache `.om` bytes forever
+  with no revalidation, `Range` requests always return 206.
+- Tabs left open across a run swap keep working (2 prior runs retained).
 - One code base, one deploy pipeline, one R2 bucket, two CF projects
   (Pages + Worker).
 
 Negative:
-- First user per PoP pays a one-time MISS cost per URL. Acceptable.
+- First user per PoP pays a one-time MISS cost per URL.
 - Outside-horizon requests fall through to origin; small tail latency hit
   for rare scrubs past +72 h.
-- Architecture has three moving parts (Pages Function, cron Worker, dashboard
-  Cache Rule). A Cache Rule misconfiguration silently reverts the system to
-  "every request is DYNAMIC", which is exactly the failure mode we had on
-  initial deploy — documented above so it's diagnosable.
+- Architecture has three moving parts (Pages Function, cron Worker, zone
+  Cache Rule). A Cache Rule misconfiguration silently reverts the system
+  to "every request is DYNAMIC".
 
 ## References
 
 - `functions/tiles/[[path]].ts` — tile proxy, R2 tier, origin fallback.
 - `functions/tiles/_warmer-trigger.ts` — HTTP entry for the warmer.
 - `functions/tiles/_admin.ts` — HTML dashboard.
-- `functions/lib/warmer.ts` — per-domain warm logic, atomic swap, old-run
-  cleanup.
+- `functions/lib/warmer.ts` — per-domain warm logic, atomic swap,
+  retention pruning.
 - `functions/lib/domains.ts` — the 14 warmed domain names.
 - `worker-cron/src/index.ts` — cron scheduler + force endpoint.
-- `worker-cron/src/purge.ts` — CF API cache purge client.
-- `src/lib/url.ts` — client URL builder (stripped).
-- `src/lib/stores/om-protocol-settings.ts` — prefetch with AbortController.
-- `src/lib/constants.ts` — block size, metadata refresh cadence.
+- `worker-cron/src/purge.ts` — CF API cache purge client, canonical URL
+  builder.
+- `src/lib/url.ts` — client URL builder (runPath included).
+- `src/lib/metadata.ts` — `latest.json` fetch + metadata derivation.
+- `src/lib/pop-warm.ts` — per-session PoP warm.
+- `src/lib/stores/om-protocol-settings.ts` — prefetch with `AbortController`.
+- `src/lib/components/run-date-label.svelte` — run-date label widget.
 - CF dashboard: Zone `thesurfr.app` → Caching → Cache Rules → `cache-om-tiles`.
 - CF dashboard: Pages project `maps` → Settings → Functions → R2 bindings
   → `TILE_CACHE = surfr-tile-cache`.

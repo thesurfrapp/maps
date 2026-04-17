@@ -32,11 +32,11 @@ export const getMetaData = async (): Promise<DomainMetaDataJson> => {
 	const latest = get(l);
 	if (!latest) throw new Error('latest.json not loaded');
 
-	// modelRun is always pinned to latest.reference_time — users can't pick
-	// a non-latest run, so latest IS the active metadata.
-	if (get(mR) === undefined) {
-		mR.set(new Date(latest.reference_time));
-	}
+	// modelRun is always pinned to latest.reference_time. Set unconditionally
+	// so a domain switch (which reloads latest.json for the new domain) also
+	// advances modelRun — otherwise getOMUrl would build URLs with the
+	// previous domain's runPath, 404.
+	mR.set(new Date(latest.reference_time));
 
 	const result = { ...latest } as DomainMetaDataJson;
 	result.valid_times = [...latest.valid_times].sort();
