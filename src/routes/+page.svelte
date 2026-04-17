@@ -178,7 +178,12 @@
 			// active variable; if this doesn't contain `wind` when you expect it
 			// to, the problem is upstream in the variable store.
 			console.log('[surfr-protocol]', { url: params.url });
-			return omProtocol(params, abortController, $omProtocolSettings);
+			const result = omProtocol(params, abortController, $omProtocolSettings);
+			result.then(
+				(res: unknown) => console.log('[surfr-protocol] resolved', { url: params.url, res }),
+				(err: unknown) => console.error('[surfr-protocol] REJECTED', { url: params.url, err })
+			);
+			return result;
 		});
 
 		const style = await getStyle();
