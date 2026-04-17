@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { modelRun, time } from '$lib/stores/time';
 	import { displayTzOffsetSeconds } from '$lib/stores/preferences';
+	import { domain, variable } from '$lib/stores/variables';
 
 	const formatted = $derived.by(() => {
 		const d = $modelRun;
@@ -26,6 +27,14 @@
 			`${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())} GMT${sign}${tzH}:${tzM}`
 		);
 	});
+
+	// Debug: the domain (tile model) + variable the embed currently thinks are active.
+	// Useful when the RN host tells us to switch (e.g. GFS wind 013 → gust 025) — we can
+	// see at a glance which .om file the embed actually loaded.
+	const modelFormatted = $derived.by(() => {
+		if (!$domain && !$variable) return null;
+		return `${$domain ?? '—'} · ${$variable ?? '—'}`;
+	});
 </script>
 
 {#if formatted}
@@ -33,6 +42,9 @@
 		<div>Run {formatted}</div>
 		{#if currentFormatted}
 			<div class="current-label">{currentFormatted}</div>
+		{/if}
+		{#if modelFormatted}
+			<div class="model-label">{modelFormatted}</div>
 		{/if}
 	</div>
 {/if}
@@ -61,5 +73,12 @@
 		color: rgba(255, 255, 255, 0.65);
 		font-weight: 400;
 		font-size: 9px;
+	}
+	.model-label {
+		margin-top: 2px;
+		color: rgba(180, 220, 255, 0.7);
+		font-weight: 500;
+		font-size: 9px;
+		letter-spacing: 0.03em;
 	}
 </style>
