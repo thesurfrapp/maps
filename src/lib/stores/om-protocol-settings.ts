@@ -11,7 +11,15 @@ import { persisted } from 'svelte-persisted-store';
 
 import { browser } from '$app/environment';
 
-import { surfrWindScale } from '$lib/color-scales/surfr';
+import { surfrWindScale, surfrWindScaleEmbed } from '$lib/color-scales/surfr';
+import { isEmbedMode } from '$lib/rn-bridge';
+
+// Pick the active wind scale once at module-load time. Embed mode gets an
+// alpha=1 (effectively alpha-less) variant with darkened low-knot hues +
+// whitened high-knot hues — the mobile WebView drops per-pixel alpha from
+// the tile texture, so "calm fades to dark, strong pops bright" has to live
+// entirely in the RGB channel.
+const activeWindScale = isEmbedMode() ? surfrWindScaleEmbed : surfrWindScale;
 import {
 	DEFAULT_CACHE_BLOCK_SIZE_KB,
 	DEFAULT_CACHE_MAX_BYTES_MB,
@@ -78,15 +86,15 @@ export const omProtocolSettings: Writable<OmProtocolSettings> = writable({
 	colorScales: {
 		...defaultOmProtocolSettings.colorScales,
 		...initialCustomColorScales,
-		wind: surfrWindScale,
-		wind_speed_10m: surfrWindScale,
-		wind_gusts_10m: surfrWindScale,
-		wind_u_component_10m: surfrWindScale,
-		wind_v_component_10m: surfrWindScale
+		wind: activeWindScale,
+		wind_speed_10m: activeWindScale,
+		wind_gusts_10m: activeWindScale,
+		wind_u_component_10m: activeWindScale,
+		wind_v_component_10m: activeWindScale
 	},
 
 	// Hard override. Wrap the library's default resolver and patch the
-	// colorScale for any wind-family variable to surfrWindScale. Belt-and-
+	// colorScale for any wind-family variable to activeWindScale. Belt-and-
 	// braces on top of the colorScales map above.
 	resolveRequest: (urlComponents, settings) => {
 		const resolved = defaultResolveRequest(urlComponents, settings);
@@ -99,7 +107,7 @@ export const omProtocolSettings: Writable<OmProtocolSettings> = writable({
 			const incomingColors = JSON.stringify(
 				(resolved.renderOptions.colorScale as { colors?: unknown }).colors
 			).slice(0, 60);
-			const surfrColors = surfrWindScale.colors as unknown as unknown[];
+			const surfrColors = activeWindScale.colors as unknown as unknown[];
 			const surfrFirstColor = JSON.stringify(surfrColors[0]);
 			console.log('[surfr-colors]', {
 				variable: v,
@@ -116,8 +124,8 @@ export const omProtocolSettings: Writable<OmProtocolSettings> = writable({
 			const dark = urlComponents.params.get('dark') === 'true';
 			resolved.renderOptions = {
 				...resolved.renderOptions,
-				colorScale: resolveColorScale(surfrWindScale, dark),
-				intervals: surfrWindScale.breakpoints
+				colorScale: resolveColorScale(activeWindScale, dark),
+				intervals: activeWindScale.breakpoints
 			};
 		}
 		return resolved;

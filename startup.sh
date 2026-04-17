@@ -25,12 +25,20 @@ if [[ "${1:-}" == "--no-tunnel" ]]; then TUNNEL=0; fi
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-echo "==> Building static bundle (vite build, adapter-static -> ./build)"
+echo "==> Initial build (vite build, adapter-static -> ./build)"
 if command -v yarn >/dev/null 2>&1 && [ -f yarn.lock ]; then
   yarn build
 else
   npm run build
 fi
+
+# Keep vite rebuilding ./build/ in the background so edits don't require
+# killing + rerunning this script. Wrangler pages dev serves the static
+# artefacts as-is (no HMR) — a hard refresh in the browser after a save is
+# enough once the watcher has regenerated the bundle.
+echo "==> Starting vite build --watch (rebuilds on save)"
+npx vite build --watch &
+VITE_PID=$!
 
 echo "==> Starting wrangler pages dev on :$PORT"
 npx wrangler pages dev build \
@@ -42,7 +50,8 @@ WRANGLER_PID=$!
 # Ensure we clean up the background process(es) on Ctrl-C / exit.
 cleanup() {
   echo
-  echo "==> Shutting down (pid=$WRANGLER_PID ${TUNNEL_PID:+/ tunnel=$TUNNEL_PID})"
+  echo "==> Shutting down (vite=$VITE_PID wrangler=$WRANGLER_PID ${TUNNEL_PID:+tunnel=$TUNNEL_PID})"
+  kill "$VITE_PID" 2>/dev/null || true
   kill "$WRANGLER_PID" 2>/dev/null || true
   [[ -n "${TUNNEL_PID:-}" ]] && kill "$TUNNEL_PID" 2>/dev/null || true
   wait 2>/dev/null || true
