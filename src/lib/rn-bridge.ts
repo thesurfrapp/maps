@@ -56,6 +56,12 @@ type InMsg =
 	// RN sends this when the user dismisses the "View details" pill. Does not
 	// move the red forecast pin — only tears down the blue-dot highlight.
 	| { type: 'clearSpotSelection' }
+	// Re-draw the blue pulsing highlight at a given lat/lng without requiring
+	// a user tap. RN sends this on cold open when the last-persisted forecast
+	// location was a selected Surfr spot — so returning users land back in the
+	// same state (pulse + pill) without re-tapping. Also hides the red forecast
+	// pin, same as a fresh spot tap would.
+	| { type: 'setSpotHighlight'; lat: number; lng: number }
 	// Zoom / projection control for the RN app's "world" icon. `setZoom`
 	// flies to the target zoom (level 0 = fully zoomed out). Optionally
 	// takes lat/lng to recenter. If `projection` is not set, we implicitly
@@ -361,6 +367,13 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 			}
 			case 'clearSpotSelection': {
 				clearSelectedSpotHighlight();
+				break;
+			}
+			case 'setSpotHighlight': {
+				if (Number.isFinite(msg.lat) && Number.isFinite(msg.lng)) {
+					hideForecastMarker(map);
+					setSelectedSpotHighlight(map, msg.lat, msg.lng);
+				}
 				break;
 			}
 			case 'setZoom': {
