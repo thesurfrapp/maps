@@ -8,7 +8,7 @@ import type * as maplibregl from 'maplibre-gl';
 
 import { changeOMfileURL } from '$lib/layers';
 import { setGlobeProjection } from '$lib/map-controls';
-import { setSurfrSpotsConfig } from '$lib/surfr-spots';
+import { LAYER_ID_DOT as SURFR_SPOTS_LAYER, setSurfrSpotsConfig } from '$lib/surfr-spots';
 
 import { displayTimezone, displayTzOffsetSeconds } from '$lib/stores/preferences';
 import { metaJson, time } from '$lib/stores/time';
@@ -27,6 +27,7 @@ type OutMsg =
 	| { type: 'availableVariables'; variables: string[]; t: number }
 	| { type: 'timestampChanged'; time: string; t: number }
 	| { type: 'forecastLocationSet'; lat: number; lng: number; t: number }
+	| { type: 'spotClick'; id: string | number; name: string; lat: number; lng: number; t: number }
 	| { type: 'referenceTime'; domain: string; referenceTime: string; t: number }
 	| { type: 'tileFetch'; url: string; status: number; ms: number; bytes: number; cache: string; range: string; upMs: number; t: number }
 	| { type: 'storageEstimate'; quotaMb: number; usageMb: number; cacheCount?: number; t: number }
@@ -140,12 +141,41 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 	// A tap anywhere on the map sets a forecast location — RN listens and refreshes
 	// its model picker + ForecastTable for that point. Mirrors Windy's
 	// "click to place forecast marker" UX.
+	//
+	// Exception: if the tap lands on a Surfr spot dot, emit `spotClick` instead
+	// and skip the forecast-marker move — RN opens its SpotDetailSheet for that
+	// spot and the user's intent clearly wasn't to relocate the forecast pin.
 	const onClick = (ev: maplibregl.MapMouseEvent) => {
+		const spotHit = map
+			.queryRenderedFeatures(ev.point, { layers: [SURFR_SPOTS_LAYER] })
+			.find((f) => f.properties?.id != null);
+		if (spotHit) {
+			const [lng, lat] = (spotHit.geometry as GeoJSON.Point).coordinates;
+			postToRN({
+				type: 'spotClick',
+				id: spotHit.properties!.id as string | number,
+				name: (spotHit.properties!.name as string) ?? '',
+				lat,
+				lng
+			});
+			return;
+		}
 		const { lat, lng } = ev.lngLat;
 		postToRN({ type: 'forecastLocationSet', lat, lng });
 		placeForecastMarker(map, lat, lng);
 	};
 	map.on('click', onClick);
+
+	// Desktop affordance: pointer cursor when hovering a spot dot. Harmless on
+	// touch (no hover) but makes the embed feel right when used in a browser.
+	const onSpotEnter = () => {
+		map.getCanvas().style.cursor = 'pointer';
+	};
+	const onSpotLeave = () => {
+		map.getCanvas().style.cursor = '';
+	};
+	map.on('mouseenter', SURFR_SPOTS_LAYER, onSpotEnter);
+	map.on('mouseleave', SURFR_SPOTS_LAYER, onSpotLeave);
 
 	const unsubMeta = metaJson.subscribe((meta) => {
 		if (meta?.valid_times?.length) {
@@ -373,6 +403,8 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 	return () => {
 		map.off('moveend', onMoveEnd);
 		map.off('click', onClick);
+		map.off('mouseenter', SURFR_SPOTS_LAYER, onSpotEnter);
+		map.off('mouseleave', SURFR_SPOTS_LAYER, onSpotLeave);
 		map.off('dataloading', onDataLoading);
 		map.off('idle', onIdle);
 		unsubMeta();

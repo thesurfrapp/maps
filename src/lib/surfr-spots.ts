@@ -8,7 +8,7 @@
 import type * as maplibregl from 'maplibre-gl';
 
 const SOURCE_ID = 'surfr-spots';
-const LAYER_ID_DOT = 'surfr-spots-dot';
+export const LAYER_ID_DOT = 'surfr-spots-dot';
 const LAYER_ID_LABEL = 'surfr-spots-label';
 const MIN_ZOOM = 8;
 const LIMIT = 100;
@@ -19,7 +19,12 @@ type SpotsConfig = {
 	token?: string;
 };
 
-type Spot = { lat: number | string; lon: number | string; name?: string };
+type Spot = {
+	id?: string | number;
+	lat: number | string;
+	lon: number | string;
+	name?: string;
+};
 
 const emptyFc: GeoJSON.FeatureCollection = { type: 'FeatureCollection', features: [] };
 
@@ -84,7 +89,7 @@ const toFeatureCollection = (spots: Spot[]): GeoJSON.FeatureCollection => ({
 			return {
 				type: 'Feature',
 				geometry: { type: 'Point', coordinates: [lon, lat] },
-				properties: { name: s.name ?? '' }
+				properties: { id: s.id ?? null, name: s.name ?? '' }
 			};
 		})
 		.filter((f): f is GeoJSON.Feature => f !== null)
