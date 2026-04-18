@@ -5,6 +5,7 @@
 //
 // Mirror of the UX that the old WindyMapView had before we replaced it.
 
+import { Marker } from 'maplibre-gl';
 import type * as maplibregl from 'maplibre-gl';
 
 const SOURCE_ID = 'surfr-spots';
@@ -151,6 +152,32 @@ export const initSurfrSpots = (map: maplibregl.Map): void => {
 export const setSurfrSpotsConfig = (config: SpotsConfig): void => {
 	currentConfig = { ...currentConfig, ...config };
 	if (currentMap) fetchAndRender(currentMap, currentConfig);
+};
+
+// Selected-spot highlight — a pulsing red ring overlay anchored to the
+// currently-selected spot. Rendered via maplibregl.Marker with a custom DOM
+// element so the animation is pure CSS (no per-frame paint-property updates).
+// See `.surfr-spot-pulse` rules in src/styles.css.
+let selectedSpotMarker: Marker | null = null;
+
+export const setSelectedSpotHighlight = (map: maplibregl.Map, lat: number, lng: number): void => {
+	if (!selectedSpotMarker) {
+		const el = document.createElement('div');
+		el.className = 'surfr-spot-pulse';
+		el.innerHTML =
+			'<div class="surfr-spot-pulse__ring"></div>' +
+			'<div class="surfr-spot-pulse__ring surfr-spot-pulse__ring--delayed"></div>';
+		selectedSpotMarker = new Marker({ element: el, anchor: 'center' })
+			.setLngLat([lng, lat])
+			.addTo(map);
+	} else {
+		selectedSpotMarker.setLngLat([lng, lat]);
+	}
+};
+
+export const clearSelectedSpotHighlight = (): void => {
+	selectedSpotMarker?.remove();
+	selectedSpotMarker = null;
 };
 
 export const teardownSurfrSpots = (map: maplibregl.Map): void => {

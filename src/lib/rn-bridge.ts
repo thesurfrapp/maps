@@ -8,7 +8,12 @@ import type * as maplibregl from 'maplibre-gl';
 
 import { changeOMfileURL } from '$lib/layers';
 import { setGlobeProjection } from '$lib/map-controls';
-import { LAYER_ID_DOT as SURFR_SPOTS_LAYER, setSurfrSpotsConfig } from '$lib/surfr-spots';
+import {
+	LAYER_ID_DOT as SURFR_SPOTS_LAYER,
+	clearSelectedSpotHighlight,
+	setSelectedSpotHighlight,
+	setSurfrSpotsConfig
+} from '$lib/surfr-spots';
 
 import { displayTimezone, displayTzOffsetSeconds } from '$lib/stores/preferences';
 import { metaJson, time } from '$lib/stores/time';
@@ -27,7 +32,7 @@ type OutMsg =
 	| { type: 'availableVariables'; variables: string[]; t: number }
 	| { type: 'timestampChanged'; time: string; t: number }
 	| { type: 'forecastLocationSet'; lat: number; lng: number; t: number }
-	| { type: 'spotClick'; id: string | number; name: string; lat: number; lng: number; t: number }
+	| { type: 'spotSelected'; id: string | number; name: string; lat: number; lng: number; t: number }
 	| { type: 'referenceTime'; domain: string; referenceTime: string; t: number }
 	| { type: 'tileFetch'; url: string; status: number; ms: number; bytes: number; cache: string; range: string; upMs: number; t: number }
 	| { type: 'storageEstimate'; quotaMb: number; usageMb: number; cacheCount?: number; t: number }
@@ -47,6 +52,10 @@ type InMsg =
 	| { type: 'setTime'; time: string }
 	| { type: 'setTzOffsetSeconds'; offsetSeconds: number }
 	| { type: 'setSpotsConfig'; endpoint?: string; token?: string }
+	// Dismisses the pulsing-ring highlight around the previously-selected spot.
+	// RN sends this when the user dismisses the "View details" pill. Does not
+	// move the red forecast pin — only tears down the blue-dot highlight.
+	| { type: 'clearSpotSelection' }
 	// Zoom / projection control for the RN app's "world" icon. `setZoom`
 	// flies to the target zoom (level 0 = fully zoomed out). Optionally
 	// takes lat/lng to recenter. If `projection` is not set, we implicitly
@@ -142,10 +151,11 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 	// its model picker + ForecastTable for that point. Mirrors Windy's
 	// "click to place forecast marker" UX.
 	//
-	// Exception: if the tap lands on (or near) a Surfr spot dot, emit `spotClick`
-	// instead and skip the forecast-marker move — RN opens its SpotDetailSheet
-	// for that spot and the user's intent clearly wasn't to relocate the forecast
-	// pin.
+	// If the tap lands on (or near) a Surfr spot dot, treat it AS a forecast-location
+	// tap snapped to the spot's exact coordinates — drop the red pin, notify RN for
+	// the forecast table — and additionally emit `spotSelected` so RN can show a
+	// "View details" pill, and light up a pulsing ring around the spot as visual
+	// feedback. Tapping empty map clears the ring.
 	//
 	// Hit-target padding: the visible dot is only `circle-radius: 4` (~8px wide),
 	// way under Apple's 44pt / Material 48dp tap-target guidelines. Rather than
@@ -163,16 +173,25 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 			.queryRenderedFeatures(bbox, { layers: [SURFR_SPOTS_LAYER] })
 			.find((f) => f.properties?.id != null);
 		if (spotHit) {
-			const [lng, lat] = (spotHit.geometry as GeoJSON.Point).coordinates;
+			// Snap to the spot's exact coordinates — the user tapped "this spot",
+			// not the tap-point near it. This keeps the forecast marker visually
+			// aligned under the pulsing ring and avoids showing slightly-different
+			// lat/lng in the forecast table vs the spot detail sheet.
+			const [spotLng, spotLat] = (spotHit.geometry as GeoJSON.Point).coordinates;
+			placeForecastMarker(map, spotLat, spotLng);
+			postToRN({ type: 'forecastLocationSet', lat: spotLat, lng: spotLng });
 			postToRN({
-				type: 'spotClick',
+				type: 'spotSelected',
 				id: spotHit.properties!.id as string | number,
 				name: (spotHit.properties!.name as string) ?? '',
-				lat,
-				lng
+				lat: spotLat,
+				lng: spotLng
 			});
+			setSelectedSpotHighlight(map, spotLat, spotLng);
 			return;
 		}
+		// Empty-map tap: current behavior + drop any lingering spot highlight.
+		clearSelectedSpotHighlight();
 		const { lat, lng } = ev.lngLat;
 		postToRN({ type: 'forecastLocationSet', lat, lng });
 		placeForecastMarker(map, lat, lng);
@@ -339,6 +358,10 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 				setSurfrSpotsConfig({ endpoint: msg.endpoint, token: msg.token });
 				break;
 			}
+			case 'clearSpotSelection': {
+				clearSelectedSpotHighlight();
+				break;
+			}
 			case 'setZoom': {
 				const center = map.getCenter();
 				// Projection flip — explicit via msg.projection, or implicit when
@@ -425,6 +448,7 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 		clearInterval(storageProbeInterval);
 		window.removeEventListener('message', onWindowMessage);
 		document.removeEventListener('message', onWindowMessage as EventListener);
+		clearSelectedSpotHighlight();
 	};
 };
 

@@ -445,3 +445,40 @@
 [data-sonner-toast]:not([data-type='error']) {
 	display: none !important;
 }
+
+/* =============================================================================
+   Selected-spot pulsing ring — see setSelectedSpotHighlight in surfr-spots.ts.
+   Two rings with a 0.8s offset so the pulse reads as continuous motion instead
+   of a single beat. Color matches the red forecast pin so the pulse visually
+   ties the spot to the active forecast location.
+   ============================================================================= */
+.surfr-spot-pulse {
+	width: 0;
+	height: 0;
+	pointer-events: none;
+	position: relative;
+}
+.surfr-spot-pulse__ring {
+	position: absolute;
+	left: 0;
+	top: 0;
+	width: 56px;
+	height: 56px;
+	margin: -28px 0 0 -28px;
+	border-radius: 50%;
+	background: rgba(239, 68, 68, 0.35);
+	animation: surfr-spot-pulse 1.6s ease-out infinite;
+}
+.surfr-spot-pulse__ring--delayed {
+	animation-delay: 0.8s;
+}
+@keyframes surfr-spot-pulse {
+	0% {
+		transform: scale(0.25);
+		opacity: 0.9;
+	}
+	100% {
+		transform: scale(1);
+		opacity: 0;
+	}
+}
