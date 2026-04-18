@@ -174,11 +174,12 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 			.find((f) => f.properties?.id != null);
 		if (spotHit) {
 			// Snap to the spot's exact coordinates — the user tapped "this spot",
-			// not the tap-point near it. This keeps the forecast marker visually
-			// aligned under the pulsing ring and avoids showing slightly-different
-			// lat/lng in the forecast table vs the spot detail sheet.
+			// not the tap-point near it. The blue spot dot + blue pulsing ring
+			// serve as the "forecast is here" visual — we hide the red pin so
+			// the selection reads as one coherent blue highlight instead of
+			// competing red + blue markers stacked on top of each other.
 			const [spotLng, spotLat] = (spotHit.geometry as GeoJSON.Point).coordinates;
-			placeForecastMarker(map, spotLat, spotLng);
+			hideForecastMarker(map);
 			postToRN({ type: 'forecastLocationSet', lat: spotLat, lng: spotLng });
 			postToRN({
 				type: 'spotSelected',
@@ -455,6 +456,8 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 // Persistent forecast marker — one red target icon, moved on each tap.
 const MARKER_SOURCE_ID = 'rn-forecast-marker';
 const MARKER_LAYER_ID = 'rn-forecast-marker-layer';
+const EMPTY_FC: GeoJSON.FeatureCollection = { type: 'FeatureCollection', features: [] };
+
 const placeForecastMarker = (map: maplibregl.Map, lat: number, lng: number): void => {
 	const data = {
 		type: 'FeatureCollection' as const,
@@ -479,4 +482,13 @@ const placeForecastMarker = (map: maplibregl.Map, lat: number, lng: number): voi
 			'circle-stroke-width': 2
 		}
 	});
+};
+
+// Clear the red forecast marker without touching the spot-selection highlight.
+// Used when the tap lands on a spot — the blue pulsing ring + blue spot dot
+// already communicate the selected forecast location, and the red pin would
+// clash with the blue highlight (looks like "two selections").
+const hideForecastMarker = (map: maplibregl.Map): void => {
+	const src = map.getSource(MARKER_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+	if (src) src.setData(EMPTY_FC);
 };
