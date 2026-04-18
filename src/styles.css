@@ -449,8 +449,9 @@
 /* =============================================================================
    Selected-spot pulsing ring — see setSelectedSpotHighlight in surfr-spots.ts.
    Two rings with a 0.8s offset so the pulse reads as continuous motion instead
-   of a single beat. Color matches the red forecast pin so the pulse visually
-   ties the spot to the active forecast location.
+   of a single beat. Color matches the cyan spot dot (#22d3ee) so the pulse
+   reads as "this spot is highlighted" rather than competing with the red
+   forecast pin.
    ============================================================================= */
 .surfr-spot-pulse {
 	width: 0;
@@ -466,7 +467,7 @@
 	height: 56px;
 	margin: -28px 0 0 -28px;
 	border-radius: 50%;
-	background: rgba(239, 68, 68, 0.35);
+	background: rgba(34, 211, 238, 0.45);
 	animation: surfr-spot-pulse 1.6s ease-out infinite;
 }
 .surfr-spot-pulse__ring--delayed {
