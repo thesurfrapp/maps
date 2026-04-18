@@ -142,12 +142,25 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 	// its model picker + ForecastTable for that point. Mirrors Windy's
 	// "click to place forecast marker" UX.
 	//
-	// Exception: if the tap lands on a Surfr spot dot, emit `spotClick` instead
-	// and skip the forecast-marker move — RN opens its SpotDetailSheet for that
-	// spot and the user's intent clearly wasn't to relocate the forecast pin.
+	// Exception: if the tap lands on (or near) a Surfr spot dot, emit `spotClick`
+	// instead and skip the forecast-marker move — RN opens its SpotDetailSheet
+	// for that spot and the user's intent clearly wasn't to relocate the forecast
+	// pin.
+	//
+	// Hit-target padding: the visible dot is only `circle-radius: 4` (~8px wide),
+	// way under Apple's 44pt / Material 48dp tap-target guidelines. Rather than
+	// grow the dot, we expand the `queryRenderedFeatures` box to ±16px around the
+	// tap — effective ~32px tap area with no visual change. Multiple hits in the
+	// box: topmost (last-drawn) wins, which is what MapLibre returns first.
+	const SPOT_HIT_PADDING_PX = 16;
 	const onClick = (ev: maplibregl.MapMouseEvent) => {
+		const { x, y } = ev.point;
+		const bbox: [maplibregl.PointLike, maplibregl.PointLike] = [
+			[x - SPOT_HIT_PADDING_PX, y - SPOT_HIT_PADDING_PX],
+			[x + SPOT_HIT_PADDING_PX, y + SPOT_HIT_PADDING_PX]
+		];
 		const spotHit = map
-			.queryRenderedFeatures(ev.point, { layers: [SURFR_SPOTS_LAYER] })
+			.queryRenderedFeatures(bbox, { layers: [SURFR_SPOTS_LAYER] })
 			.find((f) => f.properties?.id != null);
 		if (spotHit) {
 			const [lng, lat] = (spotHit.geometry as GeoJSON.Point).coordinates;
