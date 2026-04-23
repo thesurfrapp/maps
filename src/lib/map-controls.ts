@@ -85,20 +85,33 @@ export const addHillshadeLayer = () => {
 
 export const getStyle = async () => {
 	const preferences = get(p);
-	// OpenFreeMap basemap (CORS-open, OpenMapTiles-based). Upstream used
-	// tiles.open-meteo.com which is CORS-allowlisted to Open-Meteo's own origins.
-	// Positron for light, Dark for dark mode — minimalist styles that let the
-	// weather overlay read clearly on top.
-	const styleName = mode.current === 'dark' ? 'dark' : 'positron';
-	const style = await fetch(`https://tiles.openfreemap.org/styles/${styleName}`).then((r) =>
-		r.json()
-	);
+	const isDark = mode.current === 'dark';
 
-	// Minimal planet look matching maps.open-meteo.com so the weather overlay
-	// dominates visually. Filter is source-layer based (cross-style) with a few
-	// id-specific tweaks to cover both OpenFreeMap's `positron` and `dark` (which
-	// use different layer id conventions).
-	if (Array.isArray(style.layers)) {
+	// Primary basemap: MapTiler Streets v2. Gives the "Google-Maps-like"
+	// look (proper road hierarchy, landuse tints, POIs). Key is passed via
+	// a Vite env var so it isn't committed — add `VITE_MAPTILER_KEY=xxx`
+	// to a local `.env` (or the hosting env) and rebuild. If the key is
+	// absent we fall back to OpenFreeMap's minimalist dark/positron so dev
+	// still works without the key.
+	const maptilerKey = import.meta.env.VITE_MAPTILER_KEY as string | undefined;
+	const useMaptiler = Boolean(maptilerKey);
+
+	let styleUrl: string;
+	if (useMaptiler) {
+		const mtStyle = isDark ? 'streets-v2-dark' : 'voyager-v2';
+		styleUrl = `https://api.maptiler.com/maps/${mtStyle}/style.json?key=${encodeURIComponent(maptilerKey!)}`;
+	} else {
+		const styleName = isDark ? 'dark' : 'positron';
+		styleUrl = `https://tiles.openfreemap.org/styles/${styleName}`;
+	}
+	const style = await fetch(styleUrl).then((r) => r.json());
+
+	// OpenFreeMap gets the aggressive strip-down (building/landuse/etc.
+	// hidden, country borders forced white, coastline added) to make the
+	// weather raster dominate. MapTiler is left mostly intact — the whole
+	// point of switching is to keep its Google-Maps-like detail. We only
+	// force English labels on top so dual-script places don't cram.
+	if (Array.isArray(style.layers) && !useMaptiler) {
 		const HIDE_SOURCE_LAYERS = new Set([
 			'transportation',
 			'transportation_name',
@@ -147,7 +160,8 @@ export const getStyle = async () => {
 			// Place labels (countries, states, cities, towns): white, no halo.
 			// Upstream's gray-with-halo reads muddy over our saturated weather
 			// raster; we keep the basemap minimal so labels can be flat colour.
-			if (src === 'place' && id.startsWith('place_')) {
+			// (text-field English override is applied globally further down.)
+			if (src === 'place' && layer.type === 'symbol') {
 				layer.paint = {
 					...(layer.paint ?? {}),
 					'text-color': '#ffffff',
@@ -158,18 +172,44 @@ export const getStyle = async () => {
 			}
 		}
 
-		// Coastline layer — strokes water polygons in white. Real coastlines
-		// (true land/water boundary). Restored after we removed it by mistake.
-		const hasOpenmaptiles = Boolean(style.sources?.openmaptiles);
-		if (hasOpenmaptiles && !style.layers.find((l: { id: string }) => l.id === 'surfr_coastline')) {
-			const waterIdx = style.layers.findIndex((l: { id: string }) => l.id === 'water');
+		// Coastline is now added in the universal post-block so both
+		// OpenFreeMap and MapTiler get it.
+	}
+
+	// English-only label override — runs for BOTH basemaps. Without this,
+	// MapTiler streets still ships dual-script labels (e.g. English + Arabic
+	// stacked vertically) which reads cluttered.
+	if (Array.isArray(style.layers)) {
+		for (const layer of style.layers) {
+			const src: string = layer?.['source-layer'] ?? '';
+			if (src !== 'place' || layer.type !== 'symbol') continue;
+			layer.layout = {
+				...(layer.layout ?? {}),
+				'text-field': [
+					'coalesce',
+					['get', 'name:en'],
+					['get', 'name_en'],
+					['get', 'name:latin'],
+					['get', 'name_int']
+				]
+			};
+		}
+
+		// White coastline — strokes ocean polygons so the land/sea edge reads
+		// clearly against the weather raster. Basemap-agnostic: we find
+		// whichever source exposes the `water` source-layer (OpenFreeMap:
+		// `openmaptiles`, MapTiler: `maptiler_planet`) and draw from it.
+		const waterHost = style.layers.find(
+			(l: { type: string; 'source-layer'?: string; source?: string }) =>
+				l['source-layer'] === 'water'
+		);
+		if (waterHost?.source && !style.layers.find((l: { id: string }) => l.id === 'surfr_coastline')) {
 			const coastline = {
 				id: 'surfr_coastline',
 				type: 'line',
-				source: 'openmaptiles',
+				source: waterHost.source,
 				'source-layer': 'water',
-				// Only ocean polygons — exclude rivers / lakes / ponds so we
-				// trace true coastlines, not inland water rings.
+				// Only ocean polygons — exclude rivers / lakes / ponds.
 				filter: [
 					'all',
 					['==', ['geometry-type'], 'Polygon'],
@@ -181,10 +221,56 @@ export const getStyle = async () => {
 					'line-width': ['interpolate', ['linear'], ['zoom'], 0, 0.4, 3, 0.7, 6, 1, 12, 1.4]
 				}
 			};
-			if (waterIdx >= 0) {
-				style.layers.splice(waterIdx + 1, 0, coastline);
+			const firstSymbolIdx = style.layers.findIndex((l: { type: string }) => l.type === 'symbol');
+			if (firstSymbolIdx >= 0) {
+				style.layers.splice(firstSymbolIdx, 0, coastline);
 			} else {
 				style.layers.push(coastline);
+			}
+		}
+
+		// White country outline — useful at zoomed-out levels (continent /
+		// country view) to separate landmasses from the weather raster.
+		// Fades out as the user zooms into city level where borders are
+		// less relevant and roads take over orientation. Custom overlay so
+		// we don't have to fight the basemap's own boundary styling.
+		const boundaryHost = style.layers.find(
+			(l: { type: string; 'source-layer'?: string; source?: string }) =>
+				l.type === 'line' && l['source-layer'] === 'boundary'
+		);
+		if (boundaryHost?.source && !style.layers.find((l: { id: string }) => l.id === 'surfr_country_border')) {
+			const countryBorder = {
+				id: 'surfr_country_border',
+				type: 'line',
+				source: boundaryHost.source,
+				'source-layer': 'boundary',
+				filter: [
+					'all',
+					['==', ['to-number', ['get', 'admin_level']], 2],
+					['!=', ['to-number', ['get', 'maritime']], 1]
+				],
+				paint: {
+					'line-color': '#ffffff',
+					'line-opacity': [
+						'interpolate',
+						['linear'],
+						['zoom'],
+						0, 1,
+						5, 1,
+						8, 0.7,
+						11, 0.3,
+						14, 0
+					],
+					'line-width': ['interpolate', ['linear'], ['zoom'], 0, 0.6, 4, 1.2, 8, 1.6]
+				}
+			};
+			// Insert just before the first symbol layer so labels still sit
+			// on top — otherwise the border would cut through city names.
+			const firstSymbolIdx = style.layers.findIndex((l: { type: string }) => l.type === 'symbol');
+			if (firstSymbolIdx >= 0) {
+				style.layers.splice(firstSymbolIdx, 0, countryBorder);
+			} else {
+				style.layers.push(countryBorder);
 			}
 		}
 	}

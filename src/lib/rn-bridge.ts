@@ -120,6 +120,11 @@ export const isEmbedMode = (): boolean => {
 	return new URLSearchParams(window.location.search).get('embed') === '1';
 };
 
+export const isAdmin = (): boolean => {
+	if (typeof window === 'undefined') return false;
+	return new URLSearchParams(window.location.search).get('admin') === '1';
+};
+
 // postMessage floods on every moveend / time change are fine, but we debounce moveend
 // so mid-pan frames don't spam the RN thread.
 const debounce = <T extends unknown[]>(fn: (...args: T) => void, ms: number) => {

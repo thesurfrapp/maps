@@ -8,6 +8,23 @@ import type { BreakpointColorScale } from '@openmeteo/weather-map-layer';
 
 const KT_TO_MPS = 0.514444;
 
+// Global darkening factor applied to all wind anchors before they're rasterised
+// onto the map. Pushes the whole palette toward black so the overlay reads
+// heavier on light basemaps (Voyager, Streets-light) where the original hues
+// felt washed out. Hue family is preserved — only value drops. 1.0 = original,
+// 0.5 = half-brightness. Tune this one number to reshade the whole ramp.
+const WIND_DARKEN = 1.0;
+const d = (c: number): number => Math.round(c * WIND_DARKEN);
+
+// If non-null, override every anchor's alpha with this value. Useful for
+// quick "what if every wind band was X% transparent" tests. Set to null to
+// keep the per-anchor alpha curve (ascending with wind strength).
+// Caveat: the RN WebView's WebGL pipeline is known to ignore per-pixel alpha
+// from the color-scale texture — overlay dimming in the embed happens via
+// ?opacity=… instead. So changes here may only be visible in the desktop
+// browser view.
+const WIND_ALPHA_OVERRIDE: number | null = null;
+
 // Per-anchor alpha — still ascending (strong winds are more opaque than calm)
 // but with a higher floor so the calm-blue/cyan end stays visible on the dark
 // basemap. The original 0.05 floor made 0–5 kt effectively invisible over
@@ -24,16 +41,16 @@ const KT_TO_MPS = 0.514444;
 // makes each band pop against black.
 const anchors: [number, number, number, number, number][] = [
 	// kt, R, G, B, alpha
-	[0, 106, 149, 255, 0.35], //  blue (was 80,112,192)
-	[5, 82, 235, 255, 0.45], //   cyan (was 64,184,200)
-	[10, 102, 255, 153, 0.55], // green (was 80,200,120)
-	[15, 170, 255, 75, 0.65], //  lime (was 144,216,64)
-	[20, 245, 255, 47, 0.7], //   yellow (was 208,216,40)
-	[25, 255, 185, 53, 0.75], //  orange (was 232,168,48)
-	[30, 255, 118, 82, 0.8], //   red-orange (was 224,104,72)
-	[35, 255, 82, 173, 0.85], //  pink (was 224,72,152)
-	[40, 255, 88, 235, 0.9], //   magenta (was 208,72,192)
-	[50, 173, 112, 255, 0.95] //  purple (was 136,88,200)
+	[0, 106, 149, 255, 0.4], //   blue          a=0.40
+	[5, 82, 235, 255, 0.5], //    cyan          a=0.50
+	[10, 102, 255, 153, 0.55], // green         a=0.55
+	[15, 170, 255, 75, 0.6], //   lime          a=0.60
+	[20, 245, 255, 47, 0.7], //   yellow        a=0.70
+	[25, 255, 185, 53, 0.75], //  orange        a=0.75
+	[30, 255, 118, 82, 0.8], //   red-orange    a=0.80
+	[35, 255, 82, 173, 0.85], //  pink          a=0.85
+	[40, 255, 88, 235, 0.9], //   magenta       a=0.90
+	[50, 173, 112, 255, 1.0] //   purple        a=1.00
 ];
 
 // Embed-only variant for the RN WebView.
@@ -83,6 +100,8 @@ const lerpInt = (a: number, b: number, t: number): number => Math.round(lerp(a, 
 
 function densify(src: [number, number, number, number, number][]): BreakpointColorScale {
 	const out: { kt: number; rgba: [number, number, number, number] }[] = [];
+	const alphaFor = (a: number): number =>
+		WIND_ALPHA_OVERRIDE == null ? a : WIND_ALPHA_OVERRIDE;
 	for (let i = 0; i < src.length - 1; i++) {
 		const [k0, r0, g0, b0, a0] = src[i];
 		const [k1, r1, g1, b1, a1] = src[i + 1];
@@ -92,17 +111,17 @@ function densify(src: [number, number, number, number, number][]): BreakpointCol
 			out.push({
 				kt: k,
 				rgba: [
-					lerpInt(r0, r1, t),
-					lerpInt(g0, g1, t),
-					lerpInt(b0, b1, t),
-					+lerp(a0, a1, t).toFixed(3)
+					d(lerpInt(r0, r1, t)),
+					d(lerpInt(g0, g1, t)),
+					d(lerpInt(b0, b1, t)),
+					+alphaFor(lerp(a0, a1, t)).toFixed(3)
 				]
 			});
 		}
 	}
-	// Append the terminal anchor.
+	// Append the terminal anchor (also darkened).
 	const last = src[src.length - 1];
-	out.push({ kt: last[0], rgba: [last[1], last[2], last[3], last[4]] });
+	out.push({ kt: last[0], rgba: [d(last[1]), d(last[2]), d(last[3]), alphaFor(last[4])] });
 	return {
 		type: 'breakpoint',
 		unit: 'm/s',

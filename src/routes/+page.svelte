@@ -47,7 +47,7 @@
 	import { initSurfrSpots, setSurfrSpotsConfig } from '$lib/surfr-spots';
 	import { getIanaOffsetSeconds, ianaFromOffsetSeconds } from '$lib/time-format';
 	import { addOmFileLayers, changeOMfileURL } from '$lib/layers';
-	import { installRnBridge, isEmbedMode } from '$lib/rn-bridge';
+	import { installRnBridge, isAdmin, isEmbedMode } from '$lib/rn-bridge';
 	import { addTerrainSource, getStyle, setMapControlSettings } from '$lib/map-controls';
 	import { getInitialMetaData, getMetaData, matchVariableOrFirst } from '$lib/metadata';
 	import { warmCurrentPoP } from '$lib/pop-warm';
@@ -63,11 +63,13 @@
 	let mapContainer: HTMLElement | null;
 
 	let embed = $state(false);
+	let admin = $state(false);
 	let rnBridgeCleanup: (() => void) | undefined;
 
 	onMount(async () => {
 		$url = new URL(document.location.href);
 		embed = isEmbedMode();
+		admin = isAdmin();
 		// Tag the body so CSS can tweak layout in embed mode (e.g. move the
 		// MapLibre GlobeControl out of the RN app's top-right overlap zone
 		// for debugging).
@@ -387,10 +389,13 @@
      toast on domain switch — useful debugging feedback for the user. -->
 <PopWarmToast />
 
-<!-- Small label showing the current run date. Always rendered (embed + web)
-     so mobile users can see which run their tiles came from. Same 120px top
-     as the pop-warm toast — toast overlays it while warming, which is fine. -->
-<RunDateLabel />
+<!-- Debug label showing the current run date + selected time + active
+     domain/variable. Admin-only: shown on standalone web (no embed gating)
+     and in embed mode only when RN passes ?admin=1. Same 120px top as the
+     pop-warm toast — toast overlays it while warming, which is fine. -->
+{#if !embed || admin}
+	<RunDateLabel />
+{/if}
 
 <style>
 	/* Stacked in the top-left column under ModelPills + OverlayPills. */
