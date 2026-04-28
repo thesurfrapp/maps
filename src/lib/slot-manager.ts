@@ -27,8 +27,9 @@ export interface SlotLayer {
 	id: string;
 	/** Paint property used for opacity (e.g. `raster-opacity`, `line-opacity`). */
 	opacityProp: string;
-	/** Target opacity set when the slot becomes active. */
-	commitOpacity: number;
+	/** Target opacity set when the slot becomes active. May be a number or a
+	 * MapLibre expression (e.g. zoom-interpolated). */
+	commitOpacity: number | maplibregl.ExpressionSpecification;
 	/** Add the layer to the map. Must set initial opacity to 0 for fade-in. */
 	add: (map: maplibregl.Map, sourceId: string, layerId: string, beforeLayer: string) => void;
 }

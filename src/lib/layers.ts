@@ -117,10 +117,28 @@ const makeContourWidth = (): maplibregl.ExpressionSpecification => [
 // Layer definitions
 // =============================================================================
 
+// At deep zoom (neighborhood / street level) the weather raster competes with
+// the MapTiler basemap detail (roads, POIs). Interpolate raster-opacity by
+// zoom so the overlay is full-strength at country/region zoom and fades to 0
+// once the user zooms past street level. Arrows are unaffected — they stay
+// readable as a directional hint over the basemap.
+const RASTER_FADE_START_ZOOM = 11; // full user-set opacity at/below this zoom
+const RASTER_FADE_END_ZOOM = 14; // raster fully hidden at/above this zoom
+
+const rasterOpacityByZoom = (): maplibregl.ExpressionSpecification => [
+	'interpolate',
+	['linear'],
+	['zoom'],
+	RASTER_FADE_START_ZOOM,
+	getRasterOpacity(),
+	RASTER_FADE_END_ZOOM,
+	0
+];
+
 const rasterLayer = (): SlotLayer => ({
 	id: 'omRasterLayer',
 	opacityProp: 'raster-opacity',
-	commitOpacity: getRasterOpacity(),
+	commitOpacity: rasterOpacityByZoom(),
 	add: (map, sourceId, layerId, beforeLayer) => {
 		map.addLayer(
 			{
