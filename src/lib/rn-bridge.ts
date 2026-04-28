@@ -45,7 +45,12 @@ type OutMsg =
 	| { type: 'mapIdle'; t: number };
 
 type InMsg =
-	| { type: 'setCenter'; lat: number; lng: number; zoom?: number }
+	// `anchorY` (0..1, default 0.5) is the vertical screen position where the
+	// target lat/lng should land — measured as a fraction from the top of the
+	// viewport. RN sends `anchorY: 0.15` when the wind bottom sheet expands
+	// (sheet covers ~50% of the screen, but the spot looks better in the
+	// middle of the top 30% band, not the centre of the visible band).
+	| { type: 'setCenter'; lat: number; lng: number; zoom?: number; anchorY?: number }
 	| { type: 'setForecastLocation'; lat: number; lng: number }
 	| { type: 'setVariable'; variable: string }
 	| { type: 'setDomain'; domain: string }
@@ -319,13 +324,22 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 		if (!msg || typeof msg !== 'object') return;
 		console.log('[rn-bridge] ←', msg);
 		switch (msg.type) {
-			case 'setCenter':
+			case 'setCenter': {
+				// `offset` shifts the target lat/lng away from the screen centre
+				// by N pixels. Positive Y = below centre, negative = above. To
+				// land the point at `anchorY * vh` from the top, the y offset
+				// from screen-centre is `(anchorY - 0.5) * vh`.
+				const vh = map.getCanvas().clientHeight;
+				const anchorY = Number.isFinite(msg.anchorY) ? (msg.anchorY as number) : 0.5;
+				const yOffset = (anchorY - 0.5) * vh;
 				map.flyTo({
 					center: [msg.lng, msg.lat],
 					zoom: msg.zoom ?? map.getZoom(),
+					offset: [0, yOffset],
 					essential: true
 				});
 				break;
+			}
 			case 'setVariable':
 				postToRN({ type: 'setVariableReceived', variable: msg.variable });
 				if (get(variable) !== msg.variable) variable.set(msg.variable);
