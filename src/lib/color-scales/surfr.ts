@@ -14,7 +14,13 @@ const KT_TO_MPS = 0.514444;
 // felt washed out. Hue family is preserved — only value drops. 1.0 = original,
 // 0.5 = half-brightness. Tune this one number to reshade the whole ramp.
 const WIND_DARKEN = 1.0;
-const d = (c: number): number => Math.round(c * WIND_DARKEN);
+
+// Embed-only multiplier stacked on top of WIND_DARKEN. The mobile WebView
+// over MapTiler reads brighter than desktop because per-pixel alpha is
+// ignored on that pipeline (see anchorsEmbed comment), so we knock the
+// whole ramp down here without affecting the standalone web view. Tune this
+// to taste — lower = darker. 1.0 = no extra darkening.
+const EMBED_WIND_DARKEN = 0.85;
 
 // If non-null, override every anchor's alpha with this value. Useful for
 // quick "what if every wind band was X% transparent" tests. Set to null to
@@ -98,7 +104,12 @@ const anchorsEmbed: [number, number, number, number, number][] = [
 const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
 const lerpInt = (a: number, b: number, t: number): number => Math.round(lerp(a, b, t));
 
-function densify(src: [number, number, number, number, number][]): BreakpointColorScale {
+function densify(
+	src: [number, number, number, number, number][],
+	extraDarken = 1.0
+): BreakpointColorScale {
+	const factor = WIND_DARKEN * extraDarken;
+	const d = (c: number): number => Math.round(c * factor);
 	const out: { kt: number; rgba: [number, number, number, number] }[] = [];
 	const alphaFor = (a: number): number =>
 		WIND_ALPHA_OVERRIDE == null ? a : WIND_ALPHA_OVERRIDE;
@@ -131,4 +142,4 @@ function densify(src: [number, number, number, number, number][]): BreakpointCol
 }
 
 export const surfrWindScale: BreakpointColorScale = densify(anchors);
-export const surfrWindScaleEmbed: BreakpointColorScale = densify(anchorsEmbed);
+export const surfrWindScaleEmbed: BreakpointColorScale = densify(anchorsEmbed, EMBED_WIND_DARKEN);
