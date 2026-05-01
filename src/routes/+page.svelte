@@ -338,26 +338,6 @@
 			.then(() => runDomainLoad(newDomain, reqId));
 	});
 
-	// Re-snap $time to the nearest valid_time whenever either $time or
-	// $metaJson changes. The runDomainLoad path above only snaps once per
-	// domain change — but $time is also set by `urlParamsToPreferences`
-	// (cold start, may land before meta loads) and by the RN bridge's
-	// `setTime` handler (warm-nav deeplinks). Without this effect, an
-	// off-pattern time (e.g. ECMWF 3h model with a 1h-aligned alert hour)
-	// stays raw in the store, and both the run-date debug label and the
-	// `timestampChanged` bridge emission show the inputted hour instead of
-	// the snapped one.
-	$effect(() => {
-		const t = $time;
-		const meta = $metaJson;
-		if (!t || !meta?.valid_times?.length) return;
-		const timeSteps = meta.valid_times.map((s: string) => new Date(s));
-		const snapped = findTimeStep(t, timeSteps);
-		if (snapped && snapped.getTime() !== t.getTime()) {
-			time.set(snapped);
-		}
-	});
-
 	const variableSubscription = variable.subscribe(async (newVar) => {
 		if ($variable !== newVar) {
 			await tick(); // await the selectedVariable to be set

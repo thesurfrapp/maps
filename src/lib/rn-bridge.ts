@@ -20,6 +20,7 @@ import { metaJson, time } from '$lib/stores/time';
 import { domain, variable } from '$lib/stores/variables';
 
 import { formatISOWithoutTimezone, ianaFromOffsetSeconds, parseISOWithoutTimezone } from './time-format';
+import { findTimeStep } from './time-utils';
 
 // Every OutMsg gets stamped with `t` = ms since page load. Lets the RN host
 // reconstruct an accurate timeline (gaps between events tell us where wall
@@ -356,7 +357,17 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 				const parsed =
 					msg.time.length === 15 ? parseISOWithoutTimezone(msg.time) : new Date(msg.time);
 				if (!isNaN(parsed.getTime())) {
-					time.set(parsed);
+					// Snap to nearest valid_time before storing. RN passes its own
+					// `mapAnchoredTimestamp` (already floored against the published
+					// `availableTimestamps`), but for cold-start cases where that
+					// list lags or is empty, RN can post an off-pattern hour that
+					// overwrites the URL-snap result. Snapping here makes $time
+					// canonical regardless of who set it — bridge emissions and the
+					// in-fork debug label stay consistent on the same valid_time.
+					const meta = get(metaJson);
+					const timeSteps = meta?.valid_times?.map((s) => new Date(s));
+					const snapped = timeSteps?.length ? findTimeStep(parsed, timeSteps) : null;
+					time.set(snapped ?? parsed);
 					changeOMfileURL();
 				}
 				break;
