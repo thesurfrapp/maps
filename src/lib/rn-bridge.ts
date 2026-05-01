@@ -367,8 +367,17 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 					const meta = get(metaJson);
 					const timeSteps = meta?.valid_times?.map((s) => new Date(s));
 					const snapped = timeSteps?.length ? findTimeStep(parsed, timeSteps) : null;
-					time.set(snapped ?? parsed);
-					changeOMfileURL();
+					const next = snapped ?? parsed;
+					// Skip the set if the snapped value matches what's already in the
+					// store. Without this dedupe, RN's `setTime` round-trip (whose
+					// snapped result equals the current $time) still triggers a
+					// `time.subscribe` re-emit — RN sees a redundant `timestampChanged`
+					// echo for the same value.
+					const current = get(time);
+					if (next.getTime() !== current.getTime()) {
+						time.set(next);
+						changeOMfileURL();
+					}
 				}
 				break;
 			}
