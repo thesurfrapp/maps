@@ -28,10 +28,22 @@ const UPSTREAM_HOST = 'https://map-tiles.open-meteo.com';
 // capped at this number.
 const OM_FILE_CONCURRENCY = 4;
 
-// Cap each domain's warm at +72 h from the reference_time. Most kiters don't
+// Cap each domain's warm at +N h from the reference_time. Most kiters don't
 // look beyond that horizon; shaving longer-range files cuts R2 writes + storage.
 // Models with shorter horizons (HRRR ~18 h) naturally stay under this cap.
-const MAX_HORIZON_HOURS = 72;
+// Global models (GFS, ECMWF, ICON) get a longer 5-day horizon since they're
+// the ones users reach for when planning further out.
+const DEFAULT_HORIZON_HOURS = 72;
+const EXTENDED_HORIZON_HOURS = 5 * 24;
+const EXTENDED_HORIZON_DOMAINS = new Set([
+	'ncep_gfs013',
+	'ncep_gfs025',
+	'ecmwf_ifs025',
+	'dwd_icon',
+	'dwd_icon_d2'
+]);
+const horizonHoursFor = (domain: string): number =>
+	EXTENDED_HORIZON_DOMAINS.has(domain) ? EXTENDED_HORIZON_HOURS : DEFAULT_HORIZON_HOURS;
 
 // Keep this many previous runs on R2 in addition to the current run. Protects
 // long-open tabs: a client that loaded before a run swap keeps the old runPath
@@ -336,10 +348,11 @@ const warmDomainInner = async (
 			};
 		}
 
-		// Cap at +72 h from reference_time. Kiters almost never look beyond that;
+		// Cap from reference_time. Kiters almost never look beyond that;
 		// shorter-horizon models (HRRR 18 h) naturally land under the cap.
+		// Global models (GFS/ECMWF/ICON) get the longer 5-day cap.
 		const refTimeMs = new Date(upstream.reference_time).getTime();
-		const cutoffMs = refTimeMs + MAX_HORIZON_HOURS * 3600 * 1000;
+		const cutoffMs = refTimeMs + horizonHoursFor(domain) * 3600 * 1000;
 		const cappedValidTimes = meta.valid_times.filter(
 			(iso) => new Date(iso).getTime() <= cutoffMs
 		);

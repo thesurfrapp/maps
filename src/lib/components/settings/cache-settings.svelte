@@ -8,7 +8,7 @@
 	import { cacheBlockSizeKb, cacheMaxBytesMb } from '$lib/stores/om-protocol-settings';
 	import { domain } from '$lib/stores/variables';
 
-	import { popWarmProgress, warmCurrentPoP } from '$lib/pop-warm';
+	import { popWarmProgress, warmCurrentPoP, warmHorizonHoursFor } from '$lib/pop-warm';
 
 	import Button from '$lib/components/ui/button/button.svelte';
 	import { Input } from '$lib/components/ui/input';
@@ -16,6 +16,8 @@
 	import * as Select from '$lib/components/ui/select';
 
 	const triggerManualWarm = () => warmCurrentPoP(get(domain));
+
+	const warmHorizonHours = $derived(warmHorizonHoursFor($domain));
 
 	const blockSizeOptions = [
 		{ value: '16', label: '16 KiB' },
@@ -86,8 +88,8 @@
 		<div class="mt-2 flex flex-col gap-1">
 			<Label class="text-xs text-muted-foreground">
 				Warm this PoP for the current domain (fires 1-byte range requests so CF
-				pre-caches the next 72 h of .om files at your local edge). Also runs
-				automatically on model switch.
+				pre-caches the next {warmHorizonHours} h of .om files at your local edge). Also
+				runs automatically on model switch.
 			</Label>
 			<Button
 				class="cursor-pointer self-start"
@@ -95,7 +97,7 @@
 				onclick={triggerManualWarm}
 			>
 				{#if $popWarmProgress.status === 'idle'}
-					Warm this PoP (72 h)
+					Warm this PoP ({warmHorizonHours} h)
 				{:else if $popWarmProgress.status === 'running'}
 					Warming… {$popWarmProgress.done}/{$popWarmProgress.total}
 				{:else if $popWarmProgress.status === 'done'}

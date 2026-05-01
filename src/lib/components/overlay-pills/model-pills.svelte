@@ -24,7 +24,6 @@
 		{ value: 'cmc_gem_hrdps', label: 'GEM HRDPS 2.5km' },
 		{ value: 'ncep_hrrr_conus', label: 'HRRR 3km' },
 		{ value: 'knmi_harmonie_arome_europe', label: 'HARMONIE 5.5km' },
-		{ value: 'dwd_icon_eu', label: 'ICON-EU 7km' },
 		{ value: 'ecmwf_ifs025', label: 'ECMWF 9km' },
 		{ value: 'dwd_icon', label: 'ICON 11km' },
 		{ value: 'gfs', label: 'GFS 13km' }

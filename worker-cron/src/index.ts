@@ -30,7 +30,6 @@ const DOMAINS = [
 	'cmc_gem_hrdps',
 	'ncep_hrrr_conus',
 	'knmi_harmonie_arome_europe',
-	'dwd_icon_eu',
 	'ecmwf_ifs025',
 	'dwd_icon',
 	'ncep_gfs013',

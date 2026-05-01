@@ -16,7 +16,6 @@ export const WARMED_DOMAINS: readonly string[] = [
 	'cmc_gem_hrdps',
 	'ncep_hrrr_conus',
 	'knmi_harmonie_arome_europe',
-	'dwd_icon_eu',
 	'ecmwf_ifs025',
 	'dwd_icon',
 	// GFS splits wind/rain (013) from gusts (025) — frontend handles both.
