@@ -67,7 +67,7 @@
 		top: 120px;
 		left: 50%;
 		transform: translateX(-50%);
-		z-index: 100;
+		z-index: 110;
 		background: rgba(20, 20, 28, 0.85);
 		backdrop-filter: blur(8px);
 		-webkit-backdrop-filter: blur(8px);
