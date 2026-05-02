@@ -15,6 +15,12 @@
 // old-run edge entries simply age out at the 30 d Cache Rule TTL. No CF
 // cache purge is needed — this worker does not talk to the Cloudflare API.
 
+import { rewarmDomain, type RewarmResult } from './purge';
+
+type Env = {
+	REWARMER: { fetch(request: Request): Promise<Response> };
+};
+
 const WARMER_BASE = 'https://maps.thesurfr.app/tiles/_warmer-trigger';
 
 // Keep in sync with `functions/lib/domains.ts`. Drift is self-healing: any
@@ -46,9 +52,19 @@ type DomainOutcome = {
 	ms: number;
 	warmerStatus?: string;
 	bodyHead: string;
+	rewarm?: RewarmResult;
 };
 
-type AnyWarmerResult = { domain: string; status: string };
+// Subset of `DomainResult` from `functions/lib/warmer.ts` that we care
+// about for the CR-rewarm dispatch. The 'warmed' branch carries
+// referenceTime + validTimes — the inputs we need to rebuild the client-
+// facing URLs and fire `cf.cacheEverything` GETs against them.
+type AnyWarmerResult = {
+	domain: string;
+	status: string;
+	referenceTime?: string;
+	validTimes?: string[];
+};
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -61,7 +77,24 @@ const parseWarmerBody = (body: string): AnyWarmerResult[] => {
 	}
 };
 
-const runTick = async (): Promise<string> => {
+// Dispatch a CR rewarm for one domain, only if the warmer reported a
+// fresh `warmed` status (meaning a new run was just pulled into R2).
+// Subsequent identical-run ticks skip — CR is already populated.
+const maybeRewarm = async (
+	result: AnyWarmerResult | undefined,
+	rewarmer: Env['REWARMER']
+): Promise<RewarmResult | undefined> => {
+	if (!result || result.status !== 'warmed') return undefined;
+	if (!result.referenceTime || !result.validTimes?.length) return undefined;
+	try {
+		return await rewarmDomain(result.domain, result.referenceTime, result.validTimes, rewarmer);
+	} catch (err) {
+		console.warn('[rewarm] threw', result.domain, String(err));
+		return undefined;
+	}
+};
+
+const runTick = async (env: Env): Promise<string> => {
 	const tStart = Date.now();
 	const outcomes: DomainOutcome[] = [];
 	for (const domain of DOMAINS) {
@@ -70,12 +103,14 @@ const runTick = async (): Promise<string> => {
 			const res = await fetch(`${WARMER_BASE}?domain=${domain}&wait=1`, { method: 'GET' });
 			const body = await res.text();
 			const result = parseWarmerBody(body).find((r) => r.domain === domain);
+			const rewarm = await maybeRewarm(result, env.REWARMER);
 			outcomes.push({
 				domain,
 				status: res.status,
 				ms: Date.now() - t0,
 				warmerStatus: result?.status,
-				bodyHead: body.slice(0, 400)
+				bodyHead: body.slice(0, 400),
+				rewarm
 			});
 		} catch (err) {
 			outcomes.push({ domain, status: -1, ms: Date.now() - t0, bodyHead: String(err) });
@@ -94,18 +129,20 @@ const runTick = async (): Promise<string> => {
 	);
 };
 
-const runOneDomain = async (domain: string): Promise<string> => {
+const runOneDomain = async (domain: string, env: Env): Promise<string> => {
 	const t0 = Date.now();
 	const res = await fetch(`${WARMER_BASE}?domain=${domain}&wait=1&force=1`, { method: 'GET' });
 	const body = await res.text();
 	const result = parseWarmerBody(body).find((r) => r.domain === domain);
+	const rewarm = await maybeRewarm(result, env.REWARMER);
 	return JSON.stringify(
 		{
 			domain,
 			status: res.status,
 			ms: Date.now() - t0,
 			warmerStatus: result?.status,
-			bodyHead: body.slice(0, 400)
+			bodyHead: body.slice(0, 400),
+			rewarm
 		},
 		null,
 		2
@@ -113,9 +150,9 @@ const runOneDomain = async (domain: string): Promise<string> => {
 };
 
 export default {
-	async scheduled(_event: ScheduledEvent, _env: unknown, ctx: ExecutionContext): Promise<void> {
+	async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
 		ctx.waitUntil(
-			runTick()
+			runTick(env)
 				.then((out) => console.log('[cron] tick complete', out))
 				.catch((err) => console.error('[cron] tick failed', err))
 		);
@@ -126,7 +163,7 @@ export default {
 	//   GET /force?domain=X → re-run the warmer for ONE domain, even if its
 	//                         reference_time already matches our R2. Used for
 	//                         bootstrap and manual recovery.
-	async fetch(request: Request): Promise<Response> {
+	async fetch(request: Request, env: Env): Promise<Response> {
 		const url = new URL(request.url);
 		if (url.pathname === '/force') {
 			const domain = url.searchParams.get('domain');
@@ -136,12 +173,12 @@ export default {
 					{ status: 400, headers: { 'Content-Type': 'application/json' } }
 				);
 			}
-			const out = await runOneDomain(domain);
+			const out = await runOneDomain(domain, env);
 			return new Response(out, {
 				headers: { 'Content-Type': 'application/json; charset=utf-8' }
 			});
 		}
-		const out = await runTick();
+		const out = await runTick(env);
 		return new Response(out, { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
 	}
 };

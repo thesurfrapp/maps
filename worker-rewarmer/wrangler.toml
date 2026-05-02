@@ -1,0 +1,19 @@
+name = "surfr-tile-rewarmer"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+# Companion worker to `worker-cron`. Its only job: on GET /rewarm?url=X, do
+# a single full-file fetch with cf.cacheEverything so CF fills edge cache
+# + Cache Reserve. Lives as a separate Worker (not a /rewarm-one route on
+# the cron worker itself) because same-Worker self-fetch loops are blocked
+# by CF — a distinct Worker works, a self-call doesn't.
+#
+# Each request here = a fresh Worker invocation with its own 30s CPU
+# budget. The cron worker dispatches one HTTP call per URL via the service
+# binding `REWARMER`; bytes are drained in this worker's invocation. That
+# lets us populate Cache Reserve for the 168 MB × 73-file dwd_icon domain
+# which would otherwise bust a single invocation's CPU budget.
+
+[observability.logs]
+enabled = true
+invocation_logs = true

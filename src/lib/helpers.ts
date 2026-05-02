@@ -11,12 +11,13 @@ export const fmtModelRun = (modelRun: Date): string =>
 export const fmtSelectedTime = (t: Date): string =>
 	`${t.getUTCFullYear()}-${pad(t.getUTCMonth() + 1)}-${pad(t.getUTCDate())}T${pad(t.getUTCHours())}${pad(t.getUTCMinutes())}`;
 
-// All tile/json requests go through our own Cloudflare Pages Function proxy
-// (functions/tiles/[[path]].ts) which edge-caches .om files for 30 days. This
-// cuts first-byte latency from ~10s (Open-Meteo's CDN cold miss) to edge speeds
-// once the file is cached, and reduces load on Open-Meteo's origin.
-// Same URL works in dev (localhost reaches public proxy) and prod.
-export const getBaseUri = (_domainValue: string): string => 'https://maps.thesurfr.app/tiles';
+// All tile/json requests go through a standalone Cloudflare Worker on
+// `tiles.thesurfr.app` (worker-tiles/), which serves R2-backed `.om` files.
+// Workers on a custom domain run directly on the zone — no Pages
+// Orange-to-Orange hop — which is what lets Cache Reserve actually populate
+// and serve, eliminating the cross-PoP first-hit penalty (~1.5-6 s → ~150-300 ms).
+// Same URL works in dev (localhost reaches public worker) and prod.
+export const getBaseUri = (_domainValue: string): string => 'https://tiles.thesurfr.app';
 
 export const hashValue = (val: string): string => {
 	// FNV-1a 32-bit – synchronous, fast, and sufficient for cache-busting keys.

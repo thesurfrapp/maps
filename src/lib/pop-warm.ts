@@ -1,8 +1,13 @@
-// Client-side per-PoP cache warm. Fires 1-byte Range requests for the
-// horizon of .om URLs of the given domain so CF's cache-on-range
-// behaviour pulls each full file into the local PoP's edge cache.
-// Subsequent scrubs inside that window serve from local edge
-// (~100 ms) instead of first-hit origin path (up to several seconds).
+// Client-side per-PoP cache warm. For each .om URL in the horizon, fires a
+// single suffix-syntax tail Range request — `Range: bytes=-1` — which asks
+// for just the last byte of the file. The act of CF having to satisfy a
+// "back of file" range is what nudges the edge cache into a full-file fill,
+// turning later scrub fetches from `age: 0` regional→edge fills into true
+// `age > 0` edge HITs.
+//
+// Suffix syntax requires server-side support — see `parseRange` in
+// `functions/tiles/[[path]].ts`, which forwards suffix to R2 via
+// `{ range: { suffix: N } }`.
 //
 // Invoked automatically on domain switch in `+page.svelte`; also available
 // as a manual "Warm this PoP" button in the Settings sheet.
@@ -24,17 +29,28 @@ const EXTENDED_WARM_DOMAINS = new Set([
 export const warmHorizonHoursFor = (domain: string): number =>
 	EXTENDED_WARM_DOMAINS.has(domain) ? EXTENDED_WARM_HORIZON_HOURS : DEFAULT_WARM_HORIZON_HOURS;
 const WARM_CONCURRENCY = 4;
-const META_BASE = 'https://maps.thesurfr.app/tiles/data_spatial';
+const META_BASE = 'https://tiles.thesurfr.app/data_spatial';
 
-// Adaptive walk tuning. Probe every Nth file sequentially; if response is fast
-// (PoP edge cache hit) trust the (N-1) skipped neighbors are also warm and keep
-// stepping. The first slow probe flips us into dense mode — 1-by-1 from there,
-// in parallel — and backfills the just-skipped neighbors (they sit next to a
-// known-cold probe so they're likely cold too).
+// Tail probe size. Just enough bytes to make CF actually treat this as a
+// distinct range request that needs the back-of-file region in edge cache.
+// Empirically, 1 byte appears sufficient — the act of requesting the tail
+// matters more than the size.
+const TAIL_PROBE_BYTES = 1;
+
+// Sparse-walk step. On a probe whose response shows the file is already
+// fully populated at this PoP edge, we trust the next (SPARSE_STEP-1)
+// neighbors are also warm and skip them. The first cold probe flips us into
+// dense mode for the remainder.
 const SPARSE_STEP = 5;
-// CF edge hit ≈ 50–200 ms; cold R2/origin fetch ≈ 500–2000 ms. 500 ms gives
-// margin above warm hits while staying well below cold misses.
-const FAST_PROBE_MS = 500;
+
+// Threshold for "this file's edge entry is already populated at this PoP."
+// Reads the `Age` response header. `cf-cache-status: HIT` with `age: 0`
+// means a fresh regional→edge fill — i.e. this PoP didn't actually have it
+// locally yet. `age >= MIN_WARM_AGE_SEC` means a real, settled edge entry.
+// 2 seconds is small enough that a recent warm cycle still counts as warm,
+// big enough to filter out fresh regional→edge fills (which always show
+// `age: 0`).
+const MIN_WARM_AGE_SEC = 2;
 
 export type PopWarmState = {
 	status: 'idle' | 'running' | 'done' | 'failed';
@@ -122,37 +138,51 @@ export const warmCurrentPoP = async (domain: string): Promise<void> => {
 
 		const probeOne = async (
 			iso: string
-		): Promise<{ ok: boolean; elapsedMs: number; aborted: boolean }> => {
+		): Promise<{ ok: boolean; isWarm: boolean; aborted: boolean }> => {
 			const url = `${META_BASE}/${domain}/${runPath}/${fmtValidTime(iso)}.om`;
-			const t0 = performance.now();
 			try {
 				const res = await fetch(url, {
 					method: 'GET',
-					headers: { Range: 'bytes=0-0' },
+					headers: { Range: `bytes=-${TAIL_PROBE_BYTES}` },
 					signal
 				});
 				await res.body?.cancel().catch(() => {});
-				return { ok: res.ok, elapsedMs: performance.now() - t0, aborted: false };
+				if (!res.ok) {
+					return { ok: false, isWarm: false, aborted: false };
+				}
+				// Age header is exposed via the Pages Function's CORS list.
+				// `cf-cache-status: HIT` + `age >= MIN_WARM_AGE_SEC` means
+				// the edge has settled this object — neighbors warmed in the
+				// same prior cycle are very likely also settled.
+				const cfCacheStatus = res.headers.get('cf-cache-status') ?? '';
+				const ageHeader = res.headers.get('age');
+				const ageSec = ageHeader ? parseInt(ageHeader, 10) : 0;
+				const isWarm =
+					cfCacheStatus.toUpperCase() === 'HIT' &&
+					Number.isFinite(ageSec) &&
+					ageSec >= MIN_WARM_AGE_SEC;
+				return { ok: true, isWarm, aborted: false };
 			} catch (err) {
 				if ((err as { name?: string } | undefined)?.name === 'AbortError') {
-					return { ok: false, elapsedMs: performance.now() - t0, aborted: true };
+					return { ok: false, isWarm: false, aborted: true };
 				}
-				return { ok: false, elapsedMs: performance.now() - t0, aborted: false };
+				return { ok: false, isWarm: false, aborted: false };
 			}
 		};
 
 		// Sparse probe phase: walk the timeline serially with step=SPARSE_STEP.
-		// A fast hit on index i lets us trust [i+1, i+SPARSE_STEP-1] are also
-		// PoP-warm (they were almost certainly fetched alongside i in a prior
-		// warm). On the first slow/failed probe we record `densePivot` and
-		// switch to dense parallel fetching for the remainder.
+		// A response with Age >= MIN_WARM_AGE_SEC means this PoP's edge entry
+		// for the file is settled (not a fresh regional→edge fill). Neighbors
+		// were almost certainly warmed in the same prior cycle, so we trust
+		// them and skip ahead. On the first non-warm probe we record
+		// `densePivot` and switch to dense parallel warming for the remainder.
 		let densePivot = -1;
 		for (let i = 0; i < capped.length; ) {
 			if (signal.aborted) return;
-			const { ok, elapsedMs, aborted } = await probeOne(capped[i]);
+			const { ok, isWarm, aborted } = await probeOne(capped[i]);
 			if (aborted) return;
 
-			if (ok && elapsedMs < FAST_PROBE_MS) {
+			if (ok && isWarm) {
 				const advance = Math.min(SPARSE_STEP, capped.length - i);
 				popWarmProgress.update((s) => ({
 					...s,
@@ -174,8 +204,9 @@ export const warmCurrentPoP = async (domain: string): Promise<void> => {
 
 		if (densePivot >= 0 && !signal.aborted) {
 			// Backfill the up-to-(SPARSE_STEP-1) skipped neighbors before the
-			// pivot — they sit next to a known-cold probe so they're likely cold
-			// too. Then fan out across the rest of the horizon.
+			// pivot — they sit next to a known-cold probe so they're likely
+			// not settled at edge yet. Then fan out across the rest of the
+			// horizon.
 			const backfillBefore: number[] = [];
 			for (let j = Math.max(0, densePivot - SPARSE_STEP + 1); j < densePivot; j++) {
 				backfillBefore.push(j);
@@ -185,8 +216,9 @@ export const warmCurrentPoP = async (domain: string): Promise<void> => {
 				denseAfter.push(j);
 			}
 
-			// Undo the trust-bump for indices we previously claimed as warm but
-			// will now re-fetch (otherwise the dense phase double-counts them).
+			// Undo the trust-bumps for indices we previously claimed as warm
+			// but will now re-fetch (otherwise the dense phase double-counts
+			// them).
 			if (backfillBefore.length > 0) {
 				popWarmProgress.update((s) => ({
 					...s,

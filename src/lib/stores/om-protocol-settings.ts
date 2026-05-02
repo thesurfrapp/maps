@@ -47,15 +47,23 @@ export const cacheMaxBytesMb = persisted('cache-max-bytes-mb', DEFAULT_CACHE_MAX
 
 const initialCustomColorScales = get(customColorScales);
 
-function createBlockCache() {
+// Shared block cache singleton — exported so the per-PoP warm in `pop-warm.ts`
+// can construct its own `WeatherMapLayerFileReader` against the same cache,
+// letting prefetched chunks land where the main renderer's reader will find
+// them.
+let _sharedBlockCache: BrowserBlockCache | undefined;
+export function getSharedBlockCache(): BrowserBlockCache | undefined {
 	if (!browser) return undefined;
-	return new BrowserBlockCache({
+	if (_sharedBlockCache) return _sharedBlockCache;
+	_sharedBlockCache = new BrowserBlockCache({
 		blockSize: get(cacheBlockSizeKb) * 1024 - HTTP_OVERHEAD_BYTES,
 		cacheName: 'open-meteo-maps-cache-v1',
 		memCacheTtlMs: 1000,
 		maxBytes: get(cacheMaxBytesMb) * 1024 * 1024
 	});
+	return _sharedBlockCache;
 }
+const createBlockCache = getSharedBlockCache;
 
 // Variable names that must render with the Surfr wind palette, not the
 // Open-Meteo default. We used to rely on the library's colorScales map

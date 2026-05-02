@@ -8,6 +8,13 @@ compatibility_date = "2025-01-01"
 [triggers]
 crons = ["*/5 * * * *"]
 
+# Service binding to the rewarmer worker. After a successful per-domain
+# warm tick we dispatch one HTTP per validTime through this binding to
+# populate Cache Reserve. See src/purge.ts.
+[[services]]
+binding = "REWARMER"
+service = "surfr-tile-rewarmer"
+
 [observability.logs]
 enabled = true
 invocation_logs = true

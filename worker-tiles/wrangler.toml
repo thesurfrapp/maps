@@ -1,0 +1,19 @@
+name = "surfr-tile-server"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+# R2 binding — same bucket the Pages Function and warmer use.
+[[r2_buckets]]
+binding = "TILE_CACHE"
+bucket_name = "surfr-tile-cache"
+
+# Custom domain. Workers on a custom domain run directly on the zone (no
+# Orange-to-Orange hop), which is what unblocks Cache Reserve. The Pages
+# project keeps `maps.thesurfr.app`; tile-serving moves here.
+[[routes]]
+pattern = "tiles.thesurfr.app"
+custom_domain = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
