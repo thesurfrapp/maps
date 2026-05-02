@@ -129,24 +129,32 @@ const runTick = async (env: Env): Promise<string> => {
 	);
 };
 
-const runOneDomain = async (domain: string, env: Env): Promise<string> => {
+// Returns a tuple: the JSON response body, and an optional pending
+// rewarm promise the caller should hand off to `ctx.waitUntil` so it
+// finishes after the HTTP response is sent.
+const runOneDomain = async (
+	domain: string,
+	env: Env
+): Promise<{ body: string; pendingRewarm: Promise<RewarmResult | undefined> }> => {
 	const t0 = Date.now();
 	const res = await fetch(`${WARMER_BASE}?domain=${domain}&wait=1&force=1`, { method: 'GET' });
 	const body = await res.text();
 	const result = parseWarmerBody(body).find((r) => r.domain === domain);
-	const rewarm = await maybeRewarm(result, env.REWARMER);
-	return JSON.stringify(
+	const pendingRewarm = maybeRewarm(result, env.REWARMER);
+	const responseBody = JSON.stringify(
 		{
 			domain,
 			status: res.status,
 			ms: Date.now() - t0,
 			warmerStatus: result?.status,
 			bodyHead: body.slice(0, 400),
-			rewarm
+			rewarmDispatched:
+				result?.status === 'warmed' && (result.validTimes?.length ?? 0) > 0
 		},
 		null,
 		2
 	);
+	return { body: responseBody, pendingRewarm };
 };
 
 export default {
@@ -163,7 +171,7 @@ export default {
 	//   GET /force?domain=X → re-run the warmer for ONE domain, even if its
 	//                         reference_time already matches our R2. Used for
 	//                         bootstrap and manual recovery.
-	async fetch(request: Request, env: Env): Promise<Response> {
+	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 		if (url.pathname === '/force') {
 			const domain = url.searchParams.get('domain');
@@ -173,8 +181,14 @@ export default {
 					{ status: 400, headers: { 'Content-Type': 'application/json' } }
 				);
 			}
-			const out = await runOneDomain(domain, env);
-			return new Response(out, {
+			// Hand the pending rewarm promise off to waitUntil so it survives
+			// past the HTTP response. Big domains (dwd_icon, gfs025) take
+			// 5-10 min to fully populate Cache Reserve — the response goes
+			// out as soon as the warm completes (~1-3 min) and the rewarm
+			// finishes in the background.
+			const { body, pendingRewarm } = await runOneDomain(domain, env);
+			ctx.waitUntil(pendingRewarm.catch((err) => console.warn('[force] rewarm failed', err)));
+			return new Response(body, {
 				headers: { 'Content-Type': 'application/json; charset=utf-8' }
 			});
 		}

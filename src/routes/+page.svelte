@@ -323,10 +323,13 @@
 		}
 
 		changeOMfileURL();
-		// Fire the per-PoP cache warm for this domain's 72 h of .om URLs.
-		// Fire-and-forget: the warm runs in the background while the first
-		// scrub renders from R2, and subsequent scrubs hit the now-warm edge.
-		void warmCurrentPoP(newDomain);
+		// Per-PoP cache warm disabled. Once Cache Reserve is populated by the
+		// cron-worker rewarm cycle (worker-cron/src/purge.ts → worker-rewarmer),
+		// any first-hit at any PoP is served from CR (~150-300 ms) without
+		// needing client-side priming. The previous bytes=-1 walk added little
+		// over CR HITs and made domain-switch noisy with extra requests.
+		// Re-enable if CR ever proves unreliable.
+		// void warmCurrentPoP(newDomain);
 	};
 
 	const domainSubscription = domain.subscribe((newDomain) => {
