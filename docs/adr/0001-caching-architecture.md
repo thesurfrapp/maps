@@ -83,34 +83,90 @@ fresh PoP. Both store the full object — Range requests are sliced on
 serve. T3 is the authoritative origin from the user's perspective; T4
 is touched only when R2 lacks a file (rare; outside-horizon scrubs).
 
-### Topology — four runtimes, each with one job
+### Workers — how they work together
+
+Four runtimes, each with a single, narrow job. Diagram first, then the
+choreography:
 
 ```
-maps.thesurfr.app  ──► Pages           SvelteKit frontend
-                                       /tiles/_warmer-trigger    (cron HTTP entry)
-                                       /tiles/_admin             (dashboard)
-                                       /tiles/_debug/cache       (JSON inventory)
-
-tiles.thesurfr.app ──► worker-tiles    .om Range serving
-                                       latest.json
-                                       Explicit caches.default.put
-
-worker-cron        ──► CF Worker       Every 5 min: per-domain warm dispatch
-                                       After warmed: rewarm dispatch
-                                       HTTP /force?domain=X (manual recovery)
-
-worker-rewarmer    ──► CF Worker       Service-bound from worker-cron only
-                                       1 URL / invocation; full fetch + drain
-                                       Populates T2b (Cache Reserve)
+                    upstream Open-Meteo
+                            ▲
+                            │ source-of-truth fetches (R2 fill)
+                            │
+    ┌───────────────────────┴───────────────────────┐
+    │                                               │
+    │   maps.thesurfr.app  ──► Pages  ──► functions/lib/warmer.ts
+    │                              │           │ ──► R2 writes
+    │   ──► SvelteKit frontend     │           │ ──► returns {warmed | unchanged}
+    │   ──► /tiles/_warmer-trigger ┘           │
+    │   ──► /tiles/_admin                      │
+    │   ──► /tiles/_debug/cache                │
+    │                                          │
+    └────────────────▲─────────────────────────┘
+                     │
+             HTTP    │ ?domain=X&wait=1
+                     │
+   worker-cron  ──► CF Worker  (cron */5 * * * *)
+                          │
+                          │  on status:warmed
+                          ▼
+                       service binding (REWARMER)
+                          │
+   worker-rewarmer  ◄────┘  (one URL per invocation,
+                              cf.cacheEverything full GET,
+                              pipeTo(WritableStream) drain)
+                              │
+                              ▼
+                              │ HTTP request ─────►   ┌────────────────────────┐
+                                                      │  tiles.thesurfr.app    │
+                                                      │  worker-tiles          │
+                                  client browsers ──► │  R2 reads              │
+                                                      │  Explicit              │
+                                                      │  caches.default.put    │
+                                                      └─────────┬──────────────┘
+                                                                ▼
+                                                              R2 (TILE_CACHE)
+                                                              + CF cache layers
+                                                                (T2a + T2b)
 ```
 
 | Runtime | Where | Trigger | Job |
 |---|---|---|---|
 | Pages frontend | `maps.thesurfr.app` (Pages) | HTTP | SvelteKit UI |
-| Pages Function | `maps.thesurfr.app/tiles/*` (Pages) | HTTP | Admin endpoints (`_warmer-trigger`, `_admin`, `_debug`) |
+| Pages Function | `maps.thesurfr.app/tiles/*` (Pages) | HTTP | Admin endpoints (`_warmer-trigger`, `_admin`, `_debug`); R2 fill via warmer.ts |
 | `worker-tiles` | CF Worker on `tiles.thesurfr.app` (Custom Domain) | HTTP | R2-backed `.om` + `latest.json` serving with Cache API write-through |
-| `worker-cron` | CF Worker | `*/5 * * * *` cron + HTTP | Per-domain warm dispatch + rewarm dispatch |
-| `worker-rewarmer` | CF Worker | service binding from cron | One URL, full fetch, body drain |
+| `worker-cron` | CF Worker | `*/5 * * * *` cron + HTTP `/force` | Drives the 5-min poll loop; on `warmed`, dispatches rewarm |
+| `worker-rewarmer` | CF Worker | service binding from cron only | One URL per invocation; full fetch + drain to populate T2b |
+
+**Choreography** (5-minute cycle, per-domain):
+
+1. **`worker-cron`** wakes (`*/5 * * * *`) and walks the 13 domains
+   sequentially with a 1.5 s pause between each.
+2. For each domain, it hits the **Pages Function**
+   `maps.thesurfr.app/tiles/_warmer-trigger?domain=X&wait=1`.
+3. The Pages Function (`functions/lib/warmer.ts:warmDomain`) is the
+   **only place that talks to upstream Open-Meteo**. It fetches
+   upstream `latest.json`, compares against R2, and either returns
+   `unchanged` (most ticks) or runs the full Stage 1 R2 fill.
+4. On `unchanged`, `worker-cron` moves on. No further work.
+5. On `warmed`, `worker-cron` dispatches Stage 2 — the Cache Reserve
+   populate — by service-binding into `worker-rewarmer` once per
+   validTime URL (concurrency 4).
+6. **`worker-rewarmer`** has one job per invocation: fetch one URL
+   from `tiles.thesurfr.app` with `cf.cacheEverything`, drain the
+   body, return a small JSON outcome. Each invocation gets its own
+   30 s CPU budget — that's how we drain the 168 MB ICON-Global files.
+7. When the rewarmer hits `tiles.thesurfr.app`, the request goes
+   through CF edge → `worker-tiles` → R2. `worker-tiles` returns the
+   full file; CF caches it per the Cache Rule (T2a + T2b populate).
+   On the rewarmer's PoP, T2a fills locally; CR (T2b) propagates
+   globally so any other PoP can serve from CR on first hit.
+
+The Pages Function and `worker-tiles` both talk to R2 but with different
+intent: the Pages Function is the **writer** (warmer.ts streams from
+upstream into R2); `worker-tiles` is the **reader** (range or full reads
+out of R2 to serve clients). They share the same R2 binding name
+(`TILE_CACHE`) and bucket (`surfr-tile-cache`).
 
 ### Why a separate Worker for tile-serving
 

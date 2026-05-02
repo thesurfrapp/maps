@@ -13,7 +13,6 @@
 	import { latest, modelRun, now, time } from '$lib/stores/time';
 	import { selectedDomain } from '$lib/stores/variables';
 
-	import PrefetchButton from '$lib/components/time/prefetch-button.svelte';
 	import * as Select from '$lib/components/ui/select';
 
 	import {

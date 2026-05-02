@@ -35,7 +35,6 @@
 	import Spinner from '$lib/components/loading/spinner.svelte';
 	import ModelPills from '$lib/components/overlay-pills/model-pills.svelte';
 	import OverlayPills from '$lib/components/overlay-pills/overlay-pills.svelte';
-	import PopWarmToast from '$lib/components/pop-warm-toast.svelte';
 	import RunDateLabel from '$lib/components/run-date-label.svelte';
 	import Settings from '$lib/components/settings/settings.svelte';
 	import TimeSelector from '$lib/components/time/time-selector.svelte';
@@ -50,7 +49,6 @@
 	import { installRnBridge, isAdmin, isEmbedMode } from '$lib/rn-bridge';
 	import { addTerrainSource, getStyle, setMapControlSettings } from '$lib/map-controls';
 	import { getInitialMetaData, getMetaData, matchVariableOrFirst } from '$lib/metadata';
-	import { warmCurrentPoP } from '$lib/pop-warm';
 	import { addPopup } from '$lib/popup';
 	import { formatISOWithoutTimezone } from '$lib/time-format';
 	import { findTimeStep } from '$lib/time-utils';
@@ -323,13 +321,8 @@
 		}
 
 		changeOMfileURL();
-		// Per-PoP cache warm disabled. Once Cache Reserve is populated by the
-		// cron-worker rewarm cycle (worker-cron/src/purge.ts → worker-rewarmer),
-		// any first-hit at any PoP is served from CR (~150-300 ms) without
-		// needing client-side priming. The previous bytes=-1 walk added little
-		// over CR HITs and made domain-switch noisy with extra requests.
-		// Re-enable if CR ever proves unreliable.
-		// void warmCurrentPoP(newDomain);
+		// Client-side per-PoP warm fully removed in favor of server-side
+		// Cache Reserve populate (worker-rewarmer). See ADR 0001.
 	};
 
 	const domainSubscription = domain.subscribe((newDomain) => {
@@ -388,15 +381,10 @@
 	<Settings />
 {/if}
 
-<!-- Also rendered in embed so the RN WebView shows the cache-warm progress
-     toast on domain switch — useful debugging feedback for the user. -->
-<PopWarmToast />
-
 <!-- Debug label showing the current run date + selected time + active
      domain/variable. Admin-only in BOTH modes — gated on the `admin` flag
      (set via `?admin=1`). On standalone web, append `?admin=1` to see it;
-     in embed, RN only forwards admin=1 when global.isadmin is true. Same
-     120px top as the pop-warm toast — toast overlays it while warming. -->
+     in embed, RN only forwards admin=1 when global.isadmin is true. -->
 {#if admin}
 	<RunDateLabel />
 {/if}
