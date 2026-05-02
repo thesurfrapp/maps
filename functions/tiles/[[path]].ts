@@ -52,27 +52,43 @@ const corsHeaders = {
 	'Access-Control-Max-Age': '3000'
 };
 
-// Parse "bytes=start-end" → { offset, length } for R2 `get` range option.
-const parseRange = (
-	value: string
-): { offset: number; length: number; end: number } | null => {
-	const match = /^bytes=(\d+)-(\d*)$/.exec(value.trim());
+// Parse a Range header. Returns either an absolute range
+// (`bytes=N-M` / `bytes=N-`) or a suffix range (`bytes=-N` = "last N bytes").
+// R2's `get` accepts both forms, so we keep them distinct rather than
+// resolving suffix→absolute up front (we'd need totalSize to do that).
+type ParsedRange =
+	| { kind: 'absolute'; offset: number; length: number; end: number }
+	| { kind: 'suffix'; suffix: number };
+const parseRange = (value: string): ParsedRange | null => {
+	const trimmed = value.trim();
+	const suffix = /^bytes=-(\d+)$/.exec(trimmed);
+	if (suffix) {
+		const n = Number(suffix[1]);
+		if (!Number.isFinite(n) || n <= 0) return null;
+		return { kind: 'suffix', suffix: n };
+	}
+	const match = /^bytes=(\d+)-(\d*)$/.exec(trimmed);
 	if (!match) return null;
 	const offset = Number(match[1]);
 	if (!Number.isFinite(offset)) return null;
 	if (match[2] === '') {
-		return { offset, length: Number.MAX_SAFE_INTEGER, end: Number.MAX_SAFE_INTEGER };
+		return {
+			kind: 'absolute',
+			offset,
+			length: Number.MAX_SAFE_INTEGER,
+			end: Number.MAX_SAFE_INTEGER
+		};
 	}
 	const end = Number(match[2]);
 	if (!Number.isFinite(end) || end < offset) return null;
-	return { offset, length: end - offset + 1, end };
+	return { kind: 'absolute', offset, length: end - offset + 1, end };
 };
 
 // Build a Response from an R2 object body. Handles Range (206) vs full (200).
 // URLs include the run-path so `.om` bytes are immutable — safe to mark so.
 const r2ToResponse = (
 	r2Obj: R2ObjectBody,
-	rangeReq: { offset: number; end: number } | null,
+	rangeReq: ParsedRange | null,
 	totalSize: number,
 	cacheStatus: string
 ): Response => {
@@ -88,9 +104,17 @@ const r2ToResponse = (
 	if (r2Obj.httpEtag) headers.set('ETag', r2Obj.httpEtag);
 
 	if (rangeReq) {
-		const effectiveEnd = Math.min(rangeReq.end, totalSize - 1);
-		const length = effectiveEnd - rangeReq.offset + 1;
-		headers.set('Content-Range', `bytes ${rangeReq.offset}-${effectiveEnd}/${totalSize}`);
+		let start: number;
+		let end: number;
+		if (rangeReq.kind === 'suffix') {
+			start = Math.max(0, totalSize - rangeReq.suffix);
+			end = totalSize - 1;
+		} else {
+			start = rangeReq.offset;
+			end = Math.min(rangeReq.end, totalSize - 1);
+		}
+		const length = end - start + 1;
+		headers.set('Content-Range', `bytes ${start}-${end}/${totalSize}`);
 		headers.set('Content-Length', String(length));
 		return new Response(r2Obj.body, { status: 206, headers });
 	}
@@ -300,10 +324,12 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 	// reads before they ever reach here. This path is the safety net.
 	if (r2Eligible) {
 		try {
-			const r2Obj = await env.TILE_CACHE.get(
-				r2Key,
-				range ? { range: { offset: range.offset, length: range.length } } : undefined
-			);
+			const r2Range = range
+				? range.kind === 'suffix'
+					? { range: { suffix: range.suffix } }
+					: { range: { offset: range.offset, length: range.length } }
+				: undefined;
+			const r2Obj = await env.TILE_CACHE.get(r2Key, r2Range);
 			if (r2Obj) {
 				return r2ToResponse(r2Obj, range, r2Obj.size, 'HIT-R2');
 			}
