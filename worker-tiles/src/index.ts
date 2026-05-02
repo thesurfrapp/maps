@@ -113,6 +113,50 @@ const r2ToResponse = (
 	return new Response(r2Obj.body, { status: 200, headers });
 };
 
+// Slice a cached full-object response by a requested Range. The Cache API
+// stores the FULL 200 response; on a hit, we either return it as-is or
+// slice it down to the requested byte range and re-package as 206. Reads
+// the body fully into memory — fine for our .om files (max ~170 MB) which
+// fit within Worker memory bounds.
+const sliceCachedFull = async (
+	cached: Response,
+	range: ParsedRange | null
+): Promise<Response> => {
+	const totalSize = Number(cached.headers.get('Content-Length') ?? '0');
+	if (!range || !cached.body || totalSize <= 0) {
+		const headers = new Headers(cached.headers);
+		headers.set(CACHE_STATUS_HEADER, 'HIT-EDGE');
+		return new Response(cached.body, {
+			status: cached.status,
+			statusText: cached.statusText,
+			headers
+		});
+	}
+	let start: number;
+	let end: number;
+	if (range.kind === 'suffix') {
+		start = Math.max(0, totalSize - range.suffix);
+		end = totalSize - 1;
+	} else {
+		start = range.offset;
+		end = Math.min(range.end, totalSize - 1);
+	}
+	const length = end - start + 1;
+	const fullBytes = new Uint8Array(await new Response(cached.body).arrayBuffer());
+	const sliced = fullBytes.subarray(start, end + 1);
+	const headers = new Headers();
+	for (const [k, v] of Object.entries(corsHeaders)) headers.set(k, v);
+	headers.set('Content-Type', cached.headers.get('Content-Type') ?? 'application/octet-stream');
+	headers.set('Cache-Control', cached.headers.get('Cache-Control') ?? `public, max-age=${OM_FILE_TTL}, immutable`);
+	headers.set(CACHE_STATUS_HEADER, 'HIT-EDGE');
+	headers.set('Accept-Ranges', 'bytes');
+	const etag = cached.headers.get('ETag');
+	if (etag) headers.set('ETag', etag);
+	headers.set('Content-Range', `bytes ${start}-${end}/${totalSize}`);
+	headers.set('Content-Length', String(length));
+	return new Response(sliced, { status: 206, headers });
+};
+
 // Background fill: fetch full file from origin (no Range) and put into R2.
 // Called via waitUntil after an R2-miss on an .om request.
 const warmR2 = async (env: Env, r2Key: string, upstreamUrl: string): Promise<void> => {
@@ -207,27 +251,81 @@ export default {
 		const r2Key = rawPath.replace(/^\//, '');
 		const r2Eligible = R2_OM_CACHEABLE(rawPath);
 
+		// Cache key is range-stripped — we always store the FULL object
+		// under the URL so a single cache entry can satisfy any range.
+		const cacheKey = new Request(`${url.origin}${url.pathname}`, { method: 'GET' });
+
 		if (forceRefresh) {
 			if (r2Eligible) {
 				await env.TILE_CACHE.delete(r2Key).catch(() => {});
 			}
+			await caches.default.delete(cacheKey).catch(() => {});
 			await caches.default.delete(upstreamUrl).catch(() => {});
 		}
 
 		const rangeHeader = request.headers.get('Range');
 		const range = rangeHeader ? parseRange(rangeHeader) : null;
 
+		// TIER 1: explicit Cache API check. Workers on a Custom Domain don't
+		// reliably auto-cache via Cache Rules alone — empirically CF
+		// bypasses the cache layer for Worker responses unless we put them
+		// in via caches.default ourselves. Cache Rules + Cache Reserve
+		// eligibility apply on the put, not on the response stream.
+		if (r2Eligible && !forceRefresh) {
+			try {
+				const cached = await caches.default.match(cacheKey);
+				if (cached) {
+					// Slice the cached full body if a Range was requested.
+					return await sliceCachedFull(cached, range);
+				}
+			} catch (err) {
+				console.warn('[cache-match] failed', err);
+			}
+		}
+
 		// TIER 2: R2.
+		// Range request: read partial, return 206. Don't cache partials —
+		// CR can only serve from full-object cache entries. The cron
+		// rewarmer fires non-Range fetches that hit the path below and
+		// populate the cache; user Range requests then hit Tier 1.
+		// Non-Range request: read full, cache, return.
 		if (r2Eligible) {
 			try {
-				const r2Range = range
-					? range.kind === 'suffix'
-						? { range: { suffix: range.suffix } }
-						: { range: { offset: range.offset, length: range.length } }
-					: undefined;
-				const r2Obj = await env.TILE_CACHE.get(r2Key, r2Range);
-				if (r2Obj) {
-					return r2ToResponse(r2Obj, range, r2Obj.size, 'HIT-R2');
+				if (range) {
+					const r2Range =
+						range.kind === 'suffix'
+							? { range: { suffix: range.suffix } }
+							: { range: { offset: range.offset, length: range.length } };
+					const r2Obj = await env.TILE_CACHE.get(r2Key, r2Range);
+					if (r2Obj) {
+						return r2ToResponse(r2Obj, range, r2Obj.size, 'HIT-R2');
+					}
+				} else {
+					const r2Obj = await env.TILE_CACHE.get(r2Key);
+					if (r2Obj) {
+						const fullResponse = r2ToResponse(r2Obj, null, r2Obj.size, 'HIT-R2');
+						// Tee the body — one stream goes to the cache, one
+						// goes to the client. Without `tee` we can only
+						// consume the body once.
+						if (fullResponse.body) {
+							const [forCache, forClient] = fullResponse.body.tee();
+							const cacheResponse = new Response(forCache, {
+								status: 200,
+								headers: fullResponse.headers
+							});
+							ctx.waitUntil(
+								caches.default
+									.put(cacheKey, cacheResponse)
+									.catch((err) => console.warn('[cache-put] failed', err))
+							);
+							return new Response(forClient, {
+								status: fullResponse.status,
+								statusText: fullResponse.statusText,
+								headers: fullResponse.headers
+							});
+						}
+						return fullResponse;
+					}
 				}
 			} catch (err) {
 				console.warn('[r2-get] failed', r2Key, err);
