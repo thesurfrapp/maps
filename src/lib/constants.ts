@@ -49,11 +49,12 @@ export const DEFAULT_TILE_SIZE = 512;
 export const DEFAULT_OPACITY = 75;
 
 // Cache defaults (in KB and MB for UI display)
-// Bumped from 64 → 192 KB. Each range-GET pulls 3× more data, so the library
-// fires ~3× fewer requests per viewport render. Less HTTP/2 multiplexing
-// contention, less CF-edge cold-miss risk on first-time viewports, and the
-// extra bytes are negligible over modern mobile networks.
-export const DEFAULT_CACHE_BLOCK_SIZE_KB = 192;
+// Bumped 64 → 192 → 512 KB. Each range-GET pulls more data per request,
+// so the library fires fewer requests per viewport render — ~6 round-trips
+// for a world-zoom viewport instead of ~17. Trade-off is a bit more wasted
+// bandwidth at zoom-in (we fetch some bytes the renderer doesn't need),
+// but the round-trip win dominates for users on typical mobile latencies.
+export const DEFAULT_CACHE_BLOCK_SIZE_KB = 512;
 export const DEFAULT_CACHE_MAX_BYTES_MB = 400;
 
 // Measured HTTP/2 overhead per range request (~1342 bytes: HPACK headers + framing).
