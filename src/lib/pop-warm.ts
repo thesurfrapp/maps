@@ -1,47 +1,46 @@
-// Client-side per-PoP cache warm. Fires 1-byte Range requests for the
-// horizon of .om URLs of the given domain so CF's cache-on-range
-// behaviour pulls each full file into the local PoP's edge cache.
-// Subsequent scrubs inside that window serve from local edge
-// (~100 ms) instead of first-hit origin path (up to several seconds).
+// Client-side neighbor warm. On every time change (and on domain/variable
+// change), prefetches the active timestep's neighbors in two tiers:
 //
-// Invoked automatically on domain switch in `+page.svelte`; also available
-// as a manual "Warm this PoP" button in the Settings sheet.
+//   ±1 (DIRECT neighbors)  → FULL prefetch via prefetchVariable.
+//                            Pulls all blocks of the active variable into
+//                            the SHARED browser block cache. When the user
+//                            scrubs prev/next, the renderer finds everything
+//                            decoded and renders instantly from local cache.
 //
-// Horizon must mirror the server-side warmer (functions/lib/warmer.ts) —
-// warming files past the server's cap just hits 404s.
+//   ±2..±NEIGHBOR_RADIUS    → HEAD probe (`Range: bytes=0-0`).
+//   (OUTER neighbors)        Just nudges CF's PoP edge cache via cache-on-
+//                            range — the file lands in the local edge cache
+//                            but no data crosses to the browser. If the user
+//                            scrubs to one of these, the renderer still has
+//                            to fetch real data, but the round-trip is local
+//                            edge (~50 ms) instead of R2 (~300-500 ms).
+//
+// Skip-already-warmed via two Sets so rapid scrubbing doesn't refire. When
+// the user scrubs and a previously-outer file becomes a direct neighbor,
+// we upgrade it from head-probed to full-prefetched.
 
-import { writable } from 'svelte/store';
+import { get, writable } from 'svelte/store';
 
-const DEFAULT_WARM_HORIZON_HOURS = 72;
-const EXTENDED_WARM_HORIZON_HOURS = 5 * 24;
-const EXTENDED_WARM_DOMAINS = new Set([
-	'ncep_gfs013',
-	'ncep_gfs025',
-	'ecmwf_ifs025',
-	'dwd_icon',
-	'dwd_icon_d2'
-]);
-export const warmHorizonHoursFor = (domain: string): number =>
-	EXTENDED_WARM_DOMAINS.has(domain) ? EXTENDED_WARM_HORIZON_HOURS : DEFAULT_WARM_HORIZON_HOURS;
+import { WeatherMapLayerFileReader } from '@openmeteo/weather-map-layer';
+
+import { metaJson, modelRun, time } from '$lib/stores/time';
+import { domain, variable } from '$lib/stores/variables';
+import { omProtocolSettings } from '$lib/stores/om-protocol-settings';
+import { fmtModelRun, fmtSelectedTime, getBaseUri } from '$lib/helpers';
+import { formatISOUTCWithZ } from '$lib/time-format';
+
+// Outer radius — total ±5 neighbors maintained around the active time.
+const NEIGHBOR_RADIUS = 5;
+
+// Inner radius — files within ±DIRECT_RADIUS of active get the full block-
+// cache prefetch. Files outside that but within NEIGHBOR_RADIUS get only
+// the lightweight head probe.
+const DIRECT_RADIUS = 1;
+
+// Shared concurrency across both tiers. Head probes finish in tens of ms
+// so they don't bottleneck full prefetches; whichever worker finishes
+// first picks up the next task in the queue.
 const WARM_CONCURRENCY = 4;
-const META_BASE = 'https://maps.thesurfr.app/tiles/data_spatial';
-
-// Adaptive walk tuning. Probe every Nth file sequentially; if response is fast
-// (PoP edge cache hit) trust the (N-1) skipped neighbors are also warm and keep
-// stepping. The first slow probe flips us into dense mode — 1-by-1 from there,
-// in parallel — and backfills the just-skipped neighbors (they sit next to a
-// known-cold probe so they're likely cold too).
-const SPARSE_STEP = 5;
-// CF edge hit ≈ 50–200 ms; cold R2/origin fetch ≈ 500–2000 ms. 500 ms gives
-// margin above warm hits while staying well below cold misses.
-const FAST_PROBE_MS = 500;
-
-// Probe size — first byte of each file. `Range: bytes=0-0` triggers
-// CF's cache-on-range behavior: the first range request against a
-// cacheable URL pulls the full file into the local PoP edge cache, then
-// serves the requested range out of that cached copy. Subsequent range
-// requests hit edge.
-const HEAD_PROBE_RANGE = 'bytes=0-0';
 
 export type PopWarmState = {
 	status: 'idle' | 'running' | 'done' | 'failed';
@@ -61,174 +60,194 @@ export const popWarmProgress = writable<PopWarmState>({
 	fail: 0
 });
 
-const fmtValidTime = (iso: string): string => {
-	const d = new Date(iso);
-	const pad = (n: number) => String(n).padStart(2, '0');
-	return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}T${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}`;
+// URLs that have been fully prefetched (block cache populated). Strictly
+// stronger than head-probed.
+const warmedFullUrls = new Set<string>();
+
+// URLs that have been head-probed only (CF PoP edge nudged, no data in
+// browser block cache).
+const warmedHeadUrls = new Set<string>();
+
+// Single in-flight controller — every new time change aborts the prior
+// neighbor warm so we don't pile up requests during fast scrubbing.
+let currentController: AbortController | null = null;
+
+const buildOmUrl = (validTime: Date): string | null => {
+	const d = get(domain);
+	const mr = get(modelRun);
+	if (!d || !mr) return null;
+	return `${getBaseUri(d)}/data_spatial/${d}/${fmtModelRun(mr)}/${fmtSelectedTime(validTime)}.om`;
 };
 
-const fmtRunPath = (iso: string): string => {
-	const d = new Date(iso);
-	const pad = (n: number) => String(n).padStart(2, '0');
-	return `${d.getUTCFullYear()}/${pad(d.getUTCMonth() + 1)}/${pad(d.getUTCDate())}/${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}Z`;
+type NeighborTask = { url: string; mode: 'full' | 'head' };
+
+// Build the list of neighbor URLs + their tier from metaJson.valid_times.
+// Skips the active time itself (the renderer is already loading that one).
+// Bounds the window at the meta-json horizon edges (start / end of the run).
+const computeNeighborTasks = (): NeighborTask[] => {
+	const meta = get(metaJson);
+	if (!meta?.valid_times?.length) return [];
+	const currentTime = get(time);
+	if (!currentTime) return [];
+	const dateString = formatISOUTCWithZ(currentTime);
+	const idx = meta.valid_times.findIndex((s: string) => s === dateString);
+	if (idx === -1) return [];
+	const tasks: NeighborTask[] = [];
+	const start = Math.max(0, idx - NEIGHBOR_RADIUS);
+	const end = Math.min(meta.valid_times.length - 1, idx + NEIGHBOR_RADIUS);
+	for (let i = start; i <= end; i++) {
+		if (i === idx) continue;
+		const distance = Math.abs(i - idx);
+		const mode: 'full' | 'head' = distance <= DIRECT_RADIUS ? 'full' : 'head';
+		const vt = new Date(meta.valid_times[i]);
+		const url = buildOmUrl(vt);
+		if (url) tasks.push({ url, mode });
+	}
+	return tasks;
 };
 
-const runBounded = async (
-	items: string[],
-	limit: number,
-	fn: (item: string) => Promise<void>
-): Promise<void> => {
-	let i = 0;
-	const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-		while (true) {
-			const idx = i++;
-			if (idx >= items.length) return;
-			await fn(items[idx]);
-		}
-	});
-	await Promise.all(workers);
-};
-
-// In-flight guard — abort the previous warm when a new domain is selected
-// before the previous one finishes. Prevents HTTP/2 stream buildup on fast
-// domain-switching.
-let inFlightController: AbortController | null = null;
-
-export const warmCurrentPoP = async (domain: string): Promise<void> => {
-	if (!domain) return;
-	if (inFlightController) inFlightController.abort();
-	const controller = new AbortController();
-	inFlightController = controller;
-	const { signal } = controller;
-
+// Clear warmed-set + abort any in-flight warm. Called when the cached
+// content becomes irrelevant — domain or variable change.
+export const resetWarmState = (): void => {
+	warmedFullUrls.clear();
+	warmedHeadUrls.clear();
+	if (currentController) {
+		currentController.abort();
+		currentController = null;
+	}
 	popWarmProgress.set({
-		status: 'running',
-		domain,
+		status: 'idle',
+		domain: get(domain) ?? null,
 		done: 0,
 		total: 0,
 		ok: 0,
 		fail: 0
 	});
+};
 
-	try {
-		const metaRes = await fetch(`${META_BASE}/${domain}/latest.json`, {
-			cache: 'no-store',
-			signal
-		});
-		if (!metaRes.ok) throw new Error(`latest.json ${metaRes.status}`);
-		const meta = (await metaRes.json()) as {
-			reference_time: string;
-			valid_times: string[];
-		};
-		const refMs = new Date(meta.reference_time).getTime();
-		const cutoffMs = refMs + warmHorizonHoursFor(domain) * 3600 * 1000;
-		const capped = meta.valid_times.filter((iso) => new Date(iso).getTime() <= cutoffMs);
-		const runPath = fmtRunPath(meta.reference_time);
+// Returns true if `task` still needs to run given the current warmed-state.
+const needsWarming = (task: NeighborTask): boolean => {
+	if (task.mode === 'full') {
+		// Full mode: only skip if this URL is already fully warmed. A
+		// previously head-probed URL still needs upgrading to full.
+		return !warmedFullUrls.has(task.url);
+	}
+	// Head mode: skip if either tier already covers it. Full is strictly
+	// stronger than head, so a fully-warmed URL doesn't need re-probing.
+	return !warmedFullUrls.has(task.url) && !warmedHeadUrls.has(task.url);
+};
 
-		popWarmProgress.update((s) => ({ ...s, total: capped.length }));
+// Fire prefetch for any unwarmed neighbors of the current time. Idempotent
+// per (URL × tier × session).
+export const warmNeighbors = async (): Promise<void> => {
+	if (typeof window === 'undefined') return;
 
-		const probeOne = async (
-			iso: string
-		): Promise<{ ok: boolean; elapsedMs: number; aborted: boolean }> => {
-			const url = `${META_BASE}/${domain}/${runPath}/${fmtValidTime(iso)}.om`;
-			const t0 = performance.now();
-			try {
-				// Single request: head probe (`bytes=0-0`). 1-byte response,
-				// CF's cache-on-range pulls the full file into local PoP
-				// edge cache as a side effect.
-				const res = await fetch(url, {
-					method: 'GET',
-					headers: { Range: HEAD_PROBE_RANGE },
-					signal
-				});
-				await res.body?.cancel().catch(() => {});
-				return { ok: res.ok, elapsedMs: performance.now() - t0, aborted: false };
-			} catch (err) {
-				if ((err as { name?: string } | undefined)?.name === 'AbortError') {
-					return { ok: false, elapsedMs: performance.now() - t0, aborted: true };
-				}
-				return { ok: false, elapsedMs: performance.now() - t0, aborted: false };
-			}
-		};
+	if (currentController) currentController.abort();
+	const controller = new AbortController();
+	currentController = controller;
+	const { signal } = controller;
 
-		// Sparse probe phase: walk the timeline serially with step=SPARSE_STEP.
-		// A fast hit on index i lets us trust [i+1, i+SPARSE_STEP-1] are also
-		// PoP-warm (they were almost certainly fetched alongside i in a prior
-		// warm). On the first slow/failed probe we record `densePivot` and
-		// switch to dense parallel fetching for the remainder.
-		let densePivot = -1;
-		for (let i = 0; i < capped.length; ) {
-			if (signal.aborted) return;
-			const { ok, elapsedMs, aborted } = await probeOne(capped[i]);
-			if (aborted) return;
+	const candidates = computeNeighborTasks();
+	const todo = candidates.filter(needsWarming);
+	if (!todo.length) return;
 
-			if (ok && elapsedMs < FAST_PROBE_MS) {
-				const advance = Math.min(SPARSE_STEP, capped.length - i);
-				popWarmProgress.update((s) => ({
-					...s,
-					done: s.done + advance,
-					ok: s.ok + advance
-				}));
-				i += SPARSE_STEP;
-			} else {
-				popWarmProgress.update((s) => ({
-					...s,
-					done: s.done + 1,
-					ok: s.ok + (ok ? 1 : 0),
-					fail: s.fail + (ok ? 0 : 1)
-				}));
-				densePivot = i;
-				break;
-			}
-		}
+	// Order: full prefetches first (they take longer, get them dispatched
+	// early), then head probes (fast, fill in around them).
+	todo.sort((a, b) => (a.mode === 'full' ? -1 : 1) - (b.mode === 'full' ? -1 : 1));
 
-		if (densePivot >= 0 && !signal.aborted) {
-			// Backfill the up-to-(SPARSE_STEP-1) skipped neighbors before the
-			// pivot — they sit next to a known-cold probe so they're likely cold
-			// too. Then fan out across the rest of the horizon.
-			const backfillBefore: number[] = [];
-			for (let j = Math.max(0, densePivot - SPARSE_STEP + 1); j < densePivot; j++) {
-				backfillBefore.push(j);
-			}
-			const denseAfter: number[] = [];
-			for (let j = densePivot + 1; j < capped.length; j++) {
-				denseAfter.push(j);
-			}
+	const settings = get(omProtocolSettings);
+	const cache = settings.fileReaderConfig?.cache;
+	if (!cache) return; // SSR or cache not yet ready
 
-			// Undo the trust-bump for indices we previously claimed as warm but
-			// will now re-fetch (otherwise the dense phase double-counts them).
-			if (backfillBefore.length > 0) {
-				popWarmProgress.update((s) => ({
-					...s,
-					done: s.done - backfillBefore.length,
-					ok: s.ok - backfillBefore.length
-				}));
-			}
+	const currentVariable = get(variable);
+	const currentDomain = get(domain) ?? null;
 
-			const denseItems = [...backfillBefore, ...denseAfter].map((idx) => capped[idx]);
-			await runBounded(denseItems, WARM_CONCURRENCY, async (iso) => {
+	popWarmProgress.set({
+		status: 'running',
+		domain: currentDomain,
+		done: 0,
+		total: todo.length,
+		ok: 0,
+		fail: 0
+	});
+
+	const queue: NeighborTask[] = [...todo];
+	const workers = Array.from({ length: WARM_CONCURRENCY }, async () => {
+		// Each worker lazy-creates a reader on first full-prefetch task.
+		// `setToOmFile` is stateful per-reader so concurrent calls on a
+		// single reader would race.
+		let reader: WeatherMapLayerFileReader | null = null;
+		try {
+			while (queue.length) {
 				if (signal.aborted) return;
-				const { ok, aborted } = await probeOne(iso);
-				if (aborted) return;
+				const task = queue.shift();
+				if (!task) return;
+				// Re-check skip flags — another worker may have just warmed
+				// this URL between when we built the queue and now.
+				if (!needsWarming(task)) continue;
+
+				let ok = false;
+				try {
+					if (task.mode === 'full') {
+						if (!reader) {
+							reader = new WeatherMapLayerFileReader({
+								cache,
+								useSAB: settings.fileReaderConfig?.useSAB
+							});
+						}
+						await reader.setToOmFile(task.url);
+						if (signal.aborted) return;
+						await reader.prefetchVariable(currentVariable, null, signal);
+						warmedFullUrls.add(task.url);
+						// Promote: a previously head-probed URL is now strictly
+						// covered by the full-warmed set.
+						warmedHeadUrls.delete(task.url);
+					} else {
+						// Head probe — single 1-byte range request, drained.
+						// CF's cache-on-range behavior pulls the full file
+						// into the PoP edge cache as a side effect.
+						const res = await fetch(task.url, {
+							method: 'GET',
+							headers: { Range: 'bytes=0-0' },
+							signal
+						});
+						await res.body?.cancel().catch(() => {});
+						if (res.ok) warmedHeadUrls.add(task.url);
+					}
+					ok = true;
+				} catch (err) {
+					if ((err as { name?: string } | undefined)?.name === 'AbortError') return;
+					console.debug('[neighbor-warm] failed', task.url, err);
+				}
 				popWarmProgress.update((s) => ({
 					...s,
 					done: s.done + 1,
 					ok: s.ok + (ok ? 1 : 0),
 					fail: s.fail + (ok ? 0 : 1)
 				}));
-			});
+			}
+		} finally {
+			reader?.dispose();
 		}
+	});
+	await Promise.all(workers);
 
-		if (!signal.aborted) {
-			popWarmProgress.update((s) => ({ ...s, status: 'done' }));
-		}
-	} catch (err) {
-		if ((err as { name?: string } | undefined)?.name === 'AbortError') return;
-		console.warn('[popWarm] failed', err);
-		popWarmProgress.update((s) => ({ ...s, status: 'failed' }));
-	} finally {
-		if (inFlightController === controller) {
-			inFlightController = null;
-		}
+	if (!signal.aborted) {
+		popWarmProgress.update((s) => ({ ...s, status: 'done' }));
 	}
 };
+
+// Backwards-compat wrapper for existing callers (+page.svelte's
+// domain.subscribe handler, and the manual "Warm" button in cache-settings).
+// Resets the warmed-sets for a new domain, then fires the neighbor warm
+// around the current time.
+export const warmCurrentPoP = async (newDomain: string): Promise<void> => {
+	if (!newDomain) return;
+	resetWarmState();
+	await warmNeighbors();
+};
+
+// Compatibility export — the old UI-surface "warm horizon hours" label
+// no longer applies; we always warm ±NEIGHBOR_RADIUS timesteps regardless
+// of model. Kept exported so cache-settings.svelte doesn't break on import.
+export const warmHorizonHoursFor = (_domainValue: string): number => NEIGHBOR_RADIUS;

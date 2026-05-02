@@ -35,7 +35,6 @@
 	import Spinner from '$lib/components/loading/spinner.svelte';
 	import ModelPills from '$lib/components/overlay-pills/model-pills.svelte';
 	import OverlayPills from '$lib/components/overlay-pills/overlay-pills.svelte';
-	import PopWarmToast from '$lib/components/pop-warm-toast.svelte';
 	import RunDateLabel from '$lib/components/run-date-label.svelte';
 	import Settings from '$lib/components/settings/settings.svelte';
 	import TimeSelector from '$lib/components/time/time-selector.svelte';
@@ -50,7 +49,7 @@
 	import { installRnBridge, isAdmin, isEmbedMode } from '$lib/rn-bridge';
 	import { addTerrainSource, getStyle, setMapControlSettings } from '$lib/map-controls';
 	import { getInitialMetaData, getMetaData, matchVariableOrFirst } from '$lib/metadata';
-	import { warmCurrentPoP } from '$lib/pop-warm';
+	import { resetWarmState, warmCurrentPoP, warmNeighbors } from '$lib/pop-warm';
 	import { addPopup } from '$lib/popup';
 	import { formatISOWithoutTimezone } from '$lib/time-format';
 	import { findTimeStep } from '$lib/time-utils';
@@ -323,9 +322,9 @@
 		}
 
 		changeOMfileURL();
-		// Fire the per-PoP cache warm for this domain's 72 h of .om URLs.
-		// Fire-and-forget: the warm runs in the background while the first
-		// scrub renders from R2, and subsequent scrubs hit the now-warm edge.
+		// Fire neighbor warm for the current time (±5 timesteps). Resets
+		// the warmed-set for the new domain. Fire-and-forget — runs in
+		// background while the first scrub renders.
 		void warmCurrentPoP(newDomain);
 	};
 
@@ -346,6 +345,19 @@
 		}
 
 		changeOMfileURL();
+		// Variable change invalidates the prefetched block cache (different
+		// blocks needed) — reset the warmed-set and refire neighbor warm
+		// around the current time for the new variable.
+		resetWarmState();
+		void warmNeighbors();
+	});
+
+	// Time changes (scrubbing) — refire neighbor warm so the newly-active
+	// time's ±5 window is fully prefetched. The internal abort-controller
+	// in pop-warm.ts cancels any in-flight warm from a prior scrub before
+	// starting a new one.
+	const timeSubscription = time.subscribe(() => {
+		void warmNeighbors();
 	});
 
 	onDestroy(() => {
@@ -355,6 +367,7 @@
 		}
 		domainSubscription(); // unsubscribe
 		variableSubscription(); // unsubscribe
+		timeSubscription(); // unsubscribe
 	});
 </script>
 
@@ -384,10 +397,6 @@
 	<KeyboardHandler />
 	<Settings />
 {/if}
-
-<!-- Also rendered in embed so the RN WebView shows the cache-warm progress
-     toast on domain switch — useful debugging feedback for the user. -->
-<PopWarmToast />
 
 <!-- Debug label showing the current run date + selected time + active
      domain/variable. Admin-only in BOTH modes — gated on the `admin` flag
