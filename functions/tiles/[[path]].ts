@@ -48,7 +48,7 @@ const corsHeaders = {
 	'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
 	'Access-Control-Allow-Headers': `Range, If-Match, If-None-Match, If-Modified-Since, ${FORCE_REFRESH_HEADER}, ${WARM_HEADER}`,
 	'Access-Control-Expose-Headers':
-		'ETag, Content-Range, Content-Length, Accept-Ranges, X-Surfr-Cache-Status, X-Surfr-Refreshed, X-Surfr-Upstream-Ms',
+		'ETag, Content-Range, Content-Length, Accept-Ranges, X-Surfr-Cache-Status, X-Surfr-Refreshed, X-Surfr-Upstream-Ms, Age, CF-Cache-Status',
 	'Access-Control-Max-Age': '3000'
 };
 
