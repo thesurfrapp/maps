@@ -36,6 +36,13 @@ const SPARSE_STEP = 5;
 // margin above warm hits while staying well below cold misses.
 const FAST_PROBE_MS = 500;
 
+// Tail probe size — last N bytes of each file. Sent as a suffix Range
+// (`bytes=-N`) so we don't need a head request to learn the file size.
+// The act of CF having to satisfy a "back of file" range is what nudges
+// the edge cache layer into a full-file cache fill — we don't actually
+// care about the bytes returned.
+const TAIL_PROBE_BYTES = 1;
+
 export type PopWarmState = {
 	status: 'idle' | 'running' | 'done' | 'failed';
 	domain: string | null;
@@ -126,9 +133,13 @@ export const warmCurrentPoP = async (domain: string): Promise<void> => {
 			const url = `${META_BASE}/${domain}/${runPath}/${fmtValidTime(iso)}.om`;
 			const t0 = performance.now();
 			try {
+				// Single request: tail-only suffix range. No HEAD, no
+				// `bytes=0-0` head probe. Suffix syntax requires server-side
+				// support — handled by parseRange in
+				// functions/tiles/[[path]].ts.
 				const res = await fetch(url, {
 					method: 'GET',
-					headers: { Range: 'bytes=0-0' },
+					headers: { Range: `bytes=-${TAIL_PROBE_BYTES}` },
 					signal
 				});
 				await res.body?.cancel().catch(() => {});
