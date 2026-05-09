@@ -12,8 +12,12 @@
 <script lang="ts">
 	import { metaJson } from '$lib/stores/time';
 	import { domain, variable } from '$lib/stores/variables';
+	import { setWindyStationsConfig, setWindyStationsVisible } from '$lib/windy-stations';
+	import { map } from '$lib/stores/map';
 
 	type Overlay = 'wind' | 'gust' | 'rain';
+
+	let stationsVisible = false;
 
 	// Same priority order as the RN side. First match in the model's
 	// `meta.variables` wins. Keep in sync with
@@ -71,6 +75,19 @@
 		const v = resolvedForPill(key);
 		if (v) variable.set(v);
 	};
+
+	const toggleStations = () => {
+		stationsVisible = !stationsVisible;
+		const m = $map;
+		if (!m) return;
+		const endpoint = new URLSearchParams(window.location.search).get('ws_endpoint')
+			|| new URLSearchParams(window.location.search).get('spots_endpoint')
+			|| '';
+		if (endpoint && stationsVisible) {
+			setWindyStationsConfig({ endpoint, visible: true });
+		}
+		setWindyStationsVisible(m, stationsVisible);
+	};
 </script>
 
 <div class="pills">
@@ -88,6 +105,14 @@
 			{pill.label}
 		</button>
 	{/each}
+	<button
+		type="button"
+		class="pill"
+		class:active={stationsVisible}
+		on:click={toggleStations}
+	>
+		Live
+	</button>
 </div>
 
 <style>

@@ -14,6 +14,7 @@ import {
 	setSelectedSpotHighlight,
 	setSurfrSpotsConfig
 } from '$lib/surfr-spots';
+import { setWindyStationsConfig, setWindyStationsVisible } from '$lib/windy-stations';
 
 import { displayTimezone, displayTzOffsetSeconds } from '$lib/stores/preferences';
 import { metaJson, time } from '$lib/stores/time';
@@ -43,7 +44,8 @@ type OutMsg =
 	| { type: 'setDomainReceived'; domain: string; t: number }
 	| { type: 'clearStateReceived'; t: number }
 	| { type: 'mapDataLoading'; t: number }
-	| { type: 'mapIdle'; t: number };
+	| { type: 'mapIdle'; t: number }
+	| { type: 'stationTapped'; id: string; name: string; lat: number; lon: number; windKts: number; windDir: number; gustKts: number; updatedAt: number; t: number };
 
 type InMsg =
 	// `anchorY` (0..1, default 0.5) is the vertical screen position where the
@@ -84,7 +86,8 @@ type InMsg =
 	// reload the WebView. Used when the map gets stuck (e.g. a stale persisted
 	// domain causing repeated metadata fetch failures) and no in-WebView
 	// interaction un-sticks it.
-	| { type: 'clearState' };
+	| { type: 'clearState' }
+	| { type: 'setWindyStationsConfig'; endpoint?: string; visible?: boolean };
 
 declare global {
 	interface Window {
@@ -450,6 +453,28 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 					}
 					window.location.reload();
 				})();
+				break;
+			}
+			case 'setWindyStationsConfig': {
+				const onStationTap = (s: { id: string; name: string; lat: number; lon: number; windKts: number | null; windDir: number | null; gustKts: number | null; updatedAt: number | null }) => {
+					postToRN({
+						type: 'stationTapped',
+						id: s.id,
+						name: s.name,
+						lat: s.lat,
+						lon: s.lon,
+						windKts: s.windKts ?? 0,
+						windDir: s.windDir ?? 0,
+						gustKts: s.gustKts ?? 0,
+						updatedAt: s.updatedAt ?? 0
+					});
+				};
+				if (msg.endpoint) {
+					setWindyStationsConfig({ endpoint: msg.endpoint, visible: msg.visible, onStationTap });
+				}
+				if (msg.visible !== undefined) {
+					setWindyStationsVisible(map, msg.visible);
+				}
 				break;
 			}
 		}

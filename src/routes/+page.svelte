@@ -44,6 +44,7 @@
 
 	import { checkHighDefinition } from '$lib/helpers';
 	import { initSurfrSpots, setSurfrSpotsConfig } from '$lib/surfr-spots';
+	import { initWindyStations } from '$lib/windy-stations';
 	import { getIanaOffsetSeconds, ianaFromOffsetSeconds } from '$lib/time-format';
 	import { addOmFileLayers, changeOMfileURL } from '$lib/layers';
 	import { installRnBridge, isAdmin, isEmbedMode } from '$lib/rn-bridge';
@@ -234,6 +235,7 @@
 			changeOMfileURL();
 
 			initSurfrSpots($map);
+			initWindyStations($map);
 
 			rnBridgeCleanup = installRnBridge($map);
 		});
