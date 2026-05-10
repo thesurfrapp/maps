@@ -18,6 +18,7 @@ type WindyStation = {
 	windDir: number | null;
 	gustKts: number | null;
 	updatedAt: number | null;
+	source: string | null;
 };
 
 type WindyStationsConfig = {
@@ -71,11 +72,18 @@ function arrowSvg(dir: number, color: string): string {
 		`<polygon points="5,1 9,8 5,6 1,8" fill="${color}"/></svg>`;
 }
 
+function verifiedSvg(): string {
+	return `<svg width="10" height="10" viewBox="0 0 10 10" style="flex-shrink:0">` +
+		`<circle cx="5" cy="5" r="4.5" fill="#4ADE80"/>` +
+		`<path d="M3 5.2 L4.3 6.5 L7 3.8" stroke="#fff" stroke-width="1.3" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+}
+
 function createPillElement(station: WindyStation): HTMLDivElement {
 	const kts = Math.round(station.windKts ?? 0);
 	const bg = windColor(kts);
 	const fg = textColor(kts);
 	const dir = station.windDir ?? 0;
+	const isVerified = station.source != null && station.source !== 'pws';
 
 	const el = document.createElement('div');
 	el.className = 'ws-pill';
@@ -89,7 +97,7 @@ function createPillElement(station: WindyStation): HTMLDivElement {
 		`box-shadow:0 1px 3px rgba(0,0,0,0.4);` +
 		`pointer-events:auto;user-select:none;`;
 
-	el.innerHTML = arrowSvg(dir, fg) + `<span>${kts}</span>`;
+	el.innerHTML = arrowSvg(dir, fg) + `<span>${kts}</span>` + (isVerified ? verifiedSvg() : '');
 	return el;
 }
 

@@ -456,7 +456,7 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 				break;
 			}
 			case 'setWindyStationsConfig': {
-				const onStationTap = (s: { id: string; name: string; lat: number; lon: number; windKts: number | null; windDir: number | null; gustKts: number | null; updatedAt: number | null }) => {
+				const onStationTap = (s: { id: string; name: string; lat: number; lon: number; windKts: number | null; windDir: number | null; gustKts: number | null; updatedAt: number | null; source: string | null }) => {
 					postToRN({
 						type: 'stationTapped',
 						id: s.id,
@@ -466,7 +466,8 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 						windKts: s.windKts ?? 0,
 						windDir: s.windDir ?? 0,
 						gustKts: s.gustKts ?? 0,
-						updatedAt: s.updatedAt ?? 0
+						updatedAt: s.updatedAt ?? 0,
+						source: s.source ?? null
 					});
 				};
 				if (msg.endpoint) {
