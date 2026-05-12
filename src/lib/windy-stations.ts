@@ -18,7 +18,9 @@ type WindyStation = {
 	windDir: number | null;
 	gustKts: number | null;
 	updatedAt: number | null;
+	fetchedAt: number | null;
 	source: string | null;
+	stale: boolean;
 };
 
 type WindyStationsConfig = {
@@ -79,9 +81,11 @@ function verifiedSvg(): string {
 }
 
 function createPillElement(station: WindyStation): HTMLDivElement {
+	const stale = station.stale;
+	const hasWind = station.windKts != null;
 	const kts = Math.round(station.windKts ?? 0);
-	const bg = windColor(kts);
-	const fg = textColor(kts);
+	const bg = stale ? '#555' : windColor(kts);
+	const fg = stale ? '#999' : textColor(kts);
 	const dir = station.windDir ?? 0;
 	const isVerified = station.source != null && station.source !== 'pws';
 
@@ -93,11 +97,14 @@ function createPillElement(station: WindyStation): HTMLDivElement {
 		`padding:3px 6px 3px 4px;border-radius:10px;` +
 		`font:700 11px/1 system-ui,-apple-system,sans-serif;` +
 		`white-space:nowrap;cursor:pointer;` +
-		`border:1px solid rgba(255,255,255,0.35);` +
+		`border:1px solid ${stale ? 'rgba(255,255,255,0.15)' : 'rgba(255,255,255,0.35)'};` +
 		`box-shadow:0 1px 3px rgba(0,0,0,0.4);` +
+		`opacity:${stale ? '0.6' : '1'};` +
 		`pointer-events:auto;user-select:none;`;
 
-	el.innerHTML = arrowSvg(dir, fg) + `<span>${kts}</span>` + (isVerified ? verifiedSvg() : '');
+	el.innerHTML = hasWind
+		? arrowSvg(dir, fg) + `<span>${kts}</span>` + (isVerified ? verifiedSvg() : '')
+		: `<span>--</span>`;
 	return el;
 }
 
@@ -117,7 +124,6 @@ const renderMarkers = (map: maplibregl.Map, stations: WindyStation[]) => {
 	removeAllMarkers();
 	lastStations = stations;
 	for (const s of stations) {
-		if (s.windKts == null) continue;
 		const el = createPillElement(s);
 		el.addEventListener('click', (e) => {
 			e.stopPropagation();
