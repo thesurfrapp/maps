@@ -1,5 +1,7 @@
 # Surfr Maps
 
+> **This is a public repository.** Do not commit API keys, tokens, `.env` files, or other secrets. Use environment variables and Cloudflare secret bindings for all credentials.
+
 **[maps.thesurfr.app](https://maps.thesurfr.app)**
 
 A fork of [open-meteo/maps](https://github.com/open-meteo/maps) that adds a Cloudflare R2 tile-caching layer, a React Native embed bridge, live wind-station and surf-spot overlays, a simplified surf/wind-focused UI, and a custom Surfr wind color palette. Deployed on Cloudflare Pages.
