@@ -168,6 +168,29 @@ To test on a phone over HTTPS (requires `cloudflared`):
 cloudflared tunnel --url http://localhost:8788
 ```
 
+### Local `weather-map-layer` development
+
+`package.json` pins `@openmeteo/weather-map-layer` to a commit on the Surfr fork (`github:thesurfrapp/weather-map-layer#<sha>`). The source lives locally at `../weather-map-layer`. To iterate on the library and test changes in this maps project:
+
+```bash
+# In the weather-map-layer repo
+cd ../weather-map-layer
+npm run build          # produces dist/
+
+# Link it into this project
+cd ../maps
+npm link ../weather-map-layer
+```
+
+After linking, any rebuild of `weather-map-layer` is immediately available to the maps build (no reinstall needed). When done, commit the new dist to the fork, push, and update the pinned SHA in `package.json`:
+
+```bash
+# Update the pin to the new commit
+npm install github:thesurfrapp/weather-map-layer#<new-sha>
+```
+
+`npm install` (without a link) will restore the pinned GitHub commit and remove the local link.
+
 ### Prerequisites
 
 - Node.js / npm (or yarn)
