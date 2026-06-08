@@ -15,8 +15,6 @@ import {
 import { addHillshadeLayer, reloadStyles, terrainHandler } from '$lib/map-controls';
 import { updateUrl } from '$lib/url';
 
-const preferences = get(p);
-
 export class SettingsButton {
 	onAdd() {
 		const div = document.createElement('div');
@@ -71,6 +69,7 @@ export class HillshadeButton {
 
 	onAdd(map: maplibregl.Map) {
 		this.map = map;
+		const preferences = get(p);
 		const div = document.createElement('div');
 		div.className = 'maplibregl-ctrl maplibregl-ctrl-group';
 		div.title = 'Hillshade';
@@ -134,7 +133,7 @@ export class HillshadeButton {
 
 		this.terrainControl._terrainButton.addEventListener('click', () => terrainHandler());
 
-		if (preferences.terrain) {
+		if (get(p).terrain) {
 			this.map.setTerrain({ source: 'terrainSource2' });
 		}
 	}

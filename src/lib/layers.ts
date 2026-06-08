@@ -275,8 +275,8 @@ const vectorContourLabelsLayer = (): SlotLayer => ({
 const resolveBeforeLayer = (map: maplibregl.Map, desired: string): string => {
 	if (map.getLayer(desired)) return desired;
 	const layers = map.getStyle().layers ?? [];
-	const first = layers.find((l: { type: string; id: string }) =>
-		l.id.startsWith('boundary') || l.type === 'symbol'
+	const first = layers.find(
+		(l: { type: string; id: string }) => l.id.startsWith('boundary') || l.type === 'symbol'
 	);
 	return first?.id ?? (undefined as unknown as string);
 };
@@ -287,6 +287,16 @@ const resolveBeforeLayer = (map: maplibregl.Map, desired: string): string => {
 
 export let rasterManager: SlotManager | undefined;
 export let vectorManager: SlotManager | undefined;
+
+const postRnLifecycle = (type: 'mapDataLoading' | 'mapIdle'): void => {
+	try {
+		const rn = (window as unknown as { ReactNativeWebView?: { postMessage: (s: string) => void } })
+			.ReactNativeWebView;
+		rn?.postMessage(JSON.stringify({ type, t: Math.round(performance.now()) }));
+	} catch {
+		/* noop */
+	}
+};
 
 export const createManagers = (): void => {
 	const map = get(m);
@@ -309,16 +319,21 @@ export const createManagers = (): void => {
 		removeDelayMs: 300,
 		onCommit: () => {
 			loading.set(false);
+			postRnLifecycle('mapIdle');
 			refreshPopup();
 		},
-		onError: () => loading.set(false),
+		onError: () => {
+			loading.set(false);
+			postRnLifecycle('mapIdle');
+		},
 		slowLoadWarningMs: 10000,
 		onSlowLoad: () => {
 			toast.warning('Loading raster data might be limited by bandwidth or upstream server speed.');
 			// Forward to the RN host so the diagnostic timeline sees it.
 			try {
-				const rn = (window as unknown as { ReactNativeWebView?: { postMessage: (s: string) => void } })
-					.ReactNativeWebView;
+				const rn = (
+					window as unknown as { ReactNativeWebView?: { postMessage: (s: string) => void } }
+				).ReactNativeWebView;
 				rn?.postMessage(
 					JSON.stringify({ type: 'slowLoadWarning', t: Math.round(performance.now()) })
 				);
@@ -375,6 +390,7 @@ export const changeOMfileURL = (vectorOnly = false, rasterOnly = false): void =>
 	currentOmUrl.set(omUrl);
 
 	loading.set(true);
+	if (!vectorOnly) postRnLifecycle('mapDataLoading');
 
 	const preferences = get(p);
 	vectorManager?.setBeforeLayer(

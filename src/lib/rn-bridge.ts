@@ -1,10 +1,11 @@
 // React Native WebView bridge.
 // When the site is embedded in a RN WebView (?embed=1), we post events up to the
 // host and listen for commands coming down. Outside of embed mode, this module is inert.
-
 import { get } from 'svelte/store';
 
-import type * as maplibregl from 'maplibre-gl';
+import { displayTimezone, displayTzOffsetSeconds } from '$lib/stores/preferences';
+import { metaJson, time } from '$lib/stores/time';
+import { domain, variable } from '$lib/stores/variables';
 
 import { changeOMfileURL } from '$lib/layers';
 import { setGlobeProjection } from '$lib/map-controls';
@@ -16,12 +17,14 @@ import {
 } from '$lib/surfr-spots';
 import { setWindyStationsConfig, setWindyStationsVisible } from '$lib/windy-stations';
 
-import { displayTimezone, displayTzOffsetSeconds } from '$lib/stores/preferences';
-import { metaJson, time } from '$lib/stores/time';
-import { domain, variable } from '$lib/stores/variables';
-
-import { formatISOWithoutTimezone, ianaFromOffsetSeconds, parseISOWithoutTimezone } from './time-format';
+import {
+	formatISOWithoutTimezone,
+	ianaFromOffsetSeconds,
+	parseISOWithoutTimezone
+} from './time-format';
 import { findTimeStep } from './time-utils';
+
+import type * as maplibregl from 'maplibre-gl';
 
 // Every OutMsg gets stamped with `t` = ms since page load. Lets the RN host
 // reconstruct an accurate timeline (gaps between events tell us where wall
@@ -36,16 +39,50 @@ type OutMsg =
 	| { type: 'forecastLocationSet'; lat: number; lng: number; t: number }
 	| { type: 'spotSelected'; id: string | number; name: string; lat: number; lng: number; t: number }
 	| { type: 'referenceTime'; domain: string; referenceTime: string; t: number }
-	| { type: 'tileFetch'; url: string; status: number; ms: number; bytes: number; cache: string; range: string; upMs: number; t: number }
+	| {
+			type: 'tileFetch';
+			url: string;
+			status: number;
+			ms: number;
+			bytes: number;
+			cache: string;
+			range: string;
+			upMs: number;
+			t: number;
+	  }
 	| { type: 'storageEstimate'; quotaMb: number; usageMb: number; cacheCount?: number; t: number }
 	// New: lifecycle events to attribute time-loss
-	| { type: 'setTimeReceived'; time: string; t: number }
+	| {
+			type: 'setTimeReceived';
+			time: string;
+			requestedTime?: string;
+			snappedTime?: string;
+			currentTime?: string;
+			domain?: string;
+			metaDomain?: string;
+			validFirst?: string;
+			validLast?: string;
+			status?: string;
+			reason?: string;
+			t: number;
+	  }
 	| { type: 'setVariableReceived'; variable: string; t: number }
 	| { type: 'setDomainReceived'; domain: string; t: number }
 	| { type: 'clearStateReceived'; t: number }
 	| { type: 'mapDataLoading'; t: number }
 	| { type: 'mapIdle'; t: number }
-	| { type: 'stationTapped'; id: string; name: string; lat: number; lon: number; windKts: number; windDir: number; gustKts: number; updatedAt: number; t: number };
+	| {
+			type: 'stationTapped';
+			id: string;
+			name: string;
+			lat: number;
+			lon: number;
+			windKts: number;
+			windDir: number;
+			gustKts: number;
+			updatedAt: number;
+			t: number;
+	  };
 
 type InMsg =
 	// `anchorY` (0..1, default 0.5) is the vertical screen position where the
@@ -95,6 +132,51 @@ declare global {
 	}
 }
 
+const NOISY_BRIDGE_LOG_TYPES = new Set(['storageEstimate', 'tileFetch']);
+const BRIDGE_LOG_KEYS = [
+	'time',
+	'requestedTime',
+	'snappedTime',
+	'currentTime',
+	'domain',
+	'metaDomain',
+	'variable',
+	'status',
+	'reason',
+	'validFirst',
+	'validLast',
+	'lat',
+	'lng',
+	'zoom',
+	'anchorY',
+	'offsetSeconds',
+	't'
+];
+
+const formatBridgeTime = (date: Date | undefined | null): string | undefined => {
+	if (!date || isNaN(date.getTime())) return undefined;
+	return formatISOWithoutTimezone(date);
+};
+
+const compactBridgeMessage = (msg: { type?: string } & Record<string, unknown>) => {
+	const compact: Record<string, unknown> = { type: msg.type };
+	for (const key of BRIDGE_LOG_KEYS) {
+		if (msg[key] != null) compact[key] = msg[key];
+	}
+	if (Array.isArray(msg.variables)) compact.variables = msg.variables.length;
+	if (Array.isArray(msg.timestamps)) compact.timestamps = msg.timestamps.length;
+	return compact;
+};
+
+const logBridgeMessage = (
+	direction: '←' | '→',
+	msg: { type?: string } & Record<string, unknown>
+): void => {
+	if (!isAdmin()) return;
+	if (NOISY_BRIDGE_LOG_TYPES.has(String(msg.type))) return;
+	console.log(`[bridge ${direction}]`, compactBridgeMessage(msg));
+};
+
 // Loose typing on purpose — TS struggles with the OutMsg discriminated union
 // when stamping `t` after the fact. The OutMsg type above documents the wire
 // shape; runtime code just spreads + adds `t`.
@@ -112,16 +194,7 @@ const postToRN = (msg: { type: string } & Record<string, unknown>): void => {
 	// Mirror to browser console so the same diagnostics show up when testing
 	// the embed directly in a browser tab (no RN host present). Compact format
 	// so the console doesn't get unreadable.
-	if (typeof console !== 'undefined') {
-		const { type, ...rest } = stamped;
-		const restStr = Object.keys(rest).length
-			? ' ' +
-				Object.entries(rest)
-					.map(([k, v]) => `${k}=${typeof v === 'object' ? JSON.stringify(v) : v}`)
-					.join(' ')
-			: '';
-		console.log(`[bridge] ${type}${restStr}`);
-	}
+	logBridgeMessage('→', stamped);
 };
 
 export const isEmbedMode = (): boolean => {
@@ -146,26 +219,13 @@ const debounce = <T extends unknown[]>(fn: (...args: T) => void, ms: number) => 
 
 export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 	if (!isEmbedMode()) return () => {};
+	let metaDomain = get(domain);
 
 	const onMoveEnd = debounce(() => {
 		const c = map.getCenter();
 		postToRN({ type: 'moveend', lat: c.lat, lng: c.lng, zoom: map.getZoom() });
 	}, 150);
 	map.on('moveend', onMoveEnd);
-
-	// Render-lifecycle markers. `dataloading` fires when MapLibre starts
-	// requesting a source's tiles; `idle` fires when all in-flight requests
-	// finished AND the canvas is repainted. The gap between the last setTime
-	// and the next `idle` is the user-perceived "scrub-to-paint" wall time.
-	let lastDataLoadingAt = 0;
-	const onDataLoading = () => {
-		const now = performance.now();
-		if (now - lastDataLoadingAt > 50) postToRN({ type: 'mapDataLoading' });
-		lastDataLoadingAt = now;
-	};
-	map.on('dataloading', onDataLoading);
-	const onIdle = () => postToRN({ type: 'mapIdle' });
-	map.on('idle', onIdle);
 
 	// A tap anywhere on the map sets a forecast location — RN listens and refreshes
 	// its model picker + ForecastTable for that point. Mirrors Windy's
@@ -231,6 +291,7 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 	map.on('mouseleave', SURFR_SPOTS_LAYER, onSpotLeave);
 
 	const unsubMeta = metaJson.subscribe((meta) => {
+		metaDomain = get(domain);
 		if (meta?.valid_times?.length) {
 			postToRN({ type: 'availableTimestamps', timestamps: meta.valid_times });
 		}
@@ -259,8 +320,8 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 			typeof input === 'string'
 				? input
 				: input instanceof URL
-				? input.toString()
-				: (input as Request).url;
+					? input.toString()
+					: (input as Request).url;
 		const isTile = /\/(tiles|data_spatial)\//.test(url);
 		if (!isTile) return origFetch(input, init);
 		// Capture the Range header (if any) to detect duplicate block fetches —
@@ -275,7 +336,10 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 				const h = headers.find(([k]) => k.toLowerCase() === 'range');
 				if (h) rangeHdr = h[1] || '';
 			} else if (headers && typeof headers === 'object') {
-				rangeHdr = (headers as Record<string, string>).Range || (headers as Record<string, string>).range || '';
+				rangeHdr =
+					(headers as Record<string, string>).Range ||
+					(headers as Record<string, string>).range ||
+					'';
 			}
 		} catch {
 			/* noop */
@@ -326,7 +390,7 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 			return;
 		}
 		if (!msg || typeof msg !== 'object') return;
-		console.log('[rn-bridge] ←', msg);
+		logBridgeMessage('←', msg);
 		switch (msg.type) {
 			case 'setCenter': {
 				// `offset` shifts the target lat/lng away from the screen centre
@@ -353,34 +417,91 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 				if (get(domain) !== msg.domain) domain.set(msg.domain);
 				break;
 			case 'setTime': {
-				postToRN({ type: 'setTimeReceived', time: msg.time });
 				// Mirror what the fork's own time-selector does: set the store
 				// AND call changeOMfileURL() — only domain + variable have their
 				// own subscriptions that re-fetch tiles; time doesn't.
-				const parsed =
-					msg.time.length === 15 ? parseISOWithoutTimezone(msg.time) : new Date(msg.time);
-				if (!isNaN(parsed.getTime())) {
-					// Snap to nearest valid_time before storing. RN passes its own
-					// `mapAnchoredTimestamp` (already floored against the published
-					// `availableTimestamps`), but for cold-start cases where that
-					// list lags or is empty, RN can post an off-pattern hour that
-					// overwrites the URL-snap result. Snapping here makes $time
-					// canonical regardless of who set it — bridge emissions and the
-					// in-fork debug label stay consistent on the same valid_time.
-					const meta = get(metaJson);
-					const timeSteps = meta?.valid_times?.map((s) => new Date(s));
-					const snapped = timeSteps?.length ? findTimeStep(parsed, timeSteps) : null;
-					const next = snapped ?? parsed;
-					// Skip the set if the snapped value matches what's already in the
-					// store. Without this dedupe, RN's `setTime` round-trip (whose
-					// snapped result equals the current $time) still triggers a
-					// `time.subscribe` re-emit — RN sees a redundant `timestampChanged`
-					// echo for the same value.
-					const current = get(time);
-					if (next.getTime() !== current.getTime()) {
-						time.set(next);
-						changeOMfileURL();
+				let parsed: Date;
+				try {
+					parsed = msg.time.length === 15 ? parseISOWithoutTimezone(msg.time) : new Date(msg.time);
+				} catch {
+					postToRN({
+						type: 'setTimeReceived',
+						time: msg.time,
+						requestedTime: msg.time,
+						domain: get(domain),
+						metaDomain,
+						status: 'invalid',
+						reason: 'parse-failed'
+					});
+					break;
+				}
+				if (isNaN(parsed.getTime())) {
+					postToRN({
+						type: 'setTimeReceived',
+						time: msg.time,
+						requestedTime: msg.time,
+						domain: get(domain),
+						metaDomain,
+						status: 'invalid',
+						reason: 'invalid-date'
+					});
+					break;
+				}
+
+				// Snap to a valid_time before storing. This intentionally preserves the
+				// pre-existing bridge behavior: current metadata is the authority for
+				// canonical map time, and every applied time change rebuilds the OM URL.
+				// The extra fields below are diagnostics only, so older RN clients can
+				// continue to ignore them.
+				const activeDomain = get(domain);
+				const meta = get(metaJson);
+				const validTimes = Array.isArray(meta?.valid_times) ? meta.valid_times : [];
+				const validFirst = validTimes[0];
+				const validLast = validTimes[validTimes.length - 1];
+				let next = parsed;
+				let reason = validTimes.length ? 'raw' : 'no-valid-times';
+
+				if (validTimes.length) {
+					const requestedWireTime = formatBridgeTime(parsed);
+					const exact = validTimes.find((validTime) => {
+						const d = new Date(validTime);
+						return formatBridgeTime(d) === requestedWireTime;
+					});
+					if (exact) {
+						next = new Date(exact);
+						reason = 'exact';
+					} else {
+						const timeSteps = validTimes.map((s) => new Date(s));
+						const snapped = findTimeStep(parsed, timeSteps);
+						if (snapped) {
+							next = new Date(snapped.getTime());
+							reason = 'nearest';
+						}
 					}
+				}
+
+				// Skip the set if the snapped value matches what's already in the store.
+				// Without this dedupe, RN's `setTime` round-trip (whose snapped result
+				// equals the current $time) still triggers a `time.subscribe` re-emit —
+				// RN sees a redundant `timestampChanged` echo for the same value.
+				const current = get(time);
+				const changed = next.getTime() !== current.getTime();
+				postToRN({
+					type: 'setTimeReceived',
+					time: msg.time,
+					requestedTime: msg.time,
+					snappedTime: formatBridgeTime(next),
+					currentTime: formatBridgeTime(current),
+					domain: activeDomain,
+					metaDomain,
+					validFirst,
+					validLast,
+					status: changed ? 'apply' : 'noop',
+					reason
+				});
+				if (changed) {
+					time.set(next);
+					changeOMfileURL();
 				}
 				break;
 			}
@@ -423,8 +544,7 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 				// Projection flip — explicit via msg.projection, or implicit when
 				// zooming out below 2 (feels right: world icon = globe view).
 				const targetProjection =
-					msg.projection ??
-					(msg.zoom <= 2 ? 'globe' : msg.zoom > 3 ? 'mercator' : undefined);
+					msg.projection ?? (msg.zoom <= 2 ? 'globe' : msg.zoom > 3 ? 'mercator' : undefined);
 				if (targetProjection) {
 					setGlobeProjection(targetProjection === 'globe');
 				}
@@ -456,7 +576,17 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 				break;
 			}
 			case 'setWindyStationsConfig': {
-				const onStationTap = (s: { id: string; name: string; lat: number; lon: number; windKts: number | null; windDir: number | null; gustKts: number | null; updatedAt: number | null; source: string | null }) => {
+				const onStationTap = (s: {
+					id: string;
+					name: string;
+					lat: number;
+					lon: number;
+					windKts: number | null;
+					windDir: number | null;
+					gustKts: number | null;
+					updatedAt: number | null;
+					source: string | null;
+				}) => {
 					postToRN({
 						type: 'stationTapped',
 						id: s.id,
@@ -492,7 +622,12 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 	// block cache isn't actually holding what it thinks it is.
 	const probeStorage = async () => {
 		try {
-			const est = (await (navigator as unknown as { storage?: { estimate: () => Promise<{ quota?: number; usage?: number }> } }).storage?.estimate?.()) ?? null;
+			const est =
+				(await (
+					navigator as unknown as {
+						storage?: { estimate: () => Promise<{ quota?: number; usage?: number }> };
+					}
+				).storage?.estimate?.()) ?? null;
 			if (!est) return;
 			let cacheCount: number | undefined;
 			try {
@@ -520,8 +655,6 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 		map.off('click', onClick);
 		map.off('mouseenter', SURFR_SPOTS_LAYER, onSpotEnter);
 		map.off('mouseleave', SURFR_SPOTS_LAYER, onSpotLeave);
-		map.off('dataloading', onDataLoading);
-		map.off('idle', onIdle);
 		unsubMeta();
 		unsubTime();
 		clearInterval(storageProbeInterval);
@@ -540,7 +673,11 @@ const placeForecastMarker = (map: maplibregl.Map, lat: number, lng: number): voi
 	const data = {
 		type: 'FeatureCollection' as const,
 		features: [
-			{ type: 'Feature' as const, geometry: { type: 'Point' as const, coordinates: [lng, lat] }, properties: {} }
+			{
+				type: 'Feature' as const,
+				geometry: { type: 'Point' as const, coordinates: [lng, lat] },
+				properties: {}
+			}
 		]
 	};
 	const src = map.getSource(MARKER_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
