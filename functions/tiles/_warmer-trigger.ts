@@ -1,8 +1,9 @@
 // HTTP entry-point for the warmer. Hit every 5 min by a tiny companion Worker
 // (see `worker-cron/`) or manually via curl.
 //
-// No auth: the endpoint is idempotent (warmer skips up-to-date domains) and the
-// worst-case abuse is redundant R2 write ops. Revisit if that changes.
+// Auth: requires the ADMIN_TOKEN shared secret (Authorization: Bearer or
+// ?token=) — see functions/lib/auth.ts. The cron worker sends the bearer
+// header; for manual curl use `?token=<secret>`.
 //
 // Query params:
 //   ?domain=<name>   Warm a single domain (optional). Default = all 13.
@@ -15,11 +16,15 @@
 // "accepted" JSON and let the actual work run via `waitUntil`. The cron worker
 // hits this endpoint on its own schedule; it doesn't need to wait for
 // completion.
-
+import { type AuthEnv, isAuthorized, unauthorizedResponse } from '../lib/auth';
 import { WARMED_DOMAINS } from '../lib/domains';
 import { type DomainResult, type Env, warmAll, warmDomain } from '../lib/warmer';
 
-export const onRequestGet: PagesFunction<Env> = async (context) => {
+export const onRequestGet: PagesFunction<Env & AuthEnv> = async (context) => {
+	if (!isAuthorized(context.request, context.env)) {
+		return unauthorizedResponse(context.env);
+	}
+
 	const url = new URL(context.request.url);
 	const domainFilter = url.searchParams.get('domain');
 

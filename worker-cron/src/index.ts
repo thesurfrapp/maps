@@ -61,13 +61,37 @@ const parseWarmerBody = (body: string): AnyWarmerResult[] => {
 	}
 };
 
-const runTick = async (): Promise<string> => {
+// Shared secret with the Pages Functions (_warmer-trigger requires it) and
+// with our own HTTP entry-points below. Set via `wrangler secret put ADMIN_TOKEN`.
+type Env = { ADMIN_TOKEN?: string };
+
+const warmerAuthHeaders = (env: Env): Record<string, string> =>
+	env.ADMIN_TOKEN ? { Authorization: `Bearer ${env.ADMIN_TOKEN}` } : {};
+
+// Constant-time compare; accepts Authorization: Bearer or ?token=.
+const isAuthorized = (request: Request, env: Env): boolean => {
+	const secret = env.ADMIN_TOKEN;
+	if (!secret) return false;
+	const header = request.headers.get('Authorization');
+	const presented = header?.toLowerCase().startsWith('bearer ')
+		? header.slice(7).trim()
+		: (new URL(request.url).searchParams.get('token') ?? '');
+	if (presented.length !== secret.length) return false;
+	let diff = 0;
+	for (let i = 0; i < secret.length; i++) diff |= secret.charCodeAt(i) ^ presented.charCodeAt(i);
+	return diff === 0;
+};
+
+const runTick = async (env: Env): Promise<string> => {
 	const tStart = Date.now();
 	const outcomes: DomainOutcome[] = [];
 	for (const domain of DOMAINS) {
 		const t0 = Date.now();
 		try {
-			const res = await fetch(`${WARMER_BASE}?domain=${domain}&wait=1`, { method: 'GET' });
+			const res = await fetch(`${WARMER_BASE}?domain=${domain}&wait=1`, {
+				method: 'GET',
+				headers: warmerAuthHeaders(env)
+			});
 			const body = await res.text();
 			const result = parseWarmerBody(body).find((r) => r.domain === domain);
 			outcomes.push({
@@ -94,9 +118,12 @@ const runTick = async (): Promise<string> => {
 	);
 };
 
-const runOneDomain = async (domain: string): Promise<string> => {
+const runOneDomain = async (env: Env, domain: string): Promise<string> => {
 	const t0 = Date.now();
-	const res = await fetch(`${WARMER_BASE}?domain=${domain}&wait=1&force=1`, { method: 'GET' });
+	const res = await fetch(`${WARMER_BASE}?domain=${domain}&wait=1&force=1`, {
+		method: 'GET',
+		headers: warmerAuthHeaders(env)
+	});
 	const body = await res.text();
 	const result = parseWarmerBody(body).find((r) => r.domain === domain);
 	return JSON.stringify(
@@ -113,20 +140,27 @@ const runOneDomain = async (domain: string): Promise<string> => {
 };
 
 export default {
-	async scheduled(_event: ScheduledEvent, _env: unknown, ctx: ExecutionContext): Promise<void> {
+	async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
 		ctx.waitUntil(
-			runTick()
+			runTick(env)
 				.then((out) => console.log('[cron] tick complete', out))
 				.catch((err) => console.error('[cron] tick failed', err))
 		);
 	},
 
-	// HTTP entry-points:
+	// HTTP entry-points (both require the ADMIN_TOKEN shared secret, via
+	// Authorization: Bearer or ?token= — fail-closed if the secret is unset):
 	//   GET /              → full per-domain cron pass (same as scheduled tick)
 	//   GET /force?domain=X → re-run the warmer for ONE domain, even if its
 	//                         reference_time already matches our R2. Used for
 	//                         bootstrap and manual recovery.
-	async fetch(request: Request): Promise<Response> {
+	async fetch(request: Request, env: Env): Promise<Response> {
+		if (!isAuthorized(request, env)) {
+			return new Response(JSON.stringify({ error: 'unauthorized' }), {
+				status: 401,
+				headers: { 'Content-Type': 'application/json' }
+			});
+		}
 		const url = new URL(request.url);
 		if (url.pathname === '/force') {
 			const domain = url.searchParams.get('domain');
@@ -136,12 +170,12 @@ export default {
 					{ status: 400, headers: { 'Content-Type': 'application/json' } }
 				);
 			}
-			const out = await runOneDomain(domain);
+			const out = await runOneDomain(env, domain);
 			return new Response(out, {
 				headers: { 'Content-Type': 'application/json; charset=utf-8' }
 			});
 		}
-		const out = await runTick();
+		const out = await runTick(env);
 		return new Response(out, { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
 	}
 };
