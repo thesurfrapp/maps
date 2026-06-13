@@ -12,23 +12,12 @@ import { persisted } from 'svelte-persisted-store';
 import { browser } from '$app/environment';
 
 import { surfrWindScale, surfrWindScaleEmbed } from '$lib/color-scales/surfr';
-import { isEmbedMode } from '$lib/rn-bridge';
-
-// Pick the active wind scale once at module-load time. Embed mode gets an
-// alpha=1 (effectively alpha-less) variant with darkened low-knot hues +
-// whitened high-knot hues — the mobile WebView drops per-pixel alpha from
-// the tile texture, so "calm fades to dark, strong pops bright" has to live
-// entirely in the RGB channel.
-const activeWindScale = isEmbedMode() ? surfrWindScaleEmbed : surfrWindScale;
 import {
 	DEFAULT_CACHE_BLOCK_SIZE_KB,
 	DEFAULT_CACHE_MAX_BYTES_MB,
 	HTTP_OVERHEAD_BYTES
 } from '$lib/constants';
-import { getNextOmUrls } from '$lib/url';
-
-import { metaJson } from './time';
-import { selectedDomain } from './variables';
+import { isEmbedMode } from '$lib/rn-bridge';
 
 import type {
 	Data,
@@ -36,6 +25,13 @@ import type {
 	OmUrlState,
 	RenderableColorScale
 } from '@openmeteo/weather-map-layer';
+
+// Pick the active wind scale once at module-load time. Embed mode gets an
+// alpha=1 (effectively alpha-less) variant with darkened low-knot hues +
+// whitened high-knot hues — the mobile WebView drops per-pixel alpha from
+// the tile texture, so "calm fades to dark, strong pops bright" has to live
+// entirely in the RGB channel.
+const activeWindScale = isEmbedMode() ? surfrWindScaleEmbed : surfrWindScale;
 
 export const customColorScales = persisted<Record<string, RenderableColorScale>>(
 	'custom-color-scales',
@@ -66,17 +62,13 @@ function createBlockCache() {
 // unambiguous way to make it stick for every wind-family variable.
 const WIND_VARIABLE_PATTERN = /^wind_(speed|gusts|u_component|v_component)(_|$)/;
 
-// Single in-flight prefetch — aborted every time the user triggers a new read.
-// Prevents the old stalling behaviour where a slow prefetch held up HTTP/2
-// streams behind the user's next click.
-let currentPrefetchController: AbortController | null = null;
-
-
 export const omProtocolSettings: Writable<OmProtocolSettings> = writable({
 	...defaultOmProtocolSettings,
 	// static
 	fileReaderConfig: {
-		useSAB: typeof SharedArrayBuffer !== 'undefined' && (typeof crossOriginIsolated === 'undefined' || crossOriginIsolated),
+		useSAB:
+			typeof SharedArrayBuffer !== 'undefined' &&
+			(typeof crossOriginIsolated === 'undefined' || crossOriginIsolated),
 		cache: createBlockCache()
 	},
 
@@ -115,9 +107,7 @@ export const omProtocolSettings: Writable<OmProtocolSettings> = writable({
 				incomingScaleUnit: (resolved.renderOptions.colorScale as { unit?: string }).unit,
 				incomingFirstColors: incomingColors,
 				surfrFirstColor,
-				colorScalesRegistered: Object.keys(settings.colorScales).filter((k) =>
-					k.startsWith('wind')
-				)
+				colorScalesRegistered: Object.keys(settings.colorScales).filter((k) => k.startsWith('wind'))
 			});
 		}
 		if (matched) {
@@ -132,39 +122,10 @@ export const omProtocolSettings: Writable<OmProtocolSettings> = writable({
 	},
 
 	postReadCallback: (omFileReader: WeatherMapLayerFileReader, data: Data, state: OmUrlState) => {
-		// PER-HOUR PREFETCH DISABLED — replaced by a whole-domain PoP warm that
-		// runs once on model switch (see `src/lib/pop-warm.ts`, triggered from
-		// `src/routes/+page.svelte`'s domain.subscribe). That warm fires 1-byte
-		// range requests for all validTimes in the next 72 h, letting CF's
-		// cache-on-range pull each full file into local-PoP edge cache. After
-		// it finishes, scrubbing anywhere in that window is an instant local-
-		// edge HIT, making the per-scrub prefetch redundant.
-		//
-		// Left as reference — original per-hour prefetch code. Uncomment if we
-		// ever want to go back to lazy prev/next-hour warming instead of the
-		// upfront whole-domain approach.
-		//
-		// if (currentPrefetchController) {
-		// 	currentPrefetchController.abort();
-		// }
-		// currentPrefetchController = new AbortController();
-		// const signal = currentPrefetchController.signal;
-		// const nextOmUrls = getNextOmUrls(state.omFileUrl, get(selectedDomain), get(metaJson));
-		// for (const nextOmUrl of nextOmUrls) {
-		// 	if (nextOmUrl === undefined) continue;
-		// 	void (async () => {
-		// 		try {
-		// 			await omFileReader.setToOmFile(nextOmUrl);
-		// 			if (signal.aborted) return;
-		// 			await omFileReader.prefetchVariable('not_a_real_variable', null, signal);
-		// 		} catch (err) {
-		// 			if ((err as { name?: string } | undefined)?.name === 'AbortError') return;
-		// 			console.debug('[prefetch] skipped', nextOmUrl, err);
-		// 		}
-		// 	})();
-		// }
+		// No client-side prefetch/warming — removed entirely (pop-warm and the
+		// older per-hour prefetch before it). Real user reads populate the
+		// browser block cache and CF edge cache organically.
 		void omFileReader;
-		void state;
 		if (
 			state.dataOptions.domain.value === 'ecmwf_ifs' &&
 			state.dataOptions.variable === 'pressure_msl'

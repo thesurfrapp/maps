@@ -321,9 +321,10 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 	const range = rangeHeader ? parseRange(rangeHeader) : null;
 
 	// ── TIER 2: R2 (only for .om files). ─────────────────────────────────────
-	// The CF edge cache populated by the cron worker (after each run swap it
-	// purges + cacheEverything-re-warms stripped URLs) should absorb 99% of
-	// reads before they ever reach here. This path is the safety net.
+	// The CF edge cache (populated organically by user reads — runPath'd URLs
+	// are immutable, and cache-on-range turns any range read into a full-file
+	// edge fill) absorbs most repeat reads before they reach here. This path
+	// is the per-PoP first-read + safety net.
 	if (r2Eligible) {
 		try {
 			const r2Range = range
