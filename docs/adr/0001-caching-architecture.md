@@ -166,7 +166,7 @@ one user touches them at each PoP.
 ### Update flow on a new Open-Meteo run
 
 The cron fires every 5 min (CF Workers cron `*/5 * * * *` on
-`surfr-tile-warmer-cron`). It walks the 13 domains sequentially, one HTTP
+`surfr-tile-warmer-cron`). It walks the 14 domains sequentially, one HTTP
 call per domain to
 `https://maps.thesurfr.app/tiles/_warmer-trigger?domain=<d>&wait=1`.
 
@@ -357,7 +357,7 @@ Debug URLs (append `?token=<ADMIN_TOKEN>`):
   traffic (cron → Pages Function → R2 → Worker) is internal to CF →
   **zero R2 egress fees**. Client traffic never reads R2 directly — always
   via the Pages Function, which is CF-internal from R2's perspective.
-- CF cron: 288 ticks/day × 13 domain HTTP calls = ~4 k requests/day.
+- CF cron: 288 ticks/day × 14 domain HTTP calls = ~4 k requests/day.
 
 Model run cadences and approximate warm volumes (one swap per run):
 
@@ -401,7 +401,7 @@ Negative:
 - `functions/tiles/_admin.ts` — HTML dashboard.
 - `functions/lib/warmer.ts` — per-domain warm logic, atomic swap,
   retention pruning.
-- `functions/lib/domains.ts` — the 13 warmed domain names.
+- `functions/lib/domains.ts` — the 14 warmed domain names.
 - `worker-cron/src/index.ts` — cron scheduler + `/force?domain=X` endpoint.
 - `src/lib/url.ts` — client URL builder (runPath included).
 - `src/lib/metadata.ts` — `latest.json` fetch + metadata derivation.

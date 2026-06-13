@@ -6,13 +6,13 @@
 // header; for manual curl use `?token=<secret>`.
 //
 // Query params:
-//   ?domain=<name>   Warm a single domain (optional). Default = all 13.
+//   ?domain=<name>   Warm a single domain (optional). Default = all 14.
 //
 // Response: JSON summary of per-domain outcomes. Plain text exits for errors.
 //
 // NOTE on timing: Pages Functions have a request CPU cap but background work
 // via `waitUntil` continues after the response is sent. Because a full warm of
-// all 13 domains can take many minutes, we respond immediately with an
+// all 14 domains can take many minutes, we respond immediately with an
 // "accepted" JSON and let the actual work run via `waitUntil`. The cron worker
 // hits this endpoint on its own schedule; it doesn't need to wait for
 // completion.
