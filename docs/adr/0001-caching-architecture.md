@@ -277,7 +277,8 @@ the secret is unset.
 `src/lib/components/run-date-label.svelte` — a small fixed-position label
 at `top: 120px, left: 50%` showing `Run YYYY-MM-DD HH:MMZ`. Rendered in
 both standalone and `?embed=1` modes so mobile users can see which run
-their tiles came from.
+their tiles came from. Shares the 120 px slot with the pop-warm toast; the
+toast overlays the label while warming.
 
 ## PoPs and edge warming
 
@@ -304,15 +305,24 @@ caches it, and serves the requested range out of that cached full copy. So
 any range request (including our library's small header/footer probes) acts
 as a full-file warmer for that URL at that PoP.
 
-**No client-side prefetch/warming.** Two generations of client warming
-were tried and removed: a per-hour `postReadCallback` prefetch, then a
-two-tier "pop-warm" (±1 full prefetch + ±5 `bytes=0-0` edge probes on every
-scrub). Edge entries warmed this way proved too short-lived to pay off —
-unpopular content is evicted from a PoP quickly, so probe-warmed files were
-often gone again before a real user read them. Real user reads now populate
-the browser block cache and the per-PoP edge cache organically (the
-cache-on-range behavior above means even the first real range read warms
-the full file at that PoP).
+**The prefetch — per-PoP self-warming.** The client-side
+`postReadCallback` in `src/lib/stores/om-protocol-settings.ts` fires, after
+every successful `.om` read, a probe against the prev/next-hour file:
+
+```ts
+omFileReader.setToOmFile(nextOmUrl);
+omFileReader.prefetchVariable('not_a_real_variable', null, signal);
+```
+
+`'not_a_real_variable'` makes the library read only the header + footer
+(~70 KB combined) and stop — no data blocks fetched. From CF's point of
+view, that range request against an uncached cacheable URL triggers a full
+26 MB fetch + edge cache. Side effect: by the time the user scrubs to hour
+T+1, the PoP already has the full T+1 file cached.
+
+We cancel the in-flight prefetch via an `AbortController` on every new
+`postReadCallback` so fast-scrubbing users don't back up HTTP/2 streams
+behind a slow prefetch.
 
 ### Latency profile
 
@@ -405,8 +415,8 @@ Negative:
 - `worker-cron/src/index.ts` — cron scheduler + `/force?domain=X` endpoint.
 - `src/lib/url.ts` — client URL builder (runPath included).
 - `src/lib/metadata.ts` — `latest.json` fetch + metadata derivation.
-- `src/lib/stores/om-protocol-settings.ts` — om protocol config (block
-  cache sizing, color-scale overrides; no client prefetch).
+- `src/lib/pop-warm.ts` — per-session PoP warm.
+- `src/lib/stores/om-protocol-settings.ts` — prefetch with `AbortController`.
 - `src/lib/components/run-date-label.svelte` — run-date label widget.
 - CF dashboard: Zone `thesurfr.app` → Caching → Cache Rules → `cache-om-tiles`.
 - CF dashboard: Pages project `maps` → Settings → Functions → R2 bindings

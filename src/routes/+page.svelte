@@ -11,7 +11,6 @@
 	} from '@openmeteo/weather-map-layer';
 	import * as maplibregl from 'maplibre-gl';
 	import 'maplibre-gl/dist/maplibre-gl.css';
-	import { setMode } from 'mode-watcher';
 	import { toast } from 'svelte-sonner';
 
 	import { version } from '$app/environment';
@@ -19,9 +18,9 @@
 	import { map } from '$lib/stores/map';
 	import { omProtocolSettings } from '$lib/stores/om-protocol-settings';
 	import {
+		loading,
 		displayTimezone,
 		displayTzOffsetSeconds,
-		loading,
 		localStorageVersion,
 		opacity,
 		resetStates,
@@ -41,18 +40,21 @@
 	import TimeSelector from '$lib/components/time/time-selector.svelte';
 	import TimezoneSelector from '$lib/components/timezone/TimezoneSelector.svelte';
 
+	import { setMode } from 'mode-watcher';
+
 	import { checkHighDefinition } from '$lib/helpers';
+	import { initSurfrSpots, setSurfrSpotsConfig } from '$lib/surfr-spots';
+	import { initWindyStations } from '$lib/windy-stations';
+	import { getIanaOffsetSeconds, ianaFromOffsetSeconds } from '$lib/time-format';
 	import { addOmFileLayers, changeOMfileURL } from '$lib/layers';
+	import { installRnBridge, isAdmin, isEmbedMode } from '$lib/rn-bridge';
 	import { addTerrainSource, getStyle, setMapControlSettings } from '$lib/map-controls';
 	import { getInitialMetaData, getMetaData, matchVariableOrFirst } from '$lib/metadata';
+	import { resetWarmState, warmCurrentPoP, warmNeighbors } from '$lib/pop-warm';
 	import { addPopup } from '$lib/popup';
-	import { installRnBridge, isAdmin, isEmbedMode } from '$lib/rn-bridge';
-	import { initSurfrSpots, setSurfrSpotsConfig } from '$lib/surfr-spots';
-	import { getIanaOffsetSeconds, ianaFromOffsetSeconds } from '$lib/time-format';
 	import { formatISOWithoutTimezone } from '$lib/time-format';
 	import { findTimeStep } from '$lib/time-utils';
 	import { updateUrl, urlParamsToPreferences } from '$lib/url';
-	import { initWindyStations } from '$lib/windy-stations';
 
 	import '../styles.css';
 
@@ -277,7 +279,9 @@
 					$metaJson = await getMetaData();
 					if (reqId !== latestDomainReq) return;
 
-					const timeSteps = $metaJson?.valid_times.map((validTime: string) => new Date(validTime));
+					const timeSteps = $metaJson?.valid_times.map(
+						(validTime: string) => new Date(validTime)
+					);
 					const timeStep = findTimeStep($time, timeSteps);
 					// clamp time to valid times in meta data
 					if (timeStep) {
@@ -320,13 +324,19 @@
 		}
 
 		changeOMfileURL();
+		// Fire neighbor warm for the current time (±5 timesteps). Resets
+		// the warmed-set for the new domain. Fire-and-forget — runs in
+		// background while the first scrub renders.
+		void warmCurrentPoP(newDomain);
 	};
 
 	const domainSubscription = domain.subscribe((newDomain) => {
 		const reqId = ++latestDomainReq;
 		// Chain onto the previous load so runs are strictly serial. `.catch`
 		// swallows prior errors so one failure doesn't break the chain.
-		domainLoadChain = domainLoadChain.catch(() => {}).then(() => runDomainLoad(newDomain, reqId));
+		domainLoadChain = domainLoadChain
+			.catch(() => {})
+			.then(() => runDomainLoad(newDomain, reqId));
 	});
 
 	const variableSubscription = variable.subscribe(async (newVar) => {
@@ -337,6 +347,19 @@
 		}
 
 		changeOMfileURL();
+		// Variable change invalidates the prefetched block cache (different
+		// blocks needed) — reset the warmed-set and refire neighbor warm
+		// around the current time for the new variable.
+		resetWarmState();
+		void warmNeighbors();
+	});
+
+	// Time changes (scrubbing) — refire neighbor warm so the newly-active
+	// time's ±5 window is fully prefetched. The internal abort-controller
+	// in pop-warm.ts cancels any in-flight warm from a prior scrub before
+	// starting a new one.
+	const timeSubscription = time.subscribe(() => {
+		void warmNeighbors();
 	});
 
 	onDestroy(() => {
@@ -346,6 +369,7 @@
 		}
 		domainSubscription(); // unsubscribe
 		variableSubscription(); // unsubscribe
+		timeSubscription(); // unsubscribe
 	});
 </script>
 
@@ -379,7 +403,8 @@
 <!-- Debug label showing the current run date + selected time + active
      domain/variable. Admin-only in BOTH modes — gated on the `admin` flag
      (set via `?admin=1`). On standalone web, append `?admin=1` to see it;
-     in embed, RN only forwards admin=1 when global.isadmin is true. -->
+     in embed, RN only forwards admin=1 when global.isadmin is true. Same
+     120px top as the pop-warm toast — toast overlays it while warming. -->
 {#if admin}
 	<RunDateLabel />
 {/if}
@@ -393,3 +418,4 @@
 		z-index: 5;
 	}
 </style>
+

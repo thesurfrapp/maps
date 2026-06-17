@@ -89,6 +89,14 @@ Configured via the RN bridge's `setWindyStationsConfig` message (endpoint URL + 
 
 Configured via URL params (`spots_endpoint`, `spots_token`) on initial load and refreshable via the bridge's `setSpotsConfig` message.
 
+### Client-side neighbor prefetch (PoP warm)
+
+`src/lib/pop-warm.ts` — on every time/domain/variable change, prefetches adjacent timesteps in two tiers:
+- **±1 neighbors** — full prefetch via `WeatherMapLayerFileReader.prefetchVariable`, pulling all blocks into the shared browser block cache so prev/next scrub renders instantly from local cache.
+- **±2..±N outer neighbors** — `Range: bytes=0-0` HEAD probes that nudge CF's PoP edge cache without pulling data into the browser. If the user scrubs to these, the round-trip is local edge (~50 ms) instead of R2 (~300–500 ms).
+
+Skip-already-warmed sets prevent redundant fetches during rapid scrubbing.
+
 ### Simplified UI & always-latest-run UX
 
 Upstream lets users manually pick a model run (dropdown + lock button + prev/next-run keyboard shortcuts). This fork removes all of that — the map always shows the latest available run as determined by R2's `latest.json`. The cron warmer atomically swaps `latest.json` when a new run completes, and the client fetches it fresh on every page load (`Cache-Control: no-store`). Users never see a stale run, never have to understand what a "model run" is, and can't accidentally lock themselves to an old one. The `RunDateLabel` component shows which run is loaded for debugging, but there's no UI to change it.
@@ -118,7 +126,7 @@ MapTiler Streets v2 (`streets-v2-dark` / `voyager-v2`) is the primary basemap, c
 
 ### Forked weather-map-layer dependency
 
-`package.json` pins `@openmeteo/weather-map-layer` to `github:thesurfrapp/weather-map-layer#5970398…` — a Surfr fork that adds parallel prefetch support (currently unused — client-side prefetch/pop-warm was removed; real user reads populate the caches). Default cache block size bumped from 64 KB to 512 KB (3× fewer range requests per viewport render).
+`package.json` pins `@openmeteo/weather-map-layer` to `github:thesurfrapp/weather-map-layer#5970398…` — a Surfr fork that adds parallel prefetch support (used by `pop-warm.ts`). Default cache block size bumped from 64 KB to 512 KB (3× fewer range requests per viewport render).
 
 ## Diff summary
 
@@ -136,6 +144,7 @@ MapTiler Streets v2 (`streets-v2-dark` / `voyager-v2`) is the primary basemap, c
 | Embed | None | Full RN WebView postMessage bridge + imperative ref API |
 | Wind stations | None | Live Windy-style pills from Surfr backend `/windystations/bbox` |
 | Spots | None | Cyan dot markers from Surfr backend `/spots/bbox`, tappable |
+| Prefetch | None | ±1 full prefetch + ±N PoP edge warm on every time change |
 | Domain load | Single async, can race | Serialized chain + retry with backoff |
 | weather-map-layer | npm upstream | Surfr fork with parallel prefetch, 512 KB block size |
 | SSR | Enabled | Disabled (`ssr = false`) |
