@@ -20,7 +20,7 @@ The upstream open-meteo/maps project is a standalone browser demo that fetches `
 
 ## What's changed from upstream
 
-This fork is **~104 commits / +6,750 −650 lines** ahead of upstream (merge base `open-meteo/maps@f076847`).
+This fork is **~90 commits / +7,100 lines** ahead of upstream (`open-meteo/maps@f076847`).
 
 ### Tile caching & CDN
 
@@ -29,13 +29,10 @@ All `.om` and `latest.json` traffic routes through `maps.thesurfr.app/tiles/*` i
 | Component | Path | What it does |
 |---|---|---|
 | Pages Function proxy | `functions/tiles/[[path]].ts` | Serves `.om` from R2, falls back to origin + lazy R2 fill. Serves `latest.json` from R2 with `no-store`. Blocks `meta.json`/`in-progress.json`. |
-| Warmer pipeline | `functions/lib/warmer.ts` | Fetches upstream `latest.json`, diffs against R2, warms `.om` files (concurrency 4; 72 h horizon, 120 h for GFS/ECMWF/ICON), atomically swaps `latest.json`, prunes old runs (keeps current + 2). |
-| Admin dashboard | `functions/tiles/_admin.ts` | Per-domain status pills, R2 vs upstream comparison, file counts, historical runs. Token-gated. |
-| Cron worker | `worker-cron/` | Fires the warmer every 5 min, one domain at a time, with 1.5 s pauses. Authenticates with the `ADMIN_TOKEN` Bearer secret. |
-| Endpoint auth | `functions/lib/auth.ts` | Shared-secret gate (`ADMIN_TOKEN`, fail-closed) for `_admin`, `_warmer-trigger`, `_debug/cache`, and the cache-mutating request headers. Tile-serving paths stay public. |
+| Warmer pipeline | `functions/lib/warmer.ts` | Fetches upstream `latest.json`, diffs against R2, warms `.om` files (concurrency 4, 72 h horizon cap), atomically swaps `latest.json`, prunes old runs (keeps current + 2). |
+| Admin dashboard | `functions/tiles/_admin.ts` | Per-domain status pills, R2 vs upstream comparison, file counts, historical runs. |
+| Cron worker | `worker-cron/` | Fires the warmer every 5 min, one domain at a time, with 1.5 s pauses. |
 | ADR | `docs/adr/0001-caching-architecture.md` | Full design doc: 4-tier diagram, TTL table, invariants, PoP strategy, cost model. |
-
-Operational endpoints (`/tiles/_admin`, `/tiles/_warmer-trigger`, `/tiles/_debug/cache`, and the cron worker's `/` + `/force` routes) require the `ADMIN_TOKEN` shared secret — `Authorization: Bearer <t>` or `?token=<t>`. The secret lives in Cloudflare secret bindings (Pages project + worker), never in the repo. Endpoints fail closed when it's unset.
 
 ### React Native embed integration
 
@@ -220,7 +217,7 @@ RN App (SpotsScreen)
        └─ /windystations/bbox → Surfr backend (live wind station data)
 
 worker-cron (*/5 * * * *)
-  └─ hits /tiles/_warmer-trigger per domain (Bearer ADMIN_TOKEN)
+  └─ hits /tiles/_warmer-trigger per domain
      └─ warms R2 from upstream, swaps latest.json atomically
 ```
 

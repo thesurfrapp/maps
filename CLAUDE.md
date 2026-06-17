@@ -76,7 +76,7 @@ The upstream README says `npm run dev` is the dev command, and for the
 vanilla open-meteo/maps project that's true — it hits Open-Meteo's public
 tile origin directly. **This fork** re-routes all tile traffic through
 `/tiles/*` on the same origin so a Pages Function can serve from R2 (see
-`docs/adr/0001-caching-architecture.md` for the 4-tier cache architecture). With `vite dev`:
+`v1.md` for the 4-tier cache architecture). With `vite dev`:
 
 - `GET /tiles/latest.json` → 404 (no Pages Function runtime).
 - App fails to load domain metadata → white screen.
@@ -96,9 +96,9 @@ path works exactly like production.
   (setTime, setDomain, setVariable, setTzOffsetSeconds, etc.).
 - `functions/` — Cloudflare Pages Functions. The `tiles/[[path]].ts` catch-all
   serves `.om` + `latest.json` from R2, falls back to upstream, fills R2 via
-  `waitUntil`. See `docs/adr/0001-caching-architecture.md`.
+  `waitUntil`. See `v1.md` §1.1.
 - `worker-cron/` — separate Cloudflare Worker that fires the tile warmer on
-  a schedule (see `docs/adr/0001-caching-architecture.md`). Has its own `npm run dev` via `wrangler dev`.
+  a schedule (§1.2 in `v1.md`). Has its own `npm run dev` via `wrangler dev`.
 - `wrangler.toml` — Pages project config with the R2 binding.
 
 ## Gotchas

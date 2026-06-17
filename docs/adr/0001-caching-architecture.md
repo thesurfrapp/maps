@@ -62,7 +62,7 @@ Pages Function
 |---|---|---|---|
 | T1 | Browser | `.om`: 30 d + `immutable` (URL uniquely identifies a run, bytes never change). `latest.json`: `no-store`, never cached. | Any `.om` HIT response |
 | T2 | CF edge (per-PoP, + Smart Tiered Cache upper tier) | 30 d from the Cache Rule, which ignores `Cache-Control` on `.om`. | First user at each PoP; invalidated globally by cron on run swap |
-| T3 | R2 bucket `surfr-tile-cache` (ENAM region) | Current run + 2 prior runs retained; older pruned on each warm swap. | Cron warmer (proactive, 72 h horizon; 120 h for GFS/ECMWF/ICON) + Pages Function `waitUntil(warmR2)` lazy fill (files outside the horizon) |
+| T3 | R2 bucket `surfr-tile-cache` (ENAM region) | Current run + 2 prior runs retained; older pruned on each warm swap. | Cron warmer (proactive, 72 h horizon) + Pages Function `waitUntil(warmR2)` lazy fill (files outside the horizon) |
 | T4 | Open-Meteo origin | n/a | — |
 
 ### Client URL shape
@@ -76,7 +76,7 @@ immutable URL — ETag is stable, `Range` requests always return 206, browsers
 can cache the bytes with `immutable` and never revalidate.
 
 Clients derive the runPath from our R2 `latest.json` on page load
-(`src/lib/url.ts:getOMUrl` → `fmtModelRun`). The Pages
+(`src/lib/url.ts:getOMUrl` / `getNextOmUrls` → `fmtModelRun`). The Pages
 Function serves `.om` requests directly from R2 at the exact key — no
 server-side rewriting.
 
@@ -97,7 +97,7 @@ no-store`. If R2 has no object, the Pages Function returns `503
 Service Unavailable` + `Retry-After: 60`. No origin fallback.
 
 Serving from R2 only guarantees that clients only ever see a `reference_time`
-whose in-horizon `.om` files are already in R2 (the warmer writes `latest.json`
+whose 72 h of `.om` files are already in R2 (the warmer writes `latest.json`
 after all `.om` files for the run have been PUT). `no-store` prevents the
 browser or CF edge from caching a pointer that moves between runs — a stale
 pointer would let the client build a runPath URL for a run we've pruned.
@@ -113,7 +113,7 @@ Code: `functions/tiles/[[path]].ts:R2_JSON_KEY` + `serveJsonFromR2`.
 ### End-to-end invariant
 
 > If a client sees a `reference_time` in `latest.json`, every `.om` URL
-> derived from it (domain × runPath × validTime within the warm horizon)
+> derived from it (domain × runPath × validTime within the 72 h horizon)
 > is already in R2.
 
 Because:
@@ -126,23 +126,19 @@ Because:
 4. Old runs stay on R2 for 2 swaps beyond the one that retired them, so
    in-flight tabs holding an older runPath still resolve.
 
-### The warm horizon and what happens outside it
+### The 72 h window and what happens outside it
 
 The cron warmer caps per-domain warming at **72 hours** of forecast horizon
-from the run's `reference_time` (`DEFAULT_HORIZON_HOURS` in
-`functions/lib/warmer.ts`). Global/longer-range models that users reach for
-when planning ahead — `ncep_gfs013`, `ncep_gfs025`, `ecmwf_ifs025`,
-`dwd_icon`, `dwd_icon_d2` — get an extended **120 h (5 d)** horizon
-(`EXTENDED_HORIZON_HOURS` / `EXTENDED_HORIZON_DOMAINS`). Rationale: most
-users scrub within ±48 h; warming the full 10-day GFS horizon would balloon
-R2 writes with low payoff.
+from the run's `reference_time` (`MAX_HORIZON_HOURS` in
+`functions/lib/warmer.ts`). Rationale: most users scrub within ±48 h; warming
+the full 10-day GFS horizon would balloon R2 writes with low payoff.
 
-**Inside the horizon:**
+**Inside the 72 h window:**
 - R2 has the file. Pages Function serves from R2 (HIT-R2 ~100–500 ms).
 - First user at a cold PoP pays one R2-read; subsequently CF edge HIT
   (~20–120 ms) until the 30 d Cache Rule TTL expires.
 
-**Outside the horizon:**
+**Outside the 72 h window:**
 1. Client request → CF edge MISS → Pages Function.
 2. `R2.get` → null.
 3. Falls through to `fetch(upstream, cf.cacheEverything=true)`. Origin
@@ -178,8 +174,7 @@ Inside the Pages Function (`functions/lib/warmer.ts:warmDomain`):
 4. Otherwise:
    a. Fetch upstream `meta.json` for the new run (server-side only, to get
       the full `valid_times` list).
-   b. Cap `valid_times` to the domain's warm horizon (+72 h, or +120 h
-      for the extended-horizon domains) from `reference_time`.
+   b. Cap `valid_times` to +72 h from `reference_time`.
    c. Warm each capped validTime to R2 with concurrency 4 (stop-on-404 if
       upstream is still uploading, skip already-in-R2 via `head`,
       per-domain 4 min deadline).
@@ -190,8 +185,7 @@ Inside the Pages Function (`functions/lib/warmer.ts:warmDomain`):
       run only after this completes.
    f. `pruneOldRunFiles`: list all `.om` keys under `data_spatial/<domain>/`,
       group by runPath, keep newest 3 (current + 2 prior), delete the rest.
-   g. Return `{ status: 'warmed', referenceTime, previousReferenceTime,
-      validTimes, files, prunedOldFiles, keptRunPaths, wallMs }`.
+   g. Return `{ status: 'warmed', referenceTime, validTimes, files, prunedOldFiles, keptRunPaths }`.
 
 The cron worker does no further work after a `warmed` result. Because
 every URL a client builds includes the runPath (the immutable per-run
@@ -357,7 +351,7 @@ replayed from the originally-cached response.)
 Debug URLs (append `?token=<ADMIN_TOKEN>`):
 - `/tiles/_admin` — HTML dashboard.
 - `/tiles/_debug/cache` — JSON inventory.
-- `/tiles/_debug/cache?prefix=data_spatial/dwd_icon_d2/` — filter.
+- `/tiles/_debug/cache?prefix=data_spatial/dwd_icon_eu/` — filter.
 
 ## Capacity and cost
 
@@ -399,7 +393,7 @@ Positive:
 Negative:
 - First user per PoP pays a one-time MISS cost per URL.
 - Outside-horizon requests fall through to origin; small tail latency hit
-  for rare scrubs past the warm horizon.
+  for rare scrubs past +72 h.
 - Architecture has three moving parts (Pages Function, cron Worker, zone
   Cache Rule). A Cache Rule misconfiguration silently reverts the system
   to "every request is DYNAMIC".

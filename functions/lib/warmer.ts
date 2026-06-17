@@ -277,8 +277,9 @@ export type DomainResult =
 			status: 'warmed';
 			referenceTime: string;
 			previousReferenceTime: string | null;
-			// Full list of ISO validTimes that were warmed in this run
-			// (diagnostic — surfaced in the warmer-trigger JSON response).
+			// Full list of ISO validTimes that were warmed in this run. The cron
+			// worker uses these to build stripped client-facing URLs for CF cache
+			// purge + re-warm after a run swap.
 			validTimes: string[];
 			files: { ok: number; skip: number; fail: number; timedOut: boolean };
 			prunedOldFiles: number;
