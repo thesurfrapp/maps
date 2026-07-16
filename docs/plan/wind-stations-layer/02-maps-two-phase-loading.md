@@ -14,12 +14,16 @@ paint-only repaint — no re-parse, no re-cluster, no symbol re-layout at cluste
 
 ## Decisions already made (do NOT re-litigate)
 
-- **Two-phase data model.** `stations/live-cluster.json` (nightly, cached hard,
-  generation version `v`) + `stations/readings.json` (5-min, `max-age=300` + SWR),
-  served from the PUBLIC leader bucket (the main app bucket is private and 403s anonymous requests)
-  (`https://storage.googleapis.com/surfrleaderboards/stations/... (test: surfrleaderboardstest)`). Produced by
-  SRF-2643; formats documented in the backend plan.md
+- **Two-phase data model.** `live-cluster.json` (nightly, cached hard, generation
+  version `v`) + `readings.json` (5-min, `max-age=300` + SWR). Produced by SRF-2643;
+  formats documented in the backend plan.md
   (`backend/docs/plan/wind-stations-layer/01-backend-live-cluster-readings.md`).
+- **Served same-origin via a `/stations/*` Pages Function** (mirrors the `/tiles/*`
+  proxy): Cloudflare edge cache in front of the public GCS bucket
+  (`storage.googleapis.com/surfrleaderboards/stations/`, test `surfrleaderboardstest`
+  via the `STATIONS_ORIGIN` env override). No bucket URL in the client, no GCS CORS
+  config needed, and if the bucket ever goes private, auth moves into the Function's
+  env — never into the webview. Allowlist: the three files; `meta.json` stays internal.
 - **One rendering switch at z8, spots' shape without spots' data swap.** z0–7 cluster
   nodes (circle layer), z8+ individuals. Both ship in the single live-cluster; the boundary
   is layer `minzoom`/`maxzoom` constants. The z11 speed-label appearance is a text
