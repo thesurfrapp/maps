@@ -31,8 +31,10 @@ paint-only repaint — no re-parse, no re-cluster, no symbol re-layout at cluste
 - **Clusters are color-only** (max wind via `setFeatureState`) — no numbers, no arrows
   on bubbles. feature-state drives paint properties only; numbers/arrows appear on
   individuals at z8+.
-- **Live-cluster is URL-fed** to the GeoJSON source so MapLibre parses it in its worker —
-  zero main-thread JSON work on the critical path.
+- **Live-cluster is fetched once per rotation** (browser HTTP cache → repeat opens are
+  network-free) and fed to the source via `setData`. Not URL-fed: the client needs the
+  id→coords index anyway (to build the pill source and answer taps) and the `v` for the
+  version guard — one ~10 ms parse per 6h-cached fetch, never per refresh.
 - **Live merge:** readings → id-keyed hashmap → `setFeatureState` for node/dot colors;
   pills/arrows/labels at z8+ refresh via one small `setData` per cycle. **Absence from
   the hashmap (or `obsTs` > 60 min) renders dimmed** — no staleness field exists.

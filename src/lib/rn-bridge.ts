@@ -118,7 +118,13 @@ type InMsg =
 	// domain causing repeated metadata fetch failures) and no in-WebView
 	// interaction un-sticks it.
 	| { type: 'clearState' }
-	| { type: 'setWindyStationsConfig'; endpoint?: string; visible?: boolean };
+	| {
+			type: 'setWindyStationsConfig';
+			endpoint?: string;
+			visible?: boolean;
+			/** Optional override for the station-file base URL (default: same-origin /stations). */
+			stationsBaseUrl?: string;
+	  };
 
 declare global {
 	interface Window {
@@ -553,7 +559,12 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 					postToRN({ type: 'forecastLocationSet', lat: s.lat, lng: s.lon });
 				};
 				if (msg.endpoint) {
-					setWindyStationsConfig({ endpoint: msg.endpoint, visible: msg.visible, onStationTap });
+					setWindyStationsConfig({
+						endpoint: msg.endpoint,
+						stationsBaseUrl: msg.stationsBaseUrl,
+						visible: msg.visible,
+						onStationTap
+					});
 				}
 				if (msg.visible !== undefined) {
 					setWindyStationsVisible(map, msg.visible);
