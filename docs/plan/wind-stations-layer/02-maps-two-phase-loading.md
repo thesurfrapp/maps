@@ -14,10 +14,10 @@ paint-only repaint — no re-parse, no re-cluster, no symbol re-layout at cluste
 
 ## Decisions already made (do NOT re-litigate)
 
-- **Two-phase data model.** `cache/stations/live-cluster.json` (nightly, cached hard,
-  generation version `v`) + `cache/stations/readings.json` (5-min, `max-age=300` + SWR),
-  served from the main GCS bucket
-  (`https://storage.googleapis.com/<bucket>/cache/stations/...`). Produced by
+- **Two-phase data model.** `stations/live-cluster.json` (nightly, cached hard,
+  generation version `v`) + `stations/readings.json` (5-min, `max-age=300` + SWR),
+  served from the PUBLIC leader bucket (the main app bucket is private and 403s anonymous requests)
+  (`https://storage.googleapis.com/surfrleaderboards/stations/... (test: surfrleaderboardstest)`). Produced by
   SRF-2643; formats documented in the backend plan.md
   (`backend/docs/plan/wind-stations-layer/01-backend-live-cluster-readings.md`).
 - **One rendering switch at z8, spots' shape without spots' data swap.** z0–7 cluster
