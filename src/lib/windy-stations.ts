@@ -813,8 +813,16 @@ export const setWindyStationsVisible = (map: maplibregl.Map, visible: boolean): 
 		}
 	}
 	if (visible && currentMap) {
-		// Re-show: cached data is still on the sources; just catch up readings.
-		void refreshReadings(currentMap);
+		if (baseVersion === null) {
+			// First show (RN configures endpoint and visibility in separate
+			// messages, so the config path may never have bootstrapped): load
+			// the live-cluster before hydrating, or readings have nothing to
+			// attach to.
+			void bootstrap(currentMap);
+		} else {
+			// Re-show: cached data is still on the sources; just catch up.
+			void refreshReadings(currentMap);
+		}
 		startTimer(currentMap);
 	} else {
 		stopTimer();
