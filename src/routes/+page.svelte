@@ -224,7 +224,9 @@
 			// buttons + clipping panel) was removed when we simplified the
 			// standalone UI to just OverlayPills + TimeSelector. Keep the load
 			// flow itself.
+			console.debug('[map-load] fired; awaiting initial metadata…');
 			if (getInitialMetaDataPromise) await getInitialMetaDataPromise;
+			console.debug('[map-load] metadata ready; installing layers + bridge');
 
 			addTerrainSource($map);
 			addTerrainSource($map, 'terrainSource2');
@@ -238,6 +240,7 @@
 			initWindyStations($map);
 
 			rnBridgeCleanup = installRnBridge($map);
+			console.debug('[map-load] complete — rn-bridge installed');
 		});
 	});
 

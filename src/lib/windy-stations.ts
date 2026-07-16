@@ -109,11 +109,15 @@ const ktsColorStops = (): (number | string)[] => {
 };
 
 // Paint expression: color by live kts from feature-state, dim when absent.
+// MapLibre expressions can't compare against a null literal, so absence is
+// mapped to a -1 sentinel via coalesce (real kts are always >= 0).
 const liveKtsColorExpr = [
-	'case',
-	['==', ['feature-state', 'kts'], null],
+	'interpolate',
+	['linear'],
+	['coalesce', ['feature-state', 'kts'], -1],
+	-1,
 	DIM_COLOR,
-	['interpolate', ['linear'], ['feature-state', 'kts'], ...ktsColorStops()]
+	...ktsColorStops()
 ];
 
 const emptyFc: GeoJSON.FeatureCollection = { type: 'FeatureCollection', features: [] };
@@ -469,14 +473,15 @@ const ensureLayers = (map: maplibregl.Map): void => {
 
 	// Direction arrow — ONLY when a direction is known. A station reporting
 	// speed without direction must not fabricate a due-north arrow (the old
-	// `?? 0` bug).
+	// `?? 0` bug). The windDir key is omitted from feature properties when the
+	// reading has no direction, so `has` is the guard.
 	if (!map.getLayer(LAYER_ID_ARROW)) {
 		map.addLayer({
 			id: LAYER_ID_ARROW,
 			type: 'symbol',
 			source: SOURCE_LIVE,
 			minzoom: SWITCH_ZOOM,
-			filter: ['!=', ['get', 'windDir'], null],
+			filter: ['has', 'windDir'],
 			layout: {
 				'icon-image': ['case', isLightPillExpr, ARROW_IMAGE_ID_DARK, ARROW_IMAGE_ID] as never,
 				'icon-rotate': ['+', ['get', 'windDir'], 180] as never,
@@ -572,18 +577,22 @@ const applyReadings = (map: maplibregl.Map, readings: ReadingsFile): void => {
 		map.setFeatureState({ source: SOURCE_BASE, id }, { kts, live: true });
 		nextLiveIds.add(id);
 
+		// Null-valued keys are OMITTED (not set to null): the arrow layer's
+		// `has windDir` filter relies on absence, and MapLibre expressions
+		// can't test against null literals.
+		const props: Record<string, unknown> = {
+			id,
+			windKts: kts,
+			windKtsRounded: Math.round(kts),
+			updatedAt: obsTsSec * 1000
+		};
+		if (dir != null) props.windDir = dir;
+		if (gust != null) props.gustKts = gust;
+		if (base.source != null) props.source = base.source;
 		features.push({
 			type: 'Feature',
 			geometry: { type: 'Point', coordinates: [base.lon, base.lat] },
-			properties: {
-				id,
-				windKts: kts,
-				windKtsRounded: Math.round(kts),
-				windDir: dir,
-				gustKts: gust,
-				updatedAt: obsTsSec * 1000,
-				source: base.source
-			}
+			properties: props as GeoJSON.GeoJsonProperties
 		});
 	}
 	for (const id of liveIds) {
@@ -773,11 +782,18 @@ const bootstrap = async (map: maplibregl.Map): Promise<void> => {
 };
 
 export const initWindyStations = (map: maplibregl.Map): void => {
-	currentMap = map;
-	ensureLayers(map);
-	attachInteractionHandlers(map);
-	visibilityListener = onVisibilityChange;
-	document.addEventListener('visibilitychange', visibilityListener);
+	// Boundary guard: a stations-layer failure must never break the caller's
+	// map-load flow (the RN bridge installs after us) — degrade to "no station
+	// layer" and shout in the console instead.
+	try {
+		currentMap = map;
+		ensureLayers(map);
+		attachInteractionHandlers(map);
+		visibilityListener = onVisibilityChange;
+		document.addEventListener('visibilitychange', visibilityListener);
+	} catch (e) {
+		console.error('[windy-stations] init failed — station layer disabled', e);
+	}
 };
 
 export const setWindyStationsConfig = (config: WindyStationsConfig): void => {
