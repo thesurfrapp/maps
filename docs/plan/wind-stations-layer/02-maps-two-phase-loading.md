@@ -14,12 +14,16 @@ paint-only repaint — no re-parse, no re-cluster, no symbol re-layout at cluste
 
 ## Decisions already made (do NOT re-litigate)
 
-- **Two-phase data model.** `stations/live-cluster.json` (nightly, cached hard,
-  generation version `v`) + `stations/readings.json` (5-min, `max-age=300` + SWR),
-  served from the PUBLIC leader bucket (the main app bucket is private and 403s anonymous requests)
-  (`https://storage.googleapis.com/surfrleaderboards/stations/... (test: surfrleaderboardstest)`). Produced by
-  SRF-2643; formats documented in the backend plan.md
+- **Two-phase data model.** `live-cluster.json` (nightly, cached hard, generation
+  version `v`) + `readings.json` (5-min, `max-age=300` + SWR). Produced by SRF-2643;
+  formats documented in the backend plan.md
   (`backend/docs/plan/wind-stations-layer/01-backend-live-cluster-readings.md`).
+- **Served same-origin via a `/stations/*` Pages Function** (mirrors the `/tiles/*`
+  proxy): Cloudflare edge cache in front of the public GCS bucket
+  (`storage.googleapis.com/surfrleaderboards/stations/`, test `surfrleaderboardstest`
+  via the `STATIONS_ORIGIN` env override). No bucket URL in the client, no GCS CORS
+  config needed, and if the bucket ever goes private, auth moves into the Function's
+  env — never into the webview. Allowlist: the three files; `meta.json` stays internal.
 - **One rendering switch at z8, spots' shape without spots' data swap.** z0–7 cluster
   nodes (circle layer), z8+ individuals. Both ship in the single live-cluster; the boundary
   is layer `minzoom`/`maxzoom` constants. The z11 speed-label appearance is a text
@@ -31,8 +35,10 @@ paint-only repaint — no re-parse, no re-cluster, no symbol re-layout at cluste
 - **Clusters are color-only** (max wind via `setFeatureState`) — no numbers, no arrows
   on bubbles. feature-state drives paint properties only; numbers/arrows appear on
   individuals at z8+.
-- **Live-cluster is URL-fed** to the GeoJSON source so MapLibre parses it in its worker —
-  zero main-thread JSON work on the critical path.
+- **Live-cluster is fetched once per rotation** (browser HTTP cache → repeat opens are
+  network-free) and fed to the source via `setData`. Not URL-fed: the client needs the
+  id→coords index anyway (to build the pill source and answer taps) and the `v` for the
+  version guard — one ~10 ms parse per 6h-cached fetch, never per refresh.
 - **Live merge:** readings → id-keyed hashmap → `setFeatureState` for node/dot colors;
   pills/arrows/labels at z8+ refresh via one small `setData` per cycle. **Absence from
   the hashmap (or `obsTs` > 60 min) renders dimmed** — no staleness field exists.
