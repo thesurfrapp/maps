@@ -32,10 +32,6 @@ import type * as maplibregl from 'maplibre-gl';
 const SOURCE_BASE = 'windy-stations-base'; // live-cluster: nodes + all stations
 const SOURCE_LIVE = 'windy-stations'; // stations with a current reading (pills)
 
-export const LAYER_ID_NODES_COARSE = 'windy-stations-nodes-coarse';
-export const LAYER_ID_NODES = 'windy-stations-nodes';
-export const LAYER_ID_NODE_COUNT_COARSE = 'windy-stations-node-count-coarse';
-export const LAYER_ID_NODE_COUNT = 'windy-stations-node-count';
 export const LAYER_ID_DOTS = 'windy-stations-dots';
 export const LAYER_ID_SELECTION_PILL = 'windy-stations-selection-pill';
 export const LAYER_ID_PILL = 'windy-stations-pill';
@@ -54,11 +50,37 @@ const DEFAULT_STATIONS_BASE_URL = '/stations';
 const LIVE_CLUSTER_FILE = 'live-cluster.json';
 const READINGS_FILE = 'readings.json';
 
-// The rendering ladder: coarse count-bubbles (z5 grid) at continent zoom,
-// fine nodes (z8 grid) at regional zoom, individuals from the switch up.
-// The tier boundary mirrors the coarse tier's baked expansionZoom (6).
-const COARSE_MAX_ZOOM = 6;
+// The rendering ladder: individuals from the switch up, count-bubble node
+// tiers below. Each tier's zoom band starts where its grid's cell spacing
+// safely exceeds the max bubble diameter, so bubbles never overlap: z3 cells
+// are ≥64px at z1, z5 cells ≥128px at z4, z8 cells ≥64px at z6.
 const SWITCH_ZOOM = 8;
+type NodeTier = {
+	grid: number;
+	minZoom: number;
+	maxZoom: number;
+	/** radius = min(cap, base + k·√count) */
+	radius: { base: number; k: number; cap: number };
+	textSize: number;
+	/** Legacy files carry ungridded nodes — only the z8 tier accepts them. */
+	acceptsLegacy?: boolean;
+};
+const NODE_TIERS: NodeTier[] = [
+	{ grid: 3, minZoom: 0, maxZoom: 4, radius: { base: 8, k: 1.6, cap: 22 }, textSize: 11 },
+	{ grid: 5, minZoom: 4, maxZoom: 6, radius: { base: 7, k: 1.5, cap: 20 }, textSize: 11 },
+	{
+		grid: 8,
+		minZoom: 6,
+		maxZoom: SWITCH_ZOOM,
+		radius: { base: 6, k: 1.2, cap: 16 },
+		textSize: 10,
+		acceptsLegacy: true
+	}
+];
+const nodeLayerId = (grid: number): string => `windy-stations-nodes-z${grid}`;
+const nodeCountLayerId = (grid: number): string => `windy-stations-node-count-z${grid}`;
+const NODE_LAYER_IDS = NODE_TIERS.map((t) => nodeLayerId(t.grid));
+const NODE_COUNT_LAYER_IDS = NODE_TIERS.map((t) => nodeCountLayerId(t.grid));
 // Matches the backend's refresh cadence + the readings file's max-age.
 const REFRESH_MS = 5 * 60_000;
 // A reading older than this renders dimmed even if still in the file
@@ -338,60 +360,12 @@ const ensureLayers = (map: maplibregl.Map): void => {
 
 	// Cluster nodes — spots-style count bubbles (SRF-2660): radius grows with
 	// the station count, a count label sits inside, color = live max wind via
-	// feature-state (paint-only repaint on refresh, no re-layout).
-	// Coarse tier (z5 grid) carries continent zoom; fine tier (z8 grid) covers
-	// regional zoom until the individual-station switch.
-	if (!map.getLayer(LAYER_ID_NODES_COARSE)) {
-		map.addLayer({
-			id: LAYER_ID_NODES_COARSE,
-			type: 'circle',
-			source: SOURCE_BASE,
-			maxzoom: COARSE_MAX_ZOOM,
-			filter: ['all', ['==', ['get', 'node'], true], ['==', ['get', 'grid'], 5]],
-			paint: {
-				'circle-color': liveKtsColorExpr as never,
-				'circle-radius': [
-					'min',
-					24,
-					['+', 8, ['*', 1.8, ['sqrt', ['get', 'count']]]]
-				] as never,
-				'circle-stroke-width': 1.5,
-				'circle-stroke-color': 'rgba(255,255,255,0.7)',
-				'circle-opacity': 0.92
-			}
-		});
-	}
-	if (!map.getLayer(LAYER_ID_NODES)) {
-		map.addLayer({
-			id: LAYER_ID_NODES,
-			type: 'circle',
-			source: SOURCE_BASE,
-			minzoom: COARSE_MAX_ZOOM,
-			maxzoom: SWITCH_ZOOM,
-			// Legacy tolerance: nodes from a pre-SRF-2660 live-cluster carry no
-			// grid property — treat them as the fine tier.
-			filter: [
-				'all',
-				['==', ['get', 'node'], true],
-				['any', ['!', ['has', 'grid']], ['==', ['get', 'grid'], 8]]
-			],
-			paint: {
-				'circle-color': liveKtsColorExpr as never,
-				'circle-radius': [
-					'min',
-					18,
-					['+', 7, ['*', 1.3, ['sqrt', ['get', 'count']]]]
-				] as never,
-				'circle-stroke-width': 1.5,
-				'circle-stroke-color': 'rgba(255,255,255,0.7)',
-				'circle-opacity': 0.92
-			}
-		});
-	}
-
-	// Count labels inside the bubbles — counts are static properties from the
-	// live-cluster file (layout/text from properties is fine; only LIVE values
-	// are constrained to feature-state). Singles show no number.
+	// feature-state (paint-only repaint on refresh, no re-layout). One
+	// circle + count-label layer pair per pre-baked tier. A tier missing from
+	// the file matches nothing via its grid filter; loadBase extends the next
+	// finer tier's zoom range downward to cover the gap. Singles show no
+	// number (counts are static file properties — only LIVE values are
+	// constrained to feature-state).
 	const countLabelLayout = {
 		'text-field': ['to-string', ['get', 'count']] as never,
 		'text-font': ['Noto Sans Regular'],
@@ -403,38 +377,50 @@ const ensureLayers = (map: maplibregl.Map): void => {
 		'text-halo-color': 'rgba(20,26,38,0.55)',
 		'text-halo-width': 1.1
 	};
-	if (!map.getLayer(LAYER_ID_NODE_COUNT_COARSE)) {
-		map.addLayer({
-			id: LAYER_ID_NODE_COUNT_COARSE,
-			type: 'symbol',
-			source: SOURCE_BASE,
-			maxzoom: COARSE_MAX_ZOOM,
-			filter: [
-				'all',
-				['==', ['get', 'node'], true],
-				['==', ['get', 'grid'], 5],
-				['>', ['get', 'count'], 1]
-			],
-			layout: { ...countLabelLayout, 'text-size': 11 },
-			paint: countLabelPaint
-		});
-	}
-	if (!map.getLayer(LAYER_ID_NODE_COUNT)) {
-		map.addLayer({
-			id: LAYER_ID_NODE_COUNT,
-			type: 'symbol',
-			source: SOURCE_BASE,
-			minzoom: COARSE_MAX_ZOOM,
-			maxzoom: SWITCH_ZOOM,
-			filter: [
-				'all',
-				['==', ['get', 'node'], true],
-				['any', ['!', ['has', 'grid']], ['==', ['get', 'grid'], 8]],
-				['>', ['get', 'count'], 1]
-			],
-			layout: { ...countLabelLayout, 'text-size': 10 },
-			paint: countLabelPaint
-		});
+	for (const tier of NODE_TIERS) {
+		const gridMatch = tier.acceptsLegacy
+			? // Legacy files carry ungridded nodes — fold them into this tier.
+				['any', ['!', ['has', 'grid']], ['==', ['get', 'grid'], tier.grid]]
+			: ['==', ['get', 'grid'], tier.grid];
+		const radiusExpr = [
+			'min',
+			tier.radius.cap,
+			['+', tier.radius.base, ['*', tier.radius.k, ['sqrt', ['get', 'count']]]]
+		];
+		if (!map.getLayer(nodeLayerId(tier.grid))) {
+			map.addLayer({
+				id: nodeLayerId(tier.grid),
+				type: 'circle',
+				source: SOURCE_BASE,
+				minzoom: tier.minZoom,
+				maxzoom: tier.maxZoom,
+				filter: ['all', ['==', ['get', 'node'], true], gridMatch] as never,
+				paint: {
+					'circle-color': liveKtsColorExpr as never,
+					'circle-radius': radiusExpr as never,
+					'circle-stroke-width': 1.5,
+					'circle-stroke-color': 'rgba(255,255,255,0.7)',
+					'circle-opacity': 0.92
+				}
+			});
+		}
+		if (!map.getLayer(nodeCountLayerId(tier.grid))) {
+			map.addLayer({
+				id: nodeCountLayerId(tier.grid),
+				type: 'symbol',
+				source: SOURCE_BASE,
+				minzoom: tier.minZoom,
+				maxzoom: tier.maxZoom,
+				filter: [
+					'all',
+					['==', ['get', 'node'], true],
+					gridMatch,
+					['>', ['get', 'count'], 1]
+				] as never,
+				layout: { ...countLabelLayout, 'text-size': tier.textSize },
+				paint: countLabelPaint
+			});
+		}
 	}
 
 	// Station dots — z8+, every station from the base file. Colored when a
@@ -603,12 +589,15 @@ const loadBase = async (map: maplibregl.Map, reload = false): Promise<boolean> =
 
 		baseVersion = typeof fc.v === 'number' ? fc.v : null;
 		baseIndex = new Map();
-		let hasCoarseTier = false;
+		const gridsInFile = new Set<number>();
+		let hasLegacyNodes = false;
 		for (const f of fc.features as LiveClusterFeature[]) {
 			const p = f.properties;
 			if (!p || !f.geometry) continue;
 			if (p.node) {
-				if ((p as { grid?: number }).grid === 5) hasCoarseTier = true;
+				const grid = (p as { grid?: number }).grid;
+				if (typeof grid === 'number') gridsInFile.add(grid);
+				else hasLegacyNodes = true;
 				continue;
 			}
 			baseIndex.set(p.id, {
@@ -620,13 +609,21 @@ const loadBase = async (map: maplibregl.Map, reload = false): Promise<boolean> =
 		}
 		getSource(map, SOURCE_BASE)?.setData(fc);
 
-		// Rollout fallback: a pre-SRF-2660 file has no z5 tier, which would
-		// leave z0–6 empty (the coarse layer filters on grid==5). Extend the
-		// fine tier down to z0 until a coarse-capable file arrives.
-		for (const layerId of [LAYER_ID_NODES, LAYER_ID_NODE_COUNT]) {
-			if (map.getLayer(layerId)) {
-				map.setLayerZoomRange(layerId, hasCoarseTier ? COARSE_MAX_ZOOM : 0, SWITCH_ZOOM);
+		// Rollout fallback: older files may lack the coarser tiers (or carry
+		// only ungridded legacy nodes, which the legacy-accepting tier
+		// renders). Walk the ladder coarsest→finest and hand each missing
+		// tier's zoom band to the next available finer tier, so no zoom range
+		// ever renders nothing.
+		let carryMin = 0;
+		for (const tier of NODE_TIERS) {
+			const available = gridsInFile.has(tier.grid) || (tier.acceptsLegacy && hasLegacyNodes);
+			if (!available) continue; // its grid filter matches nothing anyway
+			for (const layerId of [nodeLayerId(tier.grid), nodeCountLayerId(tier.grid)]) {
+				if (map.getLayer(layerId)) {
+					map.setLayerZoomRange(layerId, carryMin, tier.maxZoom);
+				}
 			}
+			carryMin = tier.maxZoom;
 		}
 		return true;
 	} catch (e) {
@@ -846,7 +843,7 @@ const attachInteractionHandlers = (map: maplibregl.Map): void => {
 		map.on('mouseenter', layerId, setCursorPointer);
 		map.on('mouseleave', layerId, setCursorDefault);
 	}
-	for (const layerId of [LAYER_ID_NODES, LAYER_ID_NODES_COARSE]) {
+	for (const layerId of NODE_LAYER_IDS) {
 		map.on('click', layerId, handleNodeClick);
 		map.on('mouseenter', layerId, setCursorPointer);
 		map.on('mouseleave', layerId, setCursorDefault);
@@ -859,7 +856,7 @@ const detachInteractionHandlers = (map: maplibregl.Map): void => {
 		map.off('mouseenter', layerId, setCursorPointer);
 		map.off('mouseleave', layerId, setCursorDefault);
 	}
-	for (const layerId of [LAYER_ID_NODES, LAYER_ID_NODES_COARSE]) {
+	for (const layerId of NODE_LAYER_IDS) {
 		map.off('click', layerId, handleNodeClick);
 		map.off('mouseenter', layerId, setCursorPointer);
 		map.off('mouseleave', layerId, setCursorDefault);
@@ -869,10 +866,8 @@ const detachInteractionHandlers = (map: maplibregl.Map): void => {
 // ── public API (unchanged surface) ─────────────────────────────────────────
 
 const ALL_LAYERS = [
-	LAYER_ID_NODES_COARSE,
-	LAYER_ID_NODES,
-	LAYER_ID_NODE_COUNT_COARSE,
-	LAYER_ID_NODE_COUNT,
+	...NODE_LAYER_IDS,
+	...NODE_COUNT_LAYER_IDS,
 	LAYER_ID_DOTS,
 	LAYER_ID_SELECTION_PILL,
 	LAYER_ID_PILL,
