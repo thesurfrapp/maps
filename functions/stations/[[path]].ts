@@ -83,25 +83,44 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 	const forceRefresh = request.headers.get(FORCE_REFRESH_HEADER) === '1';
 
 	const fetchStart = Date.now();
-	const upstream = await fetch(upstreamUrl, {
-		method: request.method,
-		headers: upstreamHeaders,
-		cf: forceRefresh
-			? // Bypass and overwrite the edge entry — the client detected a
-				// version mismatch, so the cached copy is known-stale.
-				{ cacheEverything: true, cacheTtl: 0 }
-			: {
-					cacheEverything: true,
-					cacheTtl: policy.edgeTtl,
-					cacheTtlByStatus: {
-						'200-299': policy.edgeTtl,
-						// A 404 means the backend hasn't published yet (first
-						// deploy) — don't pin that state to the edge for long.
-						'404': 60,
-						'500-599': 0
-					}
+	let upstream: Response;
+	if (forceRefresh) {
+		// The client detected a version mismatch, so the edge-cached copy is
+		// known-stale. cf.cacheTtl:0 only prevents STORING — it still SERVES
+		// an existing entry (verified empirically) — so bypass via the
+		// standard no-store cache mode, with a query-bust fallback for
+		// runtimes that reject it. GCS ignores unknown query params on
+		// public objects.
+		try {
+			upstream = await fetch(upstreamUrl, {
+				method: request.method,
+				headers: upstreamHeaders,
+				cache: 'no-store'
+			});
+		} catch {
+			upstream = await fetch(`${upstreamUrl}?fr=${Date.now()}`, {
+				method: request.method,
+				headers: upstreamHeaders,
+				cf: { cacheEverything: false }
+			});
+		}
+	} else {
+		upstream = await fetch(upstreamUrl, {
+			method: request.method,
+			headers: upstreamHeaders,
+			cf: {
+				cacheEverything: true,
+				cacheTtl: policy.edgeTtl,
+				cacheTtlByStatus: {
+					'200-299': policy.edgeTtl,
+					// A 404 means the backend hasn't published yet (first
+					// deploy) — don't pin that state to the edge for long.
+					'404': 60,
+					'500-599': 0
 				}
-	});
+			}
+		});
+	}
 	const upstreamMs = Date.now() - fetchStart;
 
 	const headers = new Headers();
