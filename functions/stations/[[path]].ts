@@ -39,10 +39,15 @@ const FILES: Record<string, { edgeTtl: number; browserCacheControl: string }> = 
 	}
 };
 
+// Client sends this on a version-guard reload (base/readings v mismatch) so
+// a stale edge-cached file can't outlive a rotation — same mechanism as the
+// tiles proxy.
+const FORCE_REFRESH_HEADER = 'X-Surfr-Force-Refresh';
+
 const corsHeaders = {
 	'Access-Control-Allow-Origin': '*',
 	'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-	'Access-Control-Allow-Headers': 'If-None-Match, If-Modified-Since',
+	'Access-Control-Allow-Headers': `If-None-Match, If-Modified-Since, ${FORCE_REFRESH_HEADER}`,
 	'Access-Control-Expose-Headers': 'ETag, Content-Length, X-Surfr-Upstream-Ms',
 	'Access-Control-Max-Age': '3000'
 };
@@ -75,22 +80,47 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 	const inm = request.headers.get('If-None-Match');
 	if (inm) upstreamHeaders.set('If-None-Match', inm);
 
+	const forceRefresh = request.headers.get(FORCE_REFRESH_HEADER) === '1';
+
 	const fetchStart = Date.now();
-	const upstream = await fetch(upstreamUrl, {
-		method: request.method,
-		headers: upstreamHeaders,
-		cf: {
-			cacheEverything: true,
-			cacheTtl: policy.edgeTtl,
-			cacheTtlByStatus: {
-				'200-299': policy.edgeTtl,
-				// A 404 means the backend hasn't published yet (first deploy) —
-				// don't pin that state to the edge for long.
-				'404': 60,
-				'500-599': 0
-			}
+	let upstream: Response;
+	if (forceRefresh) {
+		// The client detected a version mismatch, so the edge-cached copy is
+		// known-stale. cf.cacheTtl:0 only prevents STORING — it still SERVES
+		// an existing entry (verified empirically) — so bypass via the
+		// standard no-store cache mode, with a query-bust fallback for
+		// runtimes that reject it. GCS ignores unknown query params on
+		// public objects.
+		try {
+			upstream = await fetch(upstreamUrl, {
+				method: request.method,
+				headers: upstreamHeaders,
+				cache: 'no-store'
+			});
+		} catch {
+			upstream = await fetch(`${upstreamUrl}?fr=${Date.now()}`, {
+				method: request.method,
+				headers: upstreamHeaders,
+				cf: { cacheEverything: false }
+			});
 		}
-	});
+	} else {
+		upstream = await fetch(upstreamUrl, {
+			method: request.method,
+			headers: upstreamHeaders,
+			cf: {
+				cacheEverything: true,
+				cacheTtl: policy.edgeTtl,
+				cacheTtlByStatus: {
+					'200-299': policy.edgeTtl,
+					// A 404 means the backend hasn't published yet (first
+					// deploy) — don't pin that state to the edge for long.
+					'404': 60,
+					'500-599': 0
+				}
+			}
+		});
+	}
 	const upstreamMs = Date.now() - fetchStart;
 
 	const headers = new Headers();
