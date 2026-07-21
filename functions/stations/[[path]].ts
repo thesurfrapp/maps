@@ -39,10 +39,15 @@ const FILES: Record<string, { edgeTtl: number; browserCacheControl: string }> = 
 	}
 };
 
+// Client sends this on a version-guard reload (base/readings v mismatch) so
+// a stale edge-cached file can't outlive a rotation — same mechanism as the
+// tiles proxy.
+const FORCE_REFRESH_HEADER = 'X-Surfr-Force-Refresh';
+
 const corsHeaders = {
 	'Access-Control-Allow-Origin': '*',
 	'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-	'Access-Control-Allow-Headers': 'If-None-Match, If-Modified-Since',
+	'Access-Control-Allow-Headers': `If-None-Match, If-Modified-Since, ${FORCE_REFRESH_HEADER}`,
 	'Access-Control-Expose-Headers': 'ETag, Content-Length, X-Surfr-Upstream-Ms',
 	'Access-Control-Max-Age': '3000'
 };
@@ -75,21 +80,27 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 	const inm = request.headers.get('If-None-Match');
 	if (inm) upstreamHeaders.set('If-None-Match', inm);
 
+	const forceRefresh = request.headers.get(FORCE_REFRESH_HEADER) === '1';
+
 	const fetchStart = Date.now();
 	const upstream = await fetch(upstreamUrl, {
 		method: request.method,
 		headers: upstreamHeaders,
-		cf: {
-			cacheEverything: true,
-			cacheTtl: policy.edgeTtl,
-			cacheTtlByStatus: {
-				'200-299': policy.edgeTtl,
-				// A 404 means the backend hasn't published yet (first deploy) —
-				// don't pin that state to the edge for long.
-				'404': 60,
-				'500-599': 0
-			}
-		}
+		cf: forceRefresh
+			? // Bypass and overwrite the edge entry — the client detected a
+				// version mismatch, so the cached copy is known-stale.
+				{ cacheEverything: true, cacheTtl: 0 }
+			: {
+					cacheEverything: true,
+					cacheTtl: policy.edgeTtl,
+					cacheTtlByStatus: {
+						'200-299': policy.edgeTtl,
+						// A 404 means the backend hasn't published yet (first
+						// deploy) — don't pin that state to the edge for long.
+						'404': 60,
+						'500-599': 0
+					}
+				}
 	});
 	const upstreamMs = Date.now() - fetchStart;
 

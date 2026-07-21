@@ -588,8 +588,14 @@ type LiveClusterFeature = GeoJSON.Feature<
 
 const loadBase = async (map: maplibregl.Map, reload = false): Promise<boolean> => {
 	try {
+		// `reload` fires on a version mismatch (nightly rotation, or a
+		// format upgrade like SRF-2660). cache:'reload' busts the browser
+		// cache; the header tells the /stations proxy to bypass its
+		// Cloudflare edge cache too — without it, a stale edge entry (up to
+		// 6h TTL) survives any client-side reload and the mismatch persists.
 		const res = await fetch(`${stationsBaseUrl()}/${LIVE_CLUSTER_FILE}`, {
-			cache: reload ? 'reload' : 'default'
+			cache: reload ? 'reload' : 'default',
+			headers: reload ? { 'X-Surfr-Force-Refresh': '1' } : undefined
 		});
 		if (!res.ok) return false;
 		const fc = (await res.json()) as GeoJSON.FeatureCollection & { v?: number };
@@ -597,9 +603,14 @@ const loadBase = async (map: maplibregl.Map, reload = false): Promise<boolean> =
 
 		baseVersion = typeof fc.v === 'number' ? fc.v : null;
 		baseIndex = new Map();
+		let hasCoarseTier = false;
 		for (const f of fc.features as LiveClusterFeature[]) {
 			const p = f.properties;
-			if (!p || p.node || !f.geometry) continue;
+			if (!p || !f.geometry) continue;
+			if (p.node) {
+				if ((p as { grid?: number }).grid === 5) hasCoarseTier = true;
+				continue;
+			}
 			baseIndex.set(p.id, {
 				lon: f.geometry.coordinates[0],
 				lat: f.geometry.coordinates[1],
@@ -608,6 +619,15 @@ const loadBase = async (map: maplibregl.Map, reload = false): Promise<boolean> =
 			});
 		}
 		getSource(map, SOURCE_BASE)?.setData(fc);
+
+		// Rollout fallback: a pre-SRF-2660 file has no z5 tier, which would
+		// leave z0–6 empty (the coarse layer filters on grid==5). Extend the
+		// fine tier down to z0 until a coarse-capable file arrives.
+		for (const layerId of [LAYER_ID_NODES, LAYER_ID_NODE_COUNT]) {
+			if (map.getLayer(layerId)) {
+				map.setLayerZoomRange(layerId, hasCoarseTier ? COARSE_MAX_ZOOM : 0, SWITCH_ZOOM);
+			}
+		}
 		return true;
 	} catch (e) {
 		console.warn('[windy-stations] live-cluster load failed', e);
