@@ -18,7 +18,10 @@ interface Env extends AuthEnv {
 	TILE_CACHE: R2Bucket;
 }
 
-const UPSTREAM_HOST = 'https://map-tiles.open-meteo.com';
+// Open-Meteo's AWS Open Data bucket (s3://openmeteo, us-west-2) — public, no auth.
+// Replaces map-tiles.open-meteo.com (NXDOMAIN since ~3 Sep 2026) and the retired
+// openmeteo-data-spatial.b-cdn.net (403). Path layout is unchanged. See SRF-2882.
+const UPSTREAM_HOST = 'https://openmeteo.s3.amazonaws.com';
 
 const OM_FILE_TTL = 60 * 60 * 24 * 30;
 const ERROR_404_TTL = 60 * 60;
