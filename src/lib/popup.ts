@@ -27,6 +27,7 @@ let contentDiv: HTMLDivElement | undefined;
 let valueSpan: HTMLSpanElement | undefined;
 let unitSpan: HTMLSpanElement | undefined;
 let elevationSpan: HTMLSpanElement | undefined;
+let coordsSpan: HTMLSpanElement | undefined;
 
 // Cached clipping tester — recomputed only when clippingOptions reference changes.
 let cachedClippingOptionsRef: unknown = undefined;
@@ -60,15 +61,28 @@ const initPopupDiv = (): void => {
 	contentDiv.append(unitSpan);
 	contentDiv.append(elevationSpan);
 
+	coordsSpan = document.createElement('span');
+	coordsSpan.classList.add('popup-coords');
+
 	wrapperDiv.append(contentDiv);
+	wrapperDiv.append(coordsSpan);
 	el.append(wrapperDiv);
 };
 
 /** Update the popup content for the given coordinates without moving the marker. */
+const formatCoord = (value: number, positive: string, negative: string): string =>
+	`${Math.abs(value).toFixed(4)}°${value >= 0 ? positive : negative}`;
+
 const updatePopupContent = async (coordinates: maplibregl.LngLat): Promise<void> => {
 	if (!el || !contentDiv || !valueSpan || !unitSpan || !elevationSpan) return;
 
 	const map = get(m);
+
+	if (coordsSpan) {
+		const lat = formatCoord(coordinates.lat, 'N', 'S');
+		const lng = formatCoord(coordinates.wrap().lng, 'E', 'W');
+		coordsSpan.innerText = `${lat}, ${lng}`;
+	}
 
 	const elevation = map?.queryTerrainElevation(coordinates);
 	const hasElevation = typeof elevation === 'number' && isFinite(elevation);

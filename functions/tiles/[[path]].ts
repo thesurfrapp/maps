@@ -12,12 +12,16 @@
 //
 // Bindings (configured in the Pages project dashboard):
 //   TILE_CACHE — R2 bucket. See Pages project → Settings → Functions → R2 bindings.
+import { type AuthEnv, isAuthorized, unauthorizedResponse } from '../lib/auth';
 
-interface Env {
+interface Env extends AuthEnv {
 	TILE_CACHE: R2Bucket;
 }
 
-const UPSTREAM_HOST = 'https://map-tiles.open-meteo.com';
+// Open-Meteo's AWS Open Data bucket (s3://openmeteo, us-west-2) — public, no auth.
+// Replaces map-tiles.open-meteo.com (NXDOMAIN since ~3 Sep 2026) and the retired
+// openmeteo-data-spatial.b-cdn.net (403). Path layout is unchanged. See SRF-2882.
+const UPSTREAM_HOST = 'https://openmeteo.s3.amazonaws.com';
 
 const OM_FILE_TTL = 60 * 60 * 24 * 30;
 const ERROR_404_TTL = 60 * 60;
@@ -94,10 +98,7 @@ const r2ToResponse = (
 ): Response => {
 	const headers = new Headers();
 	for (const [k, v] of Object.entries(corsHeaders)) headers.set(k, v);
-	headers.set(
-		'Content-Type',
-		r2Obj.httpMetadata?.contentType ?? 'application/octet-stream'
-	);
+	headers.set('Content-Type', r2Obj.httpMetadata?.contentType ?? 'application/octet-stream');
 	headers.set('Cache-Control', `public, max-age=${OM_FILE_TTL}, immutable`);
 	headers.set(CACHE_STATUS_HEADER, cacheStatus);
 	headers.set('Accept-Ranges', 'bytes');
@@ -199,7 +200,7 @@ const debugCache = async (bucket: R2Bucket, url: URL): Promise<Response> => {
 		count: listing.objects.length,
 		totalMb: +(totalBytes / 1e6).toFixed(1),
 		truncated: listing.truncated,
-		cursor: listing.truncated ? (listing as { cursor?: string }).cursor ?? null : null,
+		cursor: listing.truncated ? ((listing as { cursor?: string }).cursor ?? null) : null,
 		byDomain: domains,
 		sample: listing.objects.slice(0, sampleSize).map((o) => ({
 			key: o.key,
@@ -228,7 +229,7 @@ const serveJsonFromR2 = async (bucket: R2Bucket, r2Key: string): Promise<Respons
 			JSON.stringify({
 				error: 'cold-r2',
 				message:
-					'This model has not been warmed yet. Wait for the next cron tick (≤5 min) or hit /tiles/_warmer-trigger to bootstrap.',
+					'This model has not been warmed yet. Wait for the next cron tick (≤5 min) or hit /tiles/_warmer-trigger to bootstrap (requires admin token).',
 				key: r2Key
 			}),
 			{
@@ -264,13 +265,20 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 	const url = new URL(request.url);
 	const rawPath = url.pathname.replace(/^\/tiles/, '') || '/';
 
-	// Debug endpoint.
+	// Debug endpoint — operator-only (lists R2 inventory).
 	if (rawPath === '/_debug/cache' || rawPath === '/_debug/cache.json') {
+		if (!isAuthorized(request, env)) return unauthorizedResponse(env);
 		return debugCache(env.TILE_CACHE, url);
 	}
 
-	const forceRefresh = request.headers.get(FORCE_REFRESH_HEADER) === '1';
+	// The force-refresh / warm headers mutate R2 + edge cache, so they're
+	// operator-only too. Unauthorized force-refresh is ignored (the request is
+	// served normally); unauthorized warm is rejected since a 202-and-no-body
+	// response would silently lie to the caller.
+	const authorized = isAuthorized(request, env);
+	const forceRefresh = authorized && request.headers.get(FORCE_REFRESH_HEADER) === '1';
 	const warm = request.headers.get(WARM_HEADER) === '1';
+	if (warm && !authorized) return unauthorizedResponse(env);
 
 	// ── JSON indexes: R2 only, never origin. ─────────────────────────────────
 	const r2JsonKey = R2_JSON_KEY(rawPath);
@@ -285,13 +293,10 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 	// metadata comes from our R2 latest.json, which is only flipped after a
 	// run is fully warmed.
 	if (isBlockedJson(rawPath)) {
-		return new Response(
-			JSON.stringify({ error: 'blocked', message: 'use latest.json instead' }),
-			{
-				status: 404,
-				headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...corsHeaders }
-			}
-		);
+		return new Response(JSON.stringify({ error: 'blocked', message: 'use latest.json instead' }), {
+			status: 404,
+			headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...corsHeaders }
+		});
 	}
 
 	// ── .om — client sends the canonical path including runPath. ────────────

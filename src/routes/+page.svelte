@@ -44,6 +44,7 @@
 
 	import { checkHighDefinition } from '$lib/helpers';
 	import { initSurfrSpots, setSurfrSpotsConfig } from '$lib/surfr-spots';
+	import { isLiveStationsEnabled } from '$lib/feature-flags';
 	import { initWindyStations } from '$lib/windy-stations';
 	import { getIanaOffsetSeconds, ianaFromOffsetSeconds } from '$lib/time-format';
 	import { addOmFileLayers, changeOMfileURL } from '$lib/layers';
@@ -237,7 +238,7 @@
 			changeOMfileURL();
 
 			initSurfrSpots($map);
-			initWindyStations($map);
+			if (isLiveStationsEnabled()) initWindyStations($map);
 
 			rnBridgeCleanup = installRnBridge($map);
 			console.debug('[map-load] complete — rn-bridge installed');

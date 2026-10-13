@@ -12,12 +12,15 @@
 <script lang="ts">
 	import { metaJson } from '$lib/stores/time';
 	import { domain, variable } from '$lib/stores/variables';
+	import { isLiveStationsEnabled } from '$lib/feature-flags';
 	import { setWindyStationsConfig, setWindyStationsVisible } from '$lib/windy-stations';
 	import { map } from '$lib/stores/map';
 
 	type Overlay = 'wind' | 'gust' | 'rain';
 
 	let stationsVisible = false;
+	// The station layer only exists with `?stations=1`.
+	const liveStations = isLiveStationsEnabled();
 
 	// Same priority order as the RN side. First match in the model's
 	// `meta.variables` wins. Keep in sync with
@@ -105,14 +108,16 @@
 			{pill.label}
 		</button>
 	{/each}
-	<button
-		type="button"
-		class="pill"
-		class:active={stationsVisible}
-		on:click={toggleStations}
-	>
-		Live
-	</button>
+	{#if liveStations}
+		<button
+			type="button"
+			class="pill"
+			class:active={stationsVisible}
+			on:click={toggleStations}
+		>
+			Live
+		</button>
+	{/if}
 </div>
 
 <style>

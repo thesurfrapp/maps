@@ -21,7 +21,10 @@ export interface Env {
 	TILE_CACHE: R2Bucket;
 }
 
-const UPSTREAM_HOST = 'https://map-tiles.open-meteo.com';
+// Open-Meteo's AWS Open Data bucket (s3://openmeteo, us-west-2) — public, no auth.
+// Replaces map-tiles.open-meteo.com (NXDOMAIN since ~3 Sep 2026) and the retired
+// openmeteo-data-spatial.b-cdn.net (403). Path layout is unchanged. See SRF-2882.
+const UPSTREAM_HOST = 'https://openmeteo.s3.amazonaws.com';
 // Per-domain parallel file warms. Kept low so upstream Open-Meteo never sees
 // more than a handful of concurrent requests from us. The cron worker also
 // serialises domains (one at a time) so total concurrent upstream load is

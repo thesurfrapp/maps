@@ -9,6 +9,7 @@ import { displayTimezone, displayTzOffsetSeconds } from '$lib/stores/preferences
 import { metaJson, time } from '$lib/stores/time';
 import { domain, variable } from '$lib/stores/variables';
 
+import { isLiveStationsEnabled } from '$lib/feature-flags';
 import { changeOMfileURL } from '$lib/layers';
 import { setGlobeProjection } from '$lib/map-controls';
 import {
@@ -59,7 +60,20 @@ type OutMsg =
 	  }
 	| { type: 'storageEstimate'; quotaMb: number; usageMb: number; cacheCount?: number; t: number }
 	// New: lifecycle events to attribute time-loss
-	| { type: 'setTimeReceived'; time: string; t: number }
+	| {
+			type: 'setTimeReceived';
+			time: string;
+			requestedTime?: string;
+			snappedTime?: string;
+			currentTime?: string;
+			domain?: string;
+			metaDomain?: string;
+			validFirst?: string;
+			validLast?: string;
+			status?: string;
+			reason?: string;
+			t: number;
+	  }
 	| { type: 'setVariableReceived'; variable: string; t: number }
 	| { type: 'setDomainReceived'; domain: string; t: number }
 	| { type: 'clearStateReceived'; t: number }
@@ -132,6 +146,51 @@ declare global {
 	}
 }
 
+const NOISY_BRIDGE_LOG_TYPES = new Set(['storageEstimate', 'tileFetch']);
+const BRIDGE_LOG_KEYS = [
+	'time',
+	'requestedTime',
+	'snappedTime',
+	'currentTime',
+	'domain',
+	'metaDomain',
+	'variable',
+	'status',
+	'reason',
+	'validFirst',
+	'validLast',
+	'lat',
+	'lng',
+	'zoom',
+	'anchorY',
+	'offsetSeconds',
+	't'
+];
+
+const formatBridgeTime = (date: Date | undefined | null): string | undefined => {
+	if (!date || isNaN(date.getTime())) return undefined;
+	return formatISOWithoutTimezone(date);
+};
+
+const compactBridgeMessage = (msg: { type?: string } & Record<string, unknown>) => {
+	const compact: Record<string, unknown> = { type: msg.type };
+	for (const key of BRIDGE_LOG_KEYS) {
+		if (msg[key] != null) compact[key] = msg[key];
+	}
+	if (Array.isArray(msg.variables)) compact.variables = msg.variables.length;
+	if (Array.isArray(msg.timestamps)) compact.timestamps = msg.timestamps.length;
+	return compact;
+};
+
+const logBridgeMessage = (
+	direction: '←' | '→',
+	msg: { type?: string } & Record<string, unknown>
+): void => {
+	if (!isAdmin()) return;
+	if (NOISY_BRIDGE_LOG_TYPES.has(String(msg.type))) return;
+	console.log(`[bridge ${direction}]`, compactBridgeMessage(msg));
+};
+
 // Loose typing on purpose — TS struggles with the OutMsg discriminated union
 // when stamping `t` after the fact. The OutMsg type above documents the wire
 // shape; runtime code just spreads + adds `t`.
@@ -149,16 +208,7 @@ const postToRN = (msg: { type: string } & Record<string, unknown>): void => {
 	// Mirror to browser console so the same diagnostics show up when testing
 	// the embed directly in a browser tab (no RN host present). Compact format
 	// so the console doesn't get unreadable.
-	if (typeof console !== 'undefined') {
-		const { type, ...rest } = stamped;
-		const restStr = Object.keys(rest).length
-			? ' ' +
-				Object.entries(rest)
-					.map(([k, v]) => `${k}=${typeof v === 'object' ? JSON.stringify(v) : v}`)
-					.join(' ')
-			: '';
-		console.log(`[bridge] ${type}${restStr}`);
-	}
+	logBridgeMessage('→', stamped);
 };
 
 export const isEmbedMode = (): boolean => {
@@ -183,6 +233,7 @@ const debounce = <T extends unknown[]>(fn: (...args: T) => void, ms: number) => 
 
 export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 	if (!isEmbedMode()) return () => {};
+	let metaDomain = get(domain);
 
 	const onMoveEnd = debounce(() => {
 		const c = map.getCenter();
@@ -190,32 +241,27 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 	}, 150);
 	map.on('moveend', onMoveEnd);
 
-	// Render-lifecycle markers. `dataloading` fires when MapLibre starts
-	// requesting a source's tiles; `idle` fires when all in-flight requests
-	// finished AND the canvas is repainted. The gap between the last setTime
-	// and the next `idle` is the user-perceived "scrub-to-paint" wall time.
-	let lastDataLoadingAt = 0;
-	const onDataLoading = () => {
-		const now = performance.now();
-		if (now - lastDataLoadingAt > 50) postToRN({ type: 'mapDataLoading' });
-		lastDataLoadingAt = now;
-	};
-	map.on('dataloading', onDataLoading);
-	const onIdle = () => postToRN({ type: 'mapIdle' });
-	map.on('idle', onIdle);
+	const liveStations = isLiveStationsEnabled();
 
-	// A tap anywhere on the map emits a forecast-location event — RN listens
-	// and refreshes its bottom sheet for that point. Path B (Windy-style):
-	// every tap means "tell me about this point," no persistent red pin is
-	// drawn. The result varies by what's there:
+	// A tap anywhere on the map sets a forecast location — RN listens and refreshes
+	// its model picker + ForecastTable for that point. What the map draws depends
+	// on the `stations` flag:
+	//
+	// Classic (flag off — every app version that doesn't send `stations=1`):
+	//   - On a Surfr spot dot: snap to the spot's coords, emit spotSelected, light
+	//     up the blue pulsing ring and hide the red pin (one coherent selection).
+	//   - On empty map: drop the red pin at the tap point, clear the spot ring.
+	//
+	// Live stations (flag on) — Path B, Windy-style: every tap means "tell me
+	// about this point," no pin is drawn on tap:
 	//   - On a station pill: windy-stations layer handler opens the station
 	//     sheet and emits forecastLocationSet with the station's exact coords.
 	//     The early-return below skips the global-click default for that case.
-	//   - On a Surfr spot dot: snap to the spot's coords, emit spotSelected,
-	//     and light up a blue pulsing ring (the spot's own visual indicator).
+	//   - On a Surfr spot dot: same as classic, minus touching the pin.
 	//   - On empty map: just emit forecastLocationSet for the tap point and
 	//     clear any lingering spot highlight. The RN bottom sheet is the only
-	//     visual representation of "where you're forecasting."
+	//     visual representation of "where you're forecasting." Long-press drops
+	//     the (draggable) pin instead — see onContextMenu.
 	//
 	// Hit-target padding: the visible dot is only `circle-radius: 4` (~8px wide),
 	// way under Apple's 44pt / Material 48dp tap-target guidelines. Rather than
@@ -249,9 +295,11 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 		if (spotHit) {
 			// Snap to the spot's exact coordinates — the user tapped "this
 			// spot", not the tap-point near it. The blue spot dot + blue
-			// pulsing ring are the only visual indicator (no red pin in
-			// Path B), so the selection reads as one coherent highlight.
+			// pulsing ring are the only visual indicator, so the selection
+			// reads as one coherent highlight (classic hides the red pin;
+			// Path B never drew one on tap).
 			const [spotLng, spotLat] = (spotHit.geometry as GeoJSON.Point).coordinates;
+			if (!liveStations) hideForecastMarker(map);
 			postToRN({ type: 'forecastLocationSet', lat: spotLat, lng: spotLng });
 			postToRN({
 				type: 'spotSelected',
@@ -264,26 +312,27 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 			return;
 		}
 		// Empty-map tap: emit forecast location for RN to refresh its bottom
-		// sheet, and drop any lingering spot highlight. No persistent visual
-		// indicator on the map — the bottom sheet IS the forecast surface.
+		// sheet, and drop any lingering spot highlight. Classic drops the red
+		// pin here; in Path B the bottom sheet IS the forecast surface.
 		clearSelectedSpotHighlight();
 		const { lat, lng } = ev.lngLat;
 		postToRN({ type: 'forecastLocationSet', lat, lng });
+		if (!liveStations) placeForecastMarker(map, lat, lng);
 	};
 	map.on('click', onClick);
 
-	// Long-press (touch) / right-click (desktop) drops the forecast pin at
-	// the press location. MapLibre fires `contextmenu` for both. This matches
-	// the Apple/Google Maps convention: tap = select existing object, long-
-	// press = drop a new pin. Once placed, the pin is independently draggable
-	// (handled by the Marker's draggable=true config).
+	// Path B only: long-press (touch) / right-click (desktop) drops the forecast
+	// pin at the press location. MapLibre fires `contextmenu` for both. This
+	// matches the Apple/Google Maps convention: tap = select existing object,
+	// long-press = drop a new pin. Once placed, the pin is independently
+	// draggable (handled by the Marker's draggable=true config).
 	const onContextMenu = (ev: maplibregl.MapMouseEvent) => {
 		const { lat, lng } = ev.lngLat;
 		clearSelectedSpotHighlight();
 		placeForecastMarker(map, lat, lng);
 		postToRN({ type: 'forecastLocationSet', lat, lng });
 	};
-	map.on('contextmenu', onContextMenu);
+	if (liveStations) map.on('contextmenu', onContextMenu);
 
 	// Desktop affordance: pointer cursor when hovering a spot dot. Harmless on
 	// touch (no hover) but makes the embed feel right when used in a browser.
@@ -297,6 +346,7 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 	map.on('mouseleave', SURFR_SPOTS_LAYER, onSpotLeave);
 
 	const unsubMeta = metaJson.subscribe((meta) => {
+		metaDomain = get(domain);
 		if (meta?.valid_times?.length) {
 			postToRN({ type: 'availableTimestamps', timestamps: meta.valid_times });
 		}
@@ -395,7 +445,7 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 			return;
 		}
 		if (!msg || typeof msg !== 'object') return;
-		console.log('[rn-bridge] ←', msg);
+		logBridgeMessage('←', msg);
 		switch (msg.type) {
 			case 'setCenter': {
 				// `offset` shifts the target lat/lng away from the screen centre
@@ -422,34 +472,91 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 				if (get(domain) !== msg.domain) domain.set(msg.domain);
 				break;
 			case 'setTime': {
-				postToRN({ type: 'setTimeReceived', time: msg.time });
 				// Mirror what the fork's own time-selector does: set the store
 				// AND call changeOMfileURL() — only domain + variable have their
 				// own subscriptions that re-fetch tiles; time doesn't.
-				const parsed =
-					msg.time.length === 15 ? parseISOWithoutTimezone(msg.time) : new Date(msg.time);
-				if (!isNaN(parsed.getTime())) {
-					// Snap to nearest valid_time before storing. RN passes its own
-					// `mapAnchoredTimestamp` (already floored against the published
-					// `availableTimestamps`), but for cold-start cases where that
-					// list lags or is empty, RN can post an off-pattern hour that
-					// overwrites the URL-snap result. Snapping here makes $time
-					// canonical regardless of who set it — bridge emissions and the
-					// in-fork debug label stay consistent on the same valid_time.
-					const meta = get(metaJson);
-					const timeSteps = meta?.valid_times?.map((s) => new Date(s));
-					const snapped = timeSteps?.length ? findTimeStep(parsed, timeSteps) : null;
-					const next = snapped ?? parsed;
-					// Skip the set if the snapped value matches what's already in the
-					// store. Without this dedupe, RN's `setTime` round-trip (whose
-					// snapped result equals the current $time) still triggers a
-					// `time.subscribe` re-emit — RN sees a redundant `timestampChanged`
-					// echo for the same value.
-					const current = get(time);
-					if (next.getTime() !== current.getTime()) {
-						time.set(next);
-						changeOMfileURL();
+				let parsed: Date;
+				try {
+					parsed = msg.time.length === 15 ? parseISOWithoutTimezone(msg.time) : new Date(msg.time);
+				} catch {
+					postToRN({
+						type: 'setTimeReceived',
+						time: msg.time,
+						requestedTime: msg.time,
+						domain: get(domain),
+						metaDomain,
+						status: 'invalid',
+						reason: 'parse-failed'
+					});
+					break;
+				}
+				if (isNaN(parsed.getTime())) {
+					postToRN({
+						type: 'setTimeReceived',
+						time: msg.time,
+						requestedTime: msg.time,
+						domain: get(domain),
+						metaDomain,
+						status: 'invalid',
+						reason: 'invalid-date'
+					});
+					break;
+				}
+
+				// Snap to a valid_time before storing. This intentionally preserves the
+				// pre-existing bridge behavior: current metadata is the authority for
+				// canonical map time, and every applied time change rebuilds the OM URL.
+				// The extra fields below are diagnostics only, so older RN clients can
+				// continue to ignore them.
+				const activeDomain = get(domain);
+				const meta = get(metaJson);
+				const validTimes = Array.isArray(meta?.valid_times) ? meta.valid_times : [];
+				const validFirst = validTimes[0];
+				const validLast = validTimes[validTimes.length - 1];
+				let next = parsed;
+				let reason = validTimes.length ? 'raw' : 'no-valid-times';
+
+				if (validTimes.length) {
+					const requestedWireTime = formatBridgeTime(parsed);
+					const exact = validTimes.find((validTime) => {
+						const d = new Date(validTime);
+						return formatBridgeTime(d) === requestedWireTime;
+					});
+					if (exact) {
+						next = new Date(exact);
+						reason = 'exact';
+					} else {
+						const timeSteps = validTimes.map((s) => new Date(s));
+						const snapped = findTimeStep(parsed, timeSteps);
+						if (snapped) {
+							next = new Date(snapped.getTime());
+							reason = 'nearest';
+						}
 					}
+				}
+
+				// Skip the set if the snapped value matches what's already in the store.
+				// Without this dedupe, RN's `setTime` round-trip (whose snapped result
+				// equals the current $time) still triggers a `time.subscribe` re-emit —
+				// RN sees a redundant `timestampChanged` echo for the same value.
+				const current = get(time);
+				const changed = next.getTime() !== current.getTime();
+				postToRN({
+					type: 'setTimeReceived',
+					time: msg.time,
+					requestedTime: msg.time,
+					snappedTime: formatBridgeTime(next),
+					currentTime: formatBridgeTime(current),
+					domain: activeDomain,
+					metaDomain,
+					validFirst,
+					validLast,
+					status: changed ? 'apply' : 'noop',
+					reason
+				});
+				if (changed) {
+					time.set(next);
+					changeOMfileURL();
 				}
 				break;
 			}
@@ -457,8 +564,8 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 				// RN-driven pin placement — used when the user picks a search
 				// result or a deeplink lands on a non-spot location. Drops the
 				// pin (or moves it if already placed) without changing the
-				// camera. Tap is still ephemeral on the map side; this is the
-				// only programmatic way to plant the pin besides long-press.
+				// camera. In Path B tap is ephemeral on the map side, so this is
+				// the only way to plant the pin besides long-press.
 				if (Number.isFinite(msg.lat) && Number.isFinite(msg.lng)) {
 					placeForecastMarker(map, msg.lat, msg.lng);
 				}
@@ -487,6 +594,9 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 			}
 			case 'setSpotHighlight': {
 				if (Number.isFinite(msg.lat) && Number.isFinite(msg.lng)) {
+					// Classic: the blue ring replaces the red pin. Path B keeps the
+					// pin, which is a long-press bookmark independent of selection.
+					if (!liveStations) hideForecastMarker(map);
 					setSelectedSpotHighlight(map, msg.lat, msg.lng);
 				}
 				break;
@@ -528,6 +638,9 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 				break;
 			}
 			case 'setWindyStationsConfig': {
+				// Without the flag the station layer doesn't exist: ignore the
+				// message so a host that sends it can't change the classic map.
+				if (!liveStations) break;
 				const onStationTap = (s: {
 					id: string;
 					name: string;
@@ -619,8 +732,6 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 		map.off('contextmenu', onContextMenu);
 		map.off('mouseenter', SURFR_SPOTS_LAYER, onSpotEnter);
 		map.off('mouseleave', SURFR_SPOTS_LAYER, onSpotLeave);
-		map.off('dataloading', onDataLoading);
-		map.off('idle', onIdle);
 		unsubMeta();
 		unsubTime();
 		clearInterval(storageProbeInterval);
@@ -634,8 +745,57 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 	};
 };
 
-// Forecast pin — Apple/Google Maps convention. NOT placed by tap (tap is
-// ephemeral, Path B / Windy-style). Placed by long-press (or right-click on
+const placeForecastMarker = (map: maplibregl.Map, lat: number, lng: number): void => {
+	if (isLiveStationsEnabled()) placeDraggablePin(map, lat, lng);
+	else placeClassicMarker(map, lat, lng);
+};
+
+// Classic forecast marker (flag off) — one red target icon, moved on each tap.
+const MARKER_SOURCE_ID = 'rn-forecast-marker';
+const MARKER_LAYER_ID = 'rn-forecast-marker-layer';
+const EMPTY_FC: GeoJSON.FeatureCollection = { type: 'FeatureCollection', features: [] };
+
+const placeClassicMarker = (map: maplibregl.Map, lat: number, lng: number): void => {
+	const data = {
+		type: 'FeatureCollection' as const,
+		features: [
+			{
+				type: 'Feature' as const,
+				geometry: { type: 'Point' as const, coordinates: [lng, lat] },
+				properties: {}
+			}
+		]
+	};
+	const src = map.getSource(MARKER_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+	if (src) {
+		src.setData(data as GeoJSON.FeatureCollection);
+		return;
+	}
+	map.addSource(MARKER_SOURCE_ID, { type: 'geojson', data: data as GeoJSON.FeatureCollection });
+	map.addLayer({
+		id: MARKER_LAYER_ID,
+		type: 'circle',
+		source: MARKER_SOURCE_ID,
+		paint: {
+			'circle-radius': 8,
+			'circle-color': '#ef4444',
+			'circle-stroke-color': '#ffffff',
+			'circle-stroke-width': 2
+		}
+	});
+};
+
+// Clear the classic red marker without touching the spot-selection highlight.
+// Used when the tap lands on a spot — the blue pulsing ring + blue spot dot
+// already communicate the selected forecast location, and the red pin would
+// clash with the blue highlight (looks like "two selections").
+const hideForecastMarker = (map: maplibregl.Map): void => {
+	const src = map.getSource(MARKER_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+	if (src) src.setData(EMPTY_FC);
+};
+
+// Path B forecast pin (flag on) — Apple/Google Maps convention. NOT placed by
+// tap (tap is ephemeral, Windy-style). Placed by long-press (or right-click on
 // desktop) via the map's `contextmenu` event, and by `setForecastLocation`
 // messages from RN (search results, deeplinks). Once placed, the pin is
 // draggable for pixel-precise refinement.
@@ -658,7 +818,7 @@ const buildForecastPinElement = (): HTMLDivElement => {
 	return el;
 };
 
-const placeForecastMarker = (map: maplibregl.Map, lat: number, lng: number): void => {
+const placeDraggablePin = (map: maplibregl.Map, lat: number, lng: number): void => {
 	if (forecastMarker) {
 		const el = forecastMarker.getElement();
 		forecastMarker.setLngLat([lng, lat]);

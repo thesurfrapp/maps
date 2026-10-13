@@ -16,6 +16,7 @@ import {
 } from '$lib/constants';
 import { type SlotLayer, SlotManager } from '$lib/slot-manager';
 
+import { isLiveStationsEnabled } from './feature-flags';
 import { refreshPopup } from './popup';
 import { currentOmUrl } from './stores/om-url';
 import { variable as v } from './stores/variables';
@@ -25,10 +26,11 @@ import { getOMUrl } from './url';
 // so the wind-arrows source-layer is empty. Resolve to the wind u/v file
 // for the vector layer so direction arrows still render on top of the gust
 // color heatmap. Same idea as Windguru: gust intensity colored, wind
-// direction overlaid (gusts and wind share direction in practice).
+// direction overlaid (gusts and wind share direction in practice). Part of the
+// live-stations map style, so only with `?stations=1`.
 const getVectorVariable = (): string => {
 	const current = get(v);
-	if (current === 'wind_gusts_10m') return 'wind_u_component_10m';
+	if (current === 'wind_gusts_10m' && isLiveStationsEnabled()) return 'wind_u_component_10m';
 	return current;
 };
 
@@ -300,6 +302,16 @@ const resolveBeforeLayer = (map: maplibregl.Map, desired: string): string => {
 export let rasterManager: SlotManager | undefined;
 export let vectorManager: SlotManager | undefined;
 
+const postRnLifecycle = (type: 'mapDataLoading' | 'mapIdle'): void => {
+	try {
+		const rn = (window as unknown as { ReactNativeWebView?: { postMessage: (s: string) => void } })
+			.ReactNativeWebView;
+		rn?.postMessage(JSON.stringify({ type, t: Math.round(performance.now()) }));
+	} catch {
+		/* noop */
+	}
+};
+
 export const createManagers = (): void => {
 	const map = get(m);
 	if (!map) return;
@@ -321,9 +333,13 @@ export const createManagers = (): void => {
 		removeDelayMs: 300,
 		onCommit: () => {
 			loading.set(false);
+			postRnLifecycle('mapIdle');
 			refreshPopup();
 		},
-		onError: () => loading.set(false),
+		onError: () => {
+			loading.set(false);
+			postRnLifecycle('mapIdle');
+		},
 		slowLoadWarningMs: 10000,
 		onSlowLoad: () => {
 			toast.warning('Loading raster data might be limited by bandwidth or upstream server speed.');
@@ -390,6 +406,7 @@ export const changeOMfileURL = (vectorOnly = false, rasterOnly = false): void =>
 	currentOmUrl.set(rasterUrl);
 
 	loading.set(true);
+	if (!vectorOnly) postRnLifecycle('mapDataLoading');
 
 	const preferences = get(p);
 	vectorManager?.setBeforeLayer(

@@ -6,6 +6,28 @@ served by Cloudflare Pages, **with a set of Pages Functions under `functions/`
 that proxy tile traffic through an R2 cache**. The Functions are the critical
 piece — `vite dev` alone doesn't execute them.
 
+## Working rules (read first)
+
+- **Deployment is the user's job, not Claude's.** The user deploys to
+  `maps.thesurfr.app` themselves. Do NOT spin up local servers / tunnels
+  unless the user explicitly asks for a local URL. A code change that
+  typechecks and builds is "done" — stop there.
+- **When the user says it works / it's deployed, STOP.** Don't keep
+  starting servers, warming caches, or "verifying" further. The task is
+  finished.
+- **Do NOT chase the local R2 cold-cache.** `/tiles/latest.json` returning
+  503 `cold-r2` locally is normal and irrelevant — it does NOT need
+  warming via `/tiles/_warmer-trigger` to test a UI change. Production R2
+  is already warm. Never run the warmer to "fix" local bootstrap.
+- **`startup.sh` runs `vite build --watch`, which wedges `wrangler pages
+  dev`.** Each rebuild reloads the worker and can leave the port dead
+  (`curl` → `000` with the process still alive). For a stable local serve,
+  run `wrangler pages dev build` WITHOUT the watcher (see manual steps
+  below), and rebuild by hand when needed.
+- Verifying a UI change locally is fine when asked — `npm run build` +
+  `wrangler pages dev build` + the browser preview is enough. Don't add a
+  tunnel unless the user wants to test on a device.
+
 ## Starting locally
 
 Plain `npm run dev` will load the Svelte app but the page goes **white** as

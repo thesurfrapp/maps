@@ -8,15 +8,20 @@
 //   - Oldest / newest valid_time we have cached
 // Plus: when the cron last ran (from `_warmer/last-run.json`).
 //
-// No auth — same reasoning as _warmer-trigger. Readonly anyway.
-
+// Auth: requires the ADMIN_TOKEN shared secret — open it in the browser as
+// `/tiles/_admin?token=<secret>`. The token is threaded into the action links
+// (trigger warmer, force warm, JSON inventory) so they stay clickable.
+import { type AuthEnv, isAuthorized, presentedToken, unauthorizedResponse } from '../lib/auth';
 import { WARMED_DOMAINS } from '../lib/domains';
 
-interface Env {
+interface Env extends AuthEnv {
 	TILE_CACHE: R2Bucket;
 }
 
-const UPSTREAM_HOST = 'https://map-tiles.open-meteo.com';
+// Open-Meteo's AWS Open Data bucket (s3://openmeteo, us-west-2) — public, no auth.
+// Replaces map-tiles.open-meteo.com (NXDOMAIN since ~3 Sep 2026) and the retired
+// openmeteo-data-spatial.b-cdn.net (403). Path layout is unchanged. See SRF-2882.
+const UPSTREAM_HOST = 'https://openmeteo.s3.amazonaws.com';
 
 type HistoricalRun = {
 	runPath: string;
@@ -44,10 +49,7 @@ const fmtRunPath = (isoRefTime: string): string => {
 	return `${d.getUTCFullYear()}/${pad(d.getUTCMonth() + 1)}/${pad(d.getUTCDate())}/${pad(d.getUTCHours())}${pad(d.getUTCMinutes())}Z`;
 };
 
-const readJsonRefTime = async (
-	bucket: R2Bucket,
-	key: string
-): Promise<string | null> => {
+const readJsonRefTime = async (bucket: R2Bucket, key: string): Promise<string | null> => {
 	try {
 		const obj = await bucket.get(key);
 		if (!obj) return null;
@@ -71,10 +73,7 @@ const fetchUpstreamLatest = async (domain: string): Promise<string | null> => {
 
 type RunStats = { count: number; bytes: number; oldest: string | null; newest: string | null };
 
-const listDomainRuns = async (
-	bucket: R2Bucket,
-	domain: string
-): Promise<Map<string, RunStats>> => {
+const listDomainRuns = async (bucket: R2Bucket, domain: string): Promise<Map<string, RunStats>> => {
 	const prefix = `data_spatial/${domain}/`;
 	const byRunPath = new Map<string, RunStats>();
 	let cursor: string | undefined;
@@ -188,8 +187,10 @@ const relativeAge = (iso: string | null | undefined): string => {
 const renderHtml = (
 	rows: DomainRow[],
 	lastCron: unknown,
-	perDomainTicks: Record<string, unknown>
+	perDomainTicks: Record<string, unknown>,
+	token: string
 ): string => {
+	const tokenParam = `token=${encodeURIComponent(token)}`;
 	const rowsHtml = rows
 		.map((r) => {
 			const color = STATUS_COLORS[r.status];
@@ -208,7 +209,7 @@ const renderHtml = (
 			// Per-domain force-warm link. Re-runs the warmer for this domain
 			// ignoring the "unchanged" short-circuit. URL responses are raw
 			// JSON from the cron worker.
-			const forceUrl = `https://surfr-tile-warmer-cron.herbert-0fd.workers.dev/force?domain=${encodeURIComponent(r.domain)}`;
+			const forceUrl = `https://surfr-tile-warmer-cron.herbert-0fd.workers.dev/force?domain=${encodeURIComponent(r.domain)}&${tokenParam}`;
 			const forceCell = `<a href="${forceUrl}" target="_blank" rel="noreferrer" class="force-btn">Force warm</a>`;
 			const historicalCell = r.historicalRuns.length
 				? r.historicalRuns
@@ -286,9 +287,9 @@ ${cronDetails}
 </div>
 <div class="totals"><strong>${totalFiles}</strong> files &middot; <strong>${totalMb.toFixed(1)} MB</strong> across ${rows.length} domains</div>
 <div class="actions">
-	<a href="/tiles/_warmer-trigger?wait=1">Trigger warmer (wait for result)</a>
-	<a href="/tiles/_warmer-trigger">Trigger warmer (async)</a>
-	<a href="/tiles/_debug/cache">JSON inventory</a>
+	<a href="/tiles/_warmer-trigger?wait=1&${tokenParam}">Trigger warmer (wait for result)</a>
+	<a href="/tiles/_warmer-trigger?${tokenParam}">Trigger warmer (async)</a>
+	<a href="/tiles/_debug/cache?${tokenParam}">JSON inventory</a>
 </div>
 <table>
 <thead>
@@ -322,9 +323,11 @@ const readJson = async (bucket: R2Bucket, key: string): Promise<unknown> => {
 };
 
 export const onRequestGet: PagesFunction<Env> = async (context) => {
-	const rows = await Promise.all(
-		WARMED_DOMAINS.map((d) => collectRow(context.env.TILE_CACHE, d))
-	);
+	if (!isAuthorized(context.request, context.env)) {
+		return unauthorizedResponse(context.env);
+	}
+
+	const rows = await Promise.all(WARMED_DOMAINS.map((d) => collectRow(context.env.TILE_CACHE, d)));
 
 	// `last-tick.json` is written on every `warmDomain` (sharded cron path).
 	// `last-run.json` is only written by the legacy `warmAll` path. Prefer the
@@ -333,16 +336,22 @@ export const onRequestGet: PagesFunction<Env> = async (context) => {
 	const lastRun = await readJson(context.env.TILE_CACHE, '_warmer/last-run.json');
 	const perDomainTicks = await Promise.all(
 		WARMED_DOMAINS.map((d) =>
-			readJson(context.env.TILE_CACHE, `_warmer/last-domain-${d}.json`).then((v) => ({ domain: d, v }))
+			readJson(context.env.TILE_CACHE, `_warmer/last-domain-${d}.json`).then((v) => ({
+				domain: d,
+				v
+			}))
 		)
 	);
 	const domainTickByName = Object.fromEntries(perDomainTicks.map((x) => [x.domain, x.v]));
 	const lastCron = lastTick ?? lastRun;
 
-	return new Response(renderHtml(rows, lastCron, domainTickByName), {
-		headers: {
-			'Content-Type': 'text/html; charset=utf-8',
-			'Cache-Control': 'no-store'
+	return new Response(
+		renderHtml(rows, lastCron, domainTickByName, presentedToken(context.request)),
+		{
+			headers: {
+				'Content-Type': 'text/html; charset=utf-8',
+				'Cache-Control': 'no-store'
+			}
 		}
-	});
+	);
 };
