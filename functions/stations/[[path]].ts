@@ -1,47 +1,58 @@
-// Cloudflare Pages Function — wind-station file proxy (SRF-2644).
+// Cloudflare Pages Function — wind-station file proxy (SRF-2644, source moved in SRF-2994).
 //
-//   Browser ─► /stations/<file> (same-origin, no bucket URL exposed)
-//              └► CF edge cache (cacheEverything, TTL per file)
-//                 └► miss ─► public GCS bucket (surfrleaderboards/stations/*)
+//   Browser ─► /stations/<file> (same-origin)
+//              └► Cache API (this PoP, TTL per file)
+//                 └► miss ─► live-wind service /v1/stations/layer/<name> (+ source token)
 //
-// Why a proxy instead of fetching storage.googleapis.com directly:
-// - No GCS URL or bucket name in the client; if the bucket ever goes
-//   private, auth moves HERE (Cloudflare env secret), never into the webview.
-// - Same-origin → no GCS bucket CORS configuration needed.
-// - Cloudflare edge caching in front of GCS: one warm URL serves everyone.
+// The files come from the Cloudflare live-wind service (surfr-live-wind), built from
+// its snapshot plus the push hot lane — the only source of live wind for the app
+// (ADR-036). Until SRF-2994 they came from a public GCS bucket the classic backend
+// wrote from Postgres.
 //
-// The files are produced by the backend (SRF-2643):
-//   live-cluster.json      nightly  — station positions + pre-clustered nodes
-//   live-cluster-all.json  nightly  — + catalog-offline stations
-//   readings.json          ~5 min   — live values + per-node max wind
-// meta.json is server-internal and deliberately NOT proxied.
+//   live-cluster.json  — station positions + pre-grouped bubbles; changes only when
+//                        stations are added/removed (its `v`)
+//   readings.json      — live values + per-bubble max wind
+//
+// Why a proxy:
+// - The live-wind source token stays here (Pages secret STATIONS_TOKEN), never in the
+//   webview.
+// - Same-origin → no CORS setup on the live-wind service.
+// - One warm copy per PoP serves every viewer, so the service sees a request per PoP
+//   per TTL, not one per open map.
+//
+// Caching is explicit (Cache API), not `cf.cacheEverything`: the upstream request carries
+// an Authorization header, and Cloudflare's fetch cache does not reliably store those.
+//
+// Needs `global_fetch_strictly_public` (wrangler.toml): the live-wind service runs on our
+// own zone, and without the flag a fetch to it would skip the Worker on its route.
 
 interface Env {
-	// Optional override, e.g. the test bucket for preview deployments.
+	// Override for preview deployments, e.g. https://test-live-wind.thesurfr.app/v1/stations/layer
 	STATIONS_ORIGIN?: string;
+	// Live-wind source token (an entry in the service's SOURCE_TOKENS_JSON).
+	STATIONS_TOKEN?: string;
 }
 
-const DEFAULT_ORIGIN = 'https://storage.googleapis.com/surfrleaderboards/stations';
+const DEFAULT_ORIGIN = 'https://live-wind.thesurfr.app/v1/stations/layer';
 
 // Allowlist — this proxy serves exactly these files, nothing else.
-const FILES: Record<string, { edgeTtl: number; browserCacheControl: string }> = {
+const FILES: Record<string, { upstream: string; edgeTtl: number; browserCacheControl: string }> = {
 	'live-cluster.json': {
-		edgeTtl: 21600, // 6 h — matches the object's own max-age
-		browserCacheControl: 'public, max-age=21600, stale-while-revalidate=86400'
-	},
-	'live-cluster-all.json': {
+		upstream: 'live-cluster',
+		// Long on purpose: a changed station set is caught by the readings `v` guard,
+		// which force-refreshes this file (and the PoP copy with it).
 		edgeTtl: 21600,
 		browserCacheControl: 'public, max-age=21600, stale-while-revalidate=86400'
 	},
 	'readings.json': {
-		edgeTtl: 300, // one refresh cadence
-		browserCacheControl: 'public, max-age=300, stale-while-revalidate=600'
+		upstream: 'readings',
+		edgeTtl: 60, // push stations are seconds-fresh upstream; keep the PoP copy short
+		browserCacheControl: 'public, max-age=60, stale-while-revalidate=300'
 	}
 };
 
-// Client sends this on a version-guard reload (base/readings v mismatch) so
-// a stale edge-cached file can't outlive a rotation — same mechanism as the
-// tiles proxy.
+// Client sends this on a version-guard reload (base/readings v mismatch) so a stale
+// PoP copy can't outlive a station-set change — same mechanism as the tiles proxy.
 const FORCE_REFRESH_HEADER = 'X-Surfr-Force-Refresh';
 
 const corsHeaders = {
@@ -51,6 +62,12 @@ const corsHeaders = {
 	'Access-Control-Expose-Headers': 'ETag, Content-Length, X-Surfr-Upstream-Ms',
 	'Access-Control-Max-Age': '3000'
 };
+
+const errorResponse = (status: number, body: Record<string, unknown>): Response =>
+	new Response(JSON.stringify(body), {
+		status,
+		headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...corsHeaders }
+	});
 
 export const onRequest: PagesFunction<Env> = async (context) => {
 	const { request, env } = context;
@@ -65,84 +82,53 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 	const url = new URL(request.url);
 	const file = url.pathname.replace(/^\/stations\//, '');
 	const policy = FILES[file];
-	if (!policy) {
-		return new Response(JSON.stringify({ error: 'not-found', file }), {
-			status: 404,
-			headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...corsHeaders }
-		});
-	}
+	if (!policy) return errorResponse(404, { error: 'not-found', file });
+	if (!env.STATIONS_TOKEN) return errorResponse(503, { error: 'not-configured', file });
 
 	const origin = (env.STATIONS_ORIGIN ?? DEFAULT_ORIGIN).replace(/\/$/, '');
-	const upstreamUrl = `${origin}/${file}`;
-
-	// Pass conditional headers through so 304s flow end-to-end.
-	const upstreamHeaders = new Headers();
-	const inm = request.headers.get('If-None-Match');
-	if (inm) upstreamHeaders.set('If-None-Match', inm);
-
+	const upstreamUrl = `${origin}/${policy.upstream}`;
+	// Cache key carries no credentials: one shared copy per PoP for every viewer.
+	const cacheKey = new Request(upstreamUrl, { method: 'GET' });
+	const cache = caches.default;
 	const forceRefresh = request.headers.get(FORCE_REFRESH_HEADER) === '1';
 
-	const fetchStart = Date.now();
-	let upstream: Response;
-	if (forceRefresh) {
-		// The client detected a version mismatch, so the edge-cached copy is
-		// known-stale. cf.cacheTtl:0 only prevents STORING — it still SERVES
-		// an existing entry (verified empirically) — so bypass via the
-		// standard no-store cache mode, with a query-bust fallback for
-		// runtimes that reject it. GCS ignores unknown query params on
-		// public objects.
-		try {
-			upstream = await fetch(upstreamUrl, {
-				method: request.method,
-				headers: upstreamHeaders,
-				cache: 'no-store'
-			});
-		} catch {
-			upstream = await fetch(`${upstreamUrl}?fr=${Date.now()}`, {
-				method: request.method,
-				headers: upstreamHeaders,
-				cf: { cacheEverything: false }
+	let body: Response | undefined = forceRefresh ? undefined : await cache.match(cacheKey);
+	let upstreamMs = 0;
+	if (!body) {
+		const fetchStart = Date.now();
+		const upstream = await fetch(upstreamUrl, {
+			headers: { Authorization: `Bearer ${env.STATIONS_TOKEN}` }
+		});
+		upstreamMs = Date.now() - fetchStart;
+		if (!upstream.ok) {
+			return errorResponse(upstream.status === 404 ? 404 : 502, {
+				error: 'upstream',
+				status: upstream.status,
+				file
 			});
 		}
-	} else {
-		upstream = await fetch(upstreamUrl, {
-			method: request.method,
-			headers: upstreamHeaders,
-			cf: {
-				cacheEverything: true,
-				cacheTtl: policy.edgeTtl,
-				cacheTtlByStatus: {
-					'200-299': policy.edgeTtl,
-					// A 404 means the backend hasn't published yet (first
-					// deploy) — don't pin that state to the edge for long.
-					'404': 60,
-					'500-599': 0
-				}
+		const toCache = new Response(upstream.body, {
+			headers: {
+				'Content-Type': 'application/json',
+				'Cache-Control': `public, s-maxage=${policy.edgeTtl}`,
+				...(upstream.headers.get('ETag') ? { ETag: upstream.headers.get('ETag')! } : {})
 			}
 		});
+		context.waitUntil(cache.put(cacheKey, toCache.clone()));
+		body = toCache;
 	}
-	const upstreamMs = Date.now() - fetchStart;
 
 	const headers = new Headers();
 	for (const [k, v] of Object.entries(corsHeaders)) headers.set(k, v);
 	headers.set('Content-Type', 'application/json');
 	headers.set('Cache-Control', policy.browserCacheControl);
 	headers.set('X-Surfr-Upstream-Ms', String(upstreamMs));
-	const etag = upstream.headers.get('ETag');
-	if (etag) headers.set('ETag', etag);
-
-	if (upstream.status === 304) {
-		return new Response(null, { status: 304, headers });
+	const etag = body.headers.get('ETag');
+	if (etag) {
+		headers.set('ETag', etag);
+		if (request.headers.get('If-None-Match') === etag) {
+			return new Response(null, { status: 304, headers });
+		}
 	}
-	if (!upstream.ok) {
-		return new Response(
-			JSON.stringify({ error: 'upstream', status: upstream.status, file }),
-			{
-				status: upstream.status === 404 ? 404 : 502,
-				headers: { ...Object.fromEntries(headers), 'Cache-Control': 'no-store' }
-			}
-		);
-	}
-
-	return new Response(upstream.body, { status: 200, headers });
+	return new Response(request.method === 'HEAD' ? null : body.body, { status: 200, headers });
 };

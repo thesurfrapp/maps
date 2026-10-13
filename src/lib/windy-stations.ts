@@ -439,12 +439,7 @@ const ensureLayers = (map: maplibregl.Map): void => {
 				'circle-radius': 4,
 				'circle-stroke-width': 1,
 				'circle-stroke-color': 'rgba(255,255,255,0.4)',
-				'circle-opacity': [
-					'case',
-					['boolean', ['feature-state', 'live'], false],
-					0,
-					0.55
-				] as never
+				'circle-opacity': ['case', ['boolean', ['feature-state', 'live'], false], 0, 0.55] as never
 			}
 		});
 	}
@@ -508,14 +503,15 @@ const ensureLayers = (map: maplibregl.Map): void => {
 		});
 	}
 
-	// Verified badge — official sources only (not PWS).
+	// Verified badge — official networks only (priority 0 in the live-cluster:
+	// metar/ndbc/knmi), not PWS, push or other community stations.
 	if (!map.getLayer(LAYER_ID_VERIFIED)) {
 		map.addLayer({
 			id: LAYER_ID_VERIFIED,
 			type: 'symbol',
 			source: SOURCE_LIVE,
 			minzoom: SWITCH_ZOOM,
-			filter: ['all', ['to-boolean', ['get', 'source']], ['!=', ['get', 'source'], 'pws']],
+			filter: ['==', ['get', 'priority'], 0],
 			layout: {
 				'icon-image': VERIFIED_IMAGE_ID,
 				'icon-text-fit': 'both',
@@ -683,6 +679,7 @@ const applyReadings = (map: maplibregl.Map, readings: ReadingsFile): void => {
 		if (dir != null) props.windDir = dir;
 		if (gust != null) props.gustKts = gust;
 		if (base.source != null) props.source = base.source;
+		props.priority = base.priority;
 		features.push({
 			type: 'Feature',
 			geometry: { type: 'Point', coordinates: [base.lon, base.lat] },
@@ -712,11 +709,7 @@ const refreshReadings = async (map: maplibregl.Map): Promise<void> => {
 		// Version guard: the nightly rotation changed the live-cluster while we
 		// hold a cached copy — refetch it (usually a cheap 304/cache-hit), then
 		// apply the readings against the fresh base.
-		if (
-			typeof readings.v === 'number' &&
-			baseVersion !== null &&
-			readings.v !== baseVersion
-		) {
+		if (typeof readings.v === 'number' && baseVersion !== null && readings.v !== baseVersion) {
 			await loadBase(map, true);
 		}
 		applyReadings(map, readings);
@@ -792,24 +785,10 @@ const handleStationClick = (
 		stale: false
 	};
 
-	// Names live on the backend, not in the station files. One tiny lookup per
-	// tap keeps the file payloads lean; fire the callback immediately so the
-	// sheet opens without waiting, then enrich when the name arrives.
+	// The live-cluster carries no names. The app's station sheet fetches the
+	// station (name, attribution, history) from the live-wind service by id, so
+	// the map makes no extra request per tap.
 	currentConfig.onStationTap?.(station);
-	const endpoint = currentConfig.endpoint?.replace(/\/$/, '');
-	if (endpoint) {
-		fetch(`${endpoint}/windystations/search?q=${encodeURIComponent(id)}&limit=1`)
-			.then((r) => (r.ok ? r.json() : null))
-			.then((results: { id: string; name?: string }[] | null) => {
-				const match = Array.isArray(results) ? results.find((s) => s.id === id) : null;
-				if (match?.name) {
-					currentConfig.onStationTap?.({ ...station, name: match.name });
-				}
-			})
-			.catch(() => {
-				/* name enrichment is best-effort */
-			});
-	}
 };
 
 // Node drill-down — the expansion zoom is baked server-side; no async

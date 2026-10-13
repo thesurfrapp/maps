@@ -13,7 +13,7 @@ The upstream open-meteo/maps project is a standalone browser demo that fetches `
 - **Low-latency tile delivery** — a 4-tier Cloudflare cache (browser → CF edge → R2 → origin) with a 5-minute cron warmer so tiles are hot before users request them.
 - **Immutable tile URLs** — each model run gets a unique URL path (`/YYYY/MM/DD/HHmmZ/…`), enabling aggressive `Cache-Control: immutable` and reliable `Range` request caching.
 - **A postMessage bridge** — bidirectional communication with the React Native WebView host for map state, forecast location, spot selection, wind stations, and tile-fetch diagnostics.
-- **Live wind stations** — Windy-style colored pill markers showing real-time wind speed/direction from the Surfr backend's `/windystations/bbox` endpoint, tappable to open a station detail sheet in the RN host.
+- **Live wind stations** — Windy-style colored pill markers showing real-time wind speed/direction from the Cloudflare live-wind service (via the same-origin `/stations/*` proxy), tappable to open a station detail sheet in the RN host. Only shown with the `?stations=1` URL flag.
 - **Surfr spots on the map** — the user's saved surf/kite spots rendered as cyan dots + labels, tappable to set a forecast location and trigger a "View details" pill in the RN host.
 - **A stripped-down UI** — wind/gust/rain pill selectors, a 13-model dropdown, an IANA timezone picker instead of the full upstream chrome.
 - **Surfr's wind color scale** — a high-saturation palette matching Windguru-style anchors, force-applied to all wind/gust variables.
@@ -47,7 +47,7 @@ The map is embedded in the Surfr RN app as a full-screen `react-native-webview` 
 | `setDomain` / `setVariable` | Switch weather model / overlay variable |
 | `setTzOffsetSeconds` | Override display timezone (spot's UTC offset) |
 | `setSpotsConfig` | Supply or refresh the spots API endpoint + bearer token |
-| `setWindyStationsConfig` | Supply the wind stations API endpoint + toggle visibility |
+| `setWindyStationsConfig` | Toggle the wind-station layer (needs `?stations=1`; ignored otherwise) |
 | `setForecastLocation` | Drop the red forecast pin without moving the camera |
 | `setSpotHighlight` / `clearSpotSelection` | Show/hide the blue pulsing ring around a selected spot |
 | `setZoom` | Fly to zoom level with auto globe/mercator projection flip |
@@ -76,7 +76,7 @@ All outbound messages carry `t = performance.now()` so the RN host can reconstru
 
 ### Live wind stations
 
-`src/lib/windy-stations.ts` — Windy-style colored pill markers rendered as MapLibre DOM `Marker`s showing real-time wind speed, direction arrow, and gust data. Data fetched from the Surfr backend's `/windystations/bbox` endpoint, debounced 700 ms on map move, visible above zoom 5, limit 200 per viewport. Each pill is colored using Surfr's wind-speed palette and is tappable — taps emit `stationTapped` to the RN bridge, which opens a `WindyStationSheet` with the station's history chart. Stale stations render as grey pills at reduced opacity. Verified (non-PWS) stations show a green checkmark badge.
+`src/lib/windy-stations.ts` — station layer behind the `?stations=1` URL flag (`src/lib/feature-flags.ts`); without the flag the map behaves exactly as before. Two files, served same-origin by `functions/stations/[[path]].ts` from the Cloudflare live-wind service (`/v1/stations/layer/*`, SRF-2994): `live-cluster.json` (every station seen in the last 7 days plus pre-grouped count bubbles at three grid tiers; its `v` changes only when stations are added, removed or move) and `readings.json` (readings at most 1 h old, push stations included, per-bubble max wind; refreshed every 5 min while visible). A `v` mismatch between the two force-refreshes the live-cluster. Pills are colored with Surfr's wind palette; stations without a fresh reading are dimmed dots. Official networks (metar/ndbc/knmi, `priority` 0) get the verified badge. A tap emits `stationTapped` (no name — the app's `WindyStationSheet` loads name, attribution and history from the live-wind service by id). The proxy needs the Pages secret `STATIONS_TOKEN` (a live-wind source token) and optionally `STATIONS_ORIGIN` for previews.
 
 Configured via the RN bridge's `setWindyStationsConfig` message (endpoint URL + visibility toggle). The endpoint is the same Surfr backend used for spots.
 
@@ -139,7 +139,7 @@ MapTiler Streets v2 (`streets-v2-dark` / `voyager-v2`) is the primary basemap, c
 | Model-run picker | Dropdown + lock + prev/next shortcuts | Removed — always latest run via R2 `latest.json`, no user choice |
 | Wind colors | Library default | Surfr high-saturation palette |
 | Embed | None | Full RN WebView postMessage bridge + imperative ref API |
-| Wind stations | None | Live Windy-style pills from Surfr backend `/windystations/bbox` |
+| Wind stations | None | Live Windy-style pills from the Cloudflare live-wind service (`?stations=1`) |
 | Spots | None | Cyan dot markers from Surfr backend `/spots/bbox`, tappable |
 | Prefetch | None | ±1 full prefetch + ±N PoP edge warm on every time change |
 | Domain load | Single async, can race | Serialized chain + retry with backoff |
@@ -214,7 +214,7 @@ RN App (SpotsScreen)
        │
        ├─ /spots/bbox ─────→ Surfr backend (user's saved spots)
        │
-       └─ /windystations/bbox → Surfr backend (live wind station data)
+       └─ /stations/* → live-wind service /v1/stations/layer/* (live wind station data)
 
 worker-cron (*/5 * * * *)
   └─ hits /tiles/_warmer-trigger per domain
