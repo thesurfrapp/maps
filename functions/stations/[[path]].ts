@@ -54,6 +54,11 @@ const FILES: Record<string, { upstream: string; edgeTtl: number; browserCacheCon
 // Client sends this on a version-guard reload (base/readings v mismatch) so a stale
 // PoP copy can't outlive a station-set change — same mechanism as the tiles proxy.
 const FORCE_REFRESH_HEADER = 'X-Surfr-Force-Refresh';
+// Anyone can send that header, and every upstream call spends the shared `maps` token's
+// rate limit. So a forced refresh only refetches when the PoP copy is older than this:
+// upstream load stays bounded per PoP however often the header arrives.
+const FORCE_REFRESH_MIN_AGE_MS = 30_000;
+const CACHED_AT_HEADER = 'X-Surfr-Cached-At';
 
 const corsHeaders = {
 	'Access-Control-Allow-Origin': '*',
@@ -92,7 +97,11 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 	const cache = caches.default;
 	const forceRefresh = request.headers.get(FORCE_REFRESH_HEADER) === '1';
 
-	let body: Response | undefined = forceRefresh ? undefined : await cache.match(cacheKey);
+	let body: Response | undefined = await cache.match(cacheKey);
+	if (body && forceRefresh) {
+		const cachedAt = Number(body.headers.get(CACHED_AT_HEADER) ?? 0);
+		if (Date.now() - cachedAt >= FORCE_REFRESH_MIN_AGE_MS) body = undefined;
+	}
 	let upstreamMs = 0;
 	if (!body) {
 		const fetchStart = Date.now();
@@ -111,6 +120,7 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 			headers: {
 				'Content-Type': 'application/json',
 				'Cache-Control': `public, s-maxage=${policy.edgeTtl}`,
+				[CACHED_AT_HEADER]: String(Date.now()),
 				...(upstream.headers.get('ETag') ? { ETag: upstream.headers.get('ETag')! } : {})
 			}
 		});
