@@ -13,10 +13,13 @@
 // re-layout. Stations absent from the readings render dimmed (absence IS the
 // staleness signal). Individual pills/arrows (z8+) rebuild from a second,
 // small GeoJSON source containing only stations with a current reading.
+// Cluster nodes do the same from a third small source: the nodes plus their
+// live max wind, because the stacked-badge image is picked by wind band and
+// feature-state can't drive icon-image.
 //
 // One rendering switch at z8 (same shape as spots, without spots' data swap):
-//   z0–7.99  cluster nodes (circle layer, color = live max wind)
-//   z8+      individual stations (Marijn's pill + arrow + badge design)
+//   z0–7.99  cluster nodes (stacked station badges, color = live max wind)
+//   z8+      individual stations (station badge + neutral speed pill + arrow)
 // MapLibre's own clustering is NOT used — nodes are pre-baked server-side
 // with stable cell ids and a baked expansionZoom for drill-down.
 //
@@ -33,18 +36,18 @@ import type * as maplibregl from 'maplibre-gl';
 
 const SOURCE_BASE = 'windy-stations-base'; // live-cluster: nodes + all stations
 const SOURCE_LIVE = 'windy-stations'; // stations with a current reading (pills)
+const SOURCE_NODES = 'windy-stations-nodes'; // cluster nodes + live max wind
 
 export const LAYER_ID_DOTS = 'windy-stations-dots';
 export const LAYER_ID_SELECTION_PILL = 'windy-stations-selection-pill';
 export const LAYER_ID_PILL = 'windy-stations-pill';
 export const LAYER_ID_ARROW = 'windy-stations-arrow';
-export const LAYER_ID_VERIFIED = 'windy-stations-verified';
+export const LAYER_ID_BADGE = 'windy-stations-badge';
 
-const ARROW_IMAGE_ID = 'windy-station-arrow';
 const ARROW_IMAGE_ID_DARK = 'windy-station-arrow-dark';
-const PILL_IMAGE_PREFIX = 'windy-station-pill-';
+const PILL_IMAGE_ID = 'windy-station-pill';
 const SELECTION_PILL_IMAGE_ID = 'windy-station-selection-pill';
-const VERIFIED_IMAGE_ID = 'windy-station-verified';
+const BADGE_IMAGE_PREFIX = 'windy-station-badge-';
 
 // Same-origin default — the /stations/* Pages Function proxies + edge-caches
 // the public GCS objects. Overridable via setWindyStationsConfig for dev.
@@ -52,37 +55,25 @@ const DEFAULT_STATIONS_BASE_URL = '/stations';
 const LIVE_CLUSTER_FILE = 'live-cluster.json';
 const READINGS_FILE = 'readings.json';
 
-// The rendering ladder: individuals from the switch up, count-bubble node
+// The rendering ladder: individuals from the switch up, stacked-badge node
 // tiers below. Each tier's zoom band starts where its grid's cell spacing
-// safely exceeds the max bubble diameter, so bubbles never overlap: z3 cells
+// safely exceeds the widest stack (~46px), so stacks never overlap: z3 cells
 // are ≥64px at z1, z5 cells ≥128px at z4, z8 cells ≥64px at z6.
 const SWITCH_ZOOM = 8;
 type NodeTier = {
 	grid: number;
 	minZoom: number;
 	maxZoom: number;
-	/** radius = min(cap, base + k·√count) */
-	radius: { base: number; k: number; cap: number };
-	textSize: number;
 	/** Legacy files carry ungridded nodes — only the z8 tier accepts them. */
 	acceptsLegacy?: boolean;
 };
 const NODE_TIERS: NodeTier[] = [
-	{ grid: 3, minZoom: 0, maxZoom: 4, radius: { base: 8, k: 1.6, cap: 22 }, textSize: 11 },
-	{ grid: 5, minZoom: 4, maxZoom: 6, radius: { base: 7, k: 1.5, cap: 20 }, textSize: 11 },
-	{
-		grid: 8,
-		minZoom: 6,
-		maxZoom: SWITCH_ZOOM,
-		radius: { base: 6, k: 1.2, cap: 16 },
-		textSize: 10,
-		acceptsLegacy: true
-	}
+	{ grid: 3, minZoom: 0, maxZoom: 4 },
+	{ grid: 5, minZoom: 4, maxZoom: 6 },
+	{ grid: 8, minZoom: 6, maxZoom: SWITCH_ZOOM, acceptsLegacy: true }
 ];
 const nodeLayerId = (grid: number): string => `windy-stations-nodes-z${grid}`;
-const nodeCountLayerId = (grid: number): string => `windy-stations-node-count-z${grid}`;
 const NODE_LAYER_IDS = NODE_TIERS.map((t) => nodeLayerId(t.grid));
-const NODE_COUNT_LAYER_IDS = NODE_TIERS.map((t) => nodeCountLayerId(t.grid));
 // Matches the backend's refresh cadence + the readings file's max-age.
 const REFRESH_MS = 5 * 60_000;
 // A reading older than this renders dimmed even if still in the file
@@ -169,7 +160,8 @@ let baseVersion: number | null = null;
 let baseLoaded = false;
 let baseIndex = new Map<string, BaseStation>();
 let liveIds = new Set<string>(); // ids with feature-state applied (for cleanup)
-let liveNodeIds = new Set<string>();
+let nodeFeatures: LiveClusterFeature[] = []; // nodes from the live-cluster
+let nodeKts = new Map<string, number>(); // cell id → live max wind
 let selectedStationId: string | number | null = null;
 let refreshTimer: ReturnType<typeof setInterval> | undefined;
 let pendingAbort: AbortController | undefined;
@@ -181,11 +173,12 @@ const stationsBaseUrl = (): string =>
 const getSource = (map: maplibregl.Map, id: string): maplibregl.GeoJSONSource | undefined =>
 	map.getSource(id) as maplibregl.GeoJSONSource | undefined;
 
-// ── image atlas (unchanged visual design) ──────────────────────────────────
+// ── image atlas ────────────────────────────────────────────────────────────
 
-// Slim white triangle, no outline — sits INSIDE a colored pill so its
-// contrast comes from the pill background. Points UP at icon-rotate=0.
+// Slim chevron, no outline — sits inside the neutral pill, so it is drawn in
+// the pill's dark text colour. Points UP at icon-rotate=0.
 const ARROW_SIZE = 12;
+const PILL_TEXT_COLOR = '#1a1a2e';
 const drawArrow = (fill: string): ImageData | null => {
 	const canvas = document.createElement('canvas');
 	canvas.width = ARROW_SIZE;
@@ -206,52 +199,37 @@ const drawArrow = (fill: string): ImageData | null => {
 };
 
 const ensureArrowImage = (map: maplibregl.Map): void => {
-	if (!map.hasImage(ARROW_IMAGE_ID)) {
-		const white = drawArrow('#ffffff');
-		if (white) {
-			map.addImage(ARROW_IMAGE_ID, {
-				width: ARROW_SIZE,
-				height: ARROW_SIZE,
-				data: new Uint8Array(white.data)
-			});
-		}
-	}
-	if (!map.hasImage(ARROW_IMAGE_ID_DARK)) {
-		const dark = drawArrow('#1a1a2e');
-		if (dark) {
-			map.addImage(ARROW_IMAGE_ID_DARK, {
-				width: ARROW_SIZE,
-				height: ARROW_SIZE,
-				data: new Uint8Array(dark.data)
-			});
-		}
+	if (map.hasImage(ARROW_IMAGE_ID_DARK)) return;
+	const dark = drawArrow(PILL_TEXT_COLOR);
+	if (dark) {
+		map.addImage(ARROW_IMAGE_ID_DARK, {
+			width: ARROW_SIZE,
+			height: ARROW_SIZE,
+			data: new Uint8Array(dark.data)
+		});
 	}
 };
 
+// Capsule behind the arrow + speed. The wind colour lives on the badge, so the
+// pill is one neutral white image; stretchX lets `icon-text-fit: 'both'` wrap
+// 1- and 2-digit speeds while the round caps stay fixed.
 const PILL_W = 36;
 const PILL_H = 22;
 const PILL_R = PILL_H / 2;
 
-const drawCapsule = (fill: string): ImageData | null => {
-	const canvas = document.createElement('canvas');
-	canvas.width = PILL_W;
-	canvas.height = PILL_H;
-	const ctx = canvas.getContext('2d');
-	if (!ctx) return null;
-	ctx.fillStyle = fill;
+const capsulePath = (ctx: CanvasRenderingContext2D, inset: number): void => {
+	const r = PILL_R - inset;
 	ctx.beginPath();
 	if (typeof ctx.roundRect === 'function') {
-		ctx.roundRect(0, 0, PILL_W, PILL_H, PILL_R);
+		ctx.roundRect(inset, inset, PILL_W - inset * 2, PILL_H - inset * 2, r);
 	} else {
-		ctx.moveTo(PILL_R, 0);
-		ctx.lineTo(PILL_W - PILL_R, 0);
-		ctx.arc(PILL_W - PILL_R, PILL_R, PILL_R, -Math.PI / 2, Math.PI / 2);
-		ctx.lineTo(PILL_R, PILL_H);
-		ctx.arc(PILL_R, PILL_R, PILL_R, Math.PI / 2, (3 * Math.PI) / 2);
+		ctx.moveTo(PILL_R, inset);
+		ctx.lineTo(PILL_W - PILL_R, inset);
+		ctx.arc(PILL_W - PILL_R, PILL_R, r, -Math.PI / 2, Math.PI / 2);
+		ctx.lineTo(PILL_R, PILL_H - inset);
+		ctx.arc(PILL_R, PILL_R, r, Math.PI / 2, (3 * Math.PI) / 2);
 		ctx.closePath();
 	}
-	ctx.fill();
-	return ctx.getImageData(0, 0, PILL_W, PILL_H);
 };
 
 const addStretchableImage = (map: maplibregl.Map, id: string, img: ImageData): void => {
@@ -265,81 +243,214 @@ const addStretchableImage = (map: maplibregl.Map, id: string, img: ImageData): v
 	);
 };
 
-const ensurePillImages = (map: maplibregl.Map): void => {
-	for (let i = 0; i < COLOR_ANCHORS.length; i++) {
-		const id = `${PILL_IMAGE_PREFIX}${i}`;
-		if (map.hasImage(id)) continue;
-		const [, r, g, b] = COLOR_ANCHORS[i];
-		const img = drawCapsule(`rgb(${r},${g},${b})`);
-		if (img) addStretchableImage(map, id, img);
-	}
+const ensurePillImage = (map: maplibregl.Map): void => {
+	if (map.hasImage(PILL_IMAGE_ID)) return;
+	const canvas = document.createElement('canvas');
+	canvas.width = PILL_W;
+	canvas.height = PILL_H;
+	const ctx = canvas.getContext('2d');
+	if (!ctx) return;
+	capsulePath(ctx, 0.5);
+	ctx.fillStyle = '#ffffff';
+	ctx.fill();
+	// Hairline edge keeps the white pill distinct on pale map areas.
+	ctx.strokeStyle = 'rgba(26,26,46,0.14)';
+	ctx.lineWidth = 1;
+	ctx.stroke();
+	addStretchableImage(map, PILL_IMAGE_ID, ctx.getImageData(0, 0, PILL_W, PILL_H));
 };
 
+// Selection halo — a solid cyan capsule rendered behind the main pill; the
+// layer pads it 2px more per side, so the halo is a constant 2px at any width.
 const ensureSelectionPillImage = (map: maplibregl.Map): void => {
 	if (map.hasImage(SELECTION_PILL_IMAGE_ID)) return;
-	const img = drawCapsule('#22d3ee');
-	if (img) addStretchableImage(map, SELECTION_PILL_IMAGE_ID, img);
+	const canvas = document.createElement('canvas');
+	canvas.width = PILL_W;
+	canvas.height = PILL_H;
+	const ctx = canvas.getContext('2d');
+	if (!ctx) return;
+	capsulePath(ctx, 0);
+	ctx.fillStyle = '#22d3ee';
+	ctx.fill();
+	addStretchableImage(map, SELECTION_PILL_IMAGE_ID, ctx.getImageData(0, 0, PILL_W, PILL_H));
 };
 
-// Verified badge — FontAwesome circle-check knocked out of the pill's right
-// cap (see SRF station bottom sheet); rendered at 3× for retina crispness.
-const VERIFIED_SCALE = 3;
-const FA_CIRCLE_CHECK =
-	'M256 512A256 256 0 1 0 256 0a256 256 0 1 0 0 512zM369 209L241 337c-9.4 9.4-24.6 9.4-33.9 0l-64-64c-9.4-9.4-9.4-24.6 0-33.9s24.6-9.4 33.9 0l47 47L335 175c9.4-9.4 24.6-9.4 33.9 0s9.4 24.6 0 33.9z';
-const drawVerified = (): ImageData | null => {
+// Station badge — wind-coloured disc + tail with a white ring and the
+// tower-broadcast glyph (the app's stations toggle icon), so a marker reads as
+// "a station" rather than a map label. One image per (variant, wind band). The
+// tail tip is the image's bottom-centre and the layers use icon-anchor
+// 'bottom', so the tip lands on the station (or node) coordinates. Rendered at
+// SCALE× with a matching pixelRatio so the glyph stays crisp.
+const BADGE_SCALE = 3;
+const BADGE_R = 11;
+const BADGE_RING = 1.75;
+const BADGE_CY = 14; // circle centre, from the top
+const BADGE_TAIL = 8; // tail length below the circle
+const BADGE_W = 28;
+const BADGE_H = BADGE_CY + BADGE_R + BADGE_TAIL + 2;
+// Stacks: extra discs peek out to the left of the front badge, like an avatar
+// row, so a node reads as "several stations" without a count. The image is
+// widened symmetrically so its bottom-centre (the anchor) stays under the
+// front badge's tail.
+const STACK_STEP = 6;
+const BADGE_TEAL = '#0F8FA0';
+const DARK_GLYPH_BANDS = new Set([4, 5]); // 20–30 kt: yellow/orange fills
+type BadgeVariant = 'pws' | 'verified' | 'stack2' | 'stack3';
+const BADGE_VARIANTS: BadgeVariant[] = ['pws', 'verified', 'stack2', 'stack3'];
+const STACK_DEPTH: Record<BadgeVariant, number> = { pws: 1, verified: 1, stack2: 2, stack3: 3 };
+const DIM_BAND = 'dim'; // nodes without a live reading
+// Pill + arrow sit level with the badge's circle, starting under its right
+// edge. Horizontal shift in px from the station point to the arrow.
+const MARKER_DX = 20;
+const MARKER_DY = -(BADGE_H - BADGE_CY);
+const PILL_TEXT_SIZE = 12;
+// Text-offset (ems) that moves the speed number — and with it the
+// icon-text-fit pill — from the point onto the badge's right.
+const PILL_TEXT_OFFSET: [number, number] = [
+	0.6 + MARKER_DX / PILL_TEXT_SIZE,
+	0.05 + MARKER_DY / PILL_TEXT_SIZE
+];
+
+// Tower-broadcast glyph from primitives, designed at a 14px radius and scaled
+// to the badge: mast dot + stem, inner and outer signal arcs either side.
+const drawTowerGlyph = (
+	ctx: CanvasRenderingContext2D,
+	cx: number,
+	cy: number,
+	color: string
+): void => {
+	ctx.save();
+	ctx.translate(cx, cy);
+	ctx.scale(BADGE_R / 14, BADGE_R / 14);
+	ctx.strokeStyle = color;
+	ctx.fillStyle = color;
+	ctx.lineCap = 'round';
+	ctx.beginPath();
+	ctx.arc(0, -1, 2.2, 0, Math.PI * 2);
+	ctx.fill();
+	ctx.lineWidth = 1.8;
+	ctx.beginPath();
+	ctx.moveTo(0, 1);
+	ctx.lineTo(0, 8);
+	ctx.stroke();
+	const arcs: [number, number, number][] = [
+		[6, 1.6, 1],
+		[10, 1.4, 0.65]
+	];
+	for (const [r, w, alpha] of arcs) {
+		ctx.globalAlpha = alpha;
+		ctx.lineWidth = w;
+		ctx.beginPath();
+		ctx.arc(0, -1, r, Math.PI * 0.75, Math.PI * 1.25);
+		ctx.stroke();
+		ctx.beginPath();
+		ctx.arc(0, -1, r, -Math.PI * 0.25, Math.PI * 0.25);
+		ctx.stroke();
+	}
+	ctx.restore();
+};
+
+const ringed = (ctx: CanvasRenderingContext2D, path: Path2D, fill: string): void => {
+	ctx.fillStyle = fill;
+	ctx.fill(path);
+	ctx.strokeStyle = '#ffffff';
+	ctx.lineWidth = BADGE_RING;
+	ctx.lineJoin = 'round';
+	ctx.stroke(path);
+};
+
+// Small check dot on the badge's top-right for official networks: teal disc,
+// white tick, white ring.
+const drawVerifiedDot = (ctx: CanvasRenderingContext2D, cx: number, cy: number): void => {
+	const x = cx + BADGE_R * 0.72;
+	const y = cy - BADGE_R * 0.72;
+	const dot = new Path2D();
+	dot.arc(x, y, 4.2, 0, Math.PI * 2);
+	ringed(ctx, dot, BADGE_TEAL);
+	ctx.strokeStyle = '#ffffff';
+	ctx.lineWidth = 1.3;
+	ctx.lineCap = 'round';
+	ctx.beginPath();
+	ctx.moveTo(x - 1.8, y);
+	ctx.lineTo(x - 0.4, y + 1.4);
+	ctx.lineTo(x + 1.9, y - 1.3);
+	ctx.stroke();
+};
+
+const bandFill = (band: number | typeof DIM_BAND): string => {
+	if (band === DIM_BAND) return DIM_COLOR;
+	const [, r, g, b] = COLOR_ANCHORS[band];
+	return `rgb(${r},${g},${b})`;
+};
+
+const drawBadge = (variant: BadgeVariant, band: number | typeof DIM_BAND): ImageData | null => {
+	const fill = bandFill(band);
+	const depth = STACK_DEPTH[variant];
+	const pad = STACK_STEP * (depth - 1);
+	const w = BADGE_W + pad * 2;
 	const canvas = document.createElement('canvas');
-	canvas.width = PILL_W * VERIFIED_SCALE;
-	canvas.height = PILL_H * VERIFIED_SCALE;
+	canvas.width = w * BADGE_SCALE;
+	canvas.height = BADGE_H * BADGE_SCALE;
 	const ctx = canvas.getContext('2d');
 	if (!ctx) return null;
-	ctx.scale(VERIFIED_SCALE, VERIFIED_SCALE);
-	const D = 10;
-	const sc = D / 512;
-	const cx = PILL_W - PILL_R / 2;
-	const cy = PILL_H / 2;
-	ctx.translate(cx - 256 * sc, cy - 256 * sc);
-	ctx.scale(sc, sc);
-	ctx.fillStyle = '#ffffff';
-	ctx.fill(new Path2D(FA_CIRCLE_CHECK), 'evenodd');
-	return ctx.getImageData(0, 0, PILL_W * VERIFIED_SCALE, PILL_H * VERIFIED_SCALE);
-};
-
-const ensureVerifiedImage = (map: maplibregl.Map): void => {
-	if (map.hasImage(VERIFIED_IMAGE_ID)) return;
-	const img = drawVerified();
-	if (!img) return;
-	const s = VERIFIED_SCALE;
-	map.addImage(
-		VERIFIED_IMAGE_ID,
-		{ width: PILL_W * s, height: PILL_H * s, data: new Uint8Array(img.data) },
-		{
-			pixelRatio: s,
-			content: [PILL_R * s, 0, (PILL_W - PILL_R) * s, PILL_H * s],
-			stretchX: [[PILL_R * s, (PILL_W - PILL_R) * s]]
-		}
-	);
-};
-
-// Step expression picking the pill icon for a windKts property value.
-const pillByStops = (speedExpr: unknown): unknown[] => {
-	const expr: unknown[] = ['step', speedExpr, `${PILL_IMAGE_PREFIX}0`];
-	for (let i = 1; i < COLOR_ANCHORS.length; i++) {
-		expr.push(COLOR_ANCHORS[i][0], `${PILL_IMAGE_PREFIX}${i}`);
+	ctx.scale(BADGE_SCALE, BADGE_SCALE);
+	const cx = w / 2;
+	// Back discs first (furthest left), so each ring overlaps the one behind.
+	for (let i = depth - 1; i >= 1; i--) {
+		const back = new Path2D();
+		back.arc(cx - STACK_STEP * i, BADGE_CY, BADGE_R, 0, Math.PI * 2);
+		ringed(ctx, back, fill);
 	}
+	const pin = new Path2D();
+	pin.arc(cx, BADGE_CY, BADGE_R, Math.PI * 0.62, Math.PI * 0.38);
+	pin.lineTo(cx, BADGE_CY + BADGE_R + BADGE_TAIL);
+	pin.closePath();
+	ringed(ctx, pin, fill);
+	const darkGlyph = band !== DIM_BAND && DARK_GLYPH_BANDS.has(band);
+	drawTowerGlyph(ctx, cx, BADGE_CY, darkGlyph ? PILL_TEXT_COLOR : '#ffffff');
+	if (variant === 'verified') drawVerifiedDot(ctx, cx, BADGE_CY);
+	return ctx.getImageData(0, 0, w * BADGE_SCALE, BADGE_H * BADGE_SCALE);
+};
+
+const ensureBadgeImages = (map: maplibregl.Map): void => {
+	const bands: (number | typeof DIM_BAND)[] = [...COLOR_ANCHORS.keys(), DIM_BAND];
+	for (const variant of BADGE_VARIANTS) {
+		for (const band of bands) {
+			const id = `${BADGE_IMAGE_PREFIX}${variant}-${band}`;
+			if (map.hasImage(id)) continue;
+			const img = drawBadge(variant, band);
+			if (!img) continue;
+			map.addImage(
+				id,
+				{ width: img.width, height: img.height, data: new Uint8Array(img.data) },
+				{ pixelRatio: BADGE_SCALE }
+			);
+		}
+	}
+};
+
+// Step expression → wind band index (into COLOR_ANCHORS) for a speed in kt.
+const bandIndexExpr = (speedExpr: unknown): unknown[] => {
+	const expr: unknown[] = ['step', speedExpr, 0];
+	for (let i = 1; i < COLOR_ANCHORS.length; i++) expr.push(COLOR_ANCHORS[i][0], i);
 	return expr;
 };
 
-// Yellow/orange pills (20–30 kt) have light backgrounds where white fails
-// contrast — same test drives text color and arrow variant.
-const isLightPillExpr = ['all', ['>=', ['get', 'windKts'], 20], ['<', ['get', 'windKts'], 30]];
+const badgeImageExpr = (variantExpr: unknown, bandExpr: unknown): unknown[] => [
+	'concat',
+	BADGE_IMAGE_PREFIX,
+	variantExpr,
+	'-',
+	bandExpr
+];
 
 // ── layers ─────────────────────────────────────────────────────────────────
 
 const ensureLayers = (map: maplibregl.Map): void => {
 	ensureArrowImage(map);
-	ensurePillImages(map);
+	ensurePillImage(map);
 	ensureSelectionPillImage(map);
-	ensureVerifiedImage(map);
+	ensureBadgeImages(map);
 
 	// Base source: the live-cluster file's contents (nodes + every station).
 	// No MapLibre clustering — nodes are pre-baked server-side.
@@ -351,8 +462,8 @@ const ensureLayers = (map: maplibregl.Map): void => {
 			promoteId: 'id'
 		});
 	}
-	// Live source: only stations with a current reading — feeds the pill/
-	// arrow/badge symbol layers at z8+. Rebuilt on each readings refresh.
+	// Live source: only stations with a current reading — feeds the badge/
+	// pill/arrow symbol layers at z8+. Rebuilt on each readings refresh.
 	if (!map.getSource(SOURCE_LIVE)) {
 		map.addSource(SOURCE_LIVE, {
 			type: 'geojson',
@@ -361,75 +472,59 @@ const ensureLayers = (map: maplibregl.Map): void => {
 			promoteId: 'id'
 		});
 	}
+	// Node source: the pre-baked nodes with their live max wind as a property.
+	// The stack image is chosen per wind band in layout, which feature-state
+	// can't drive, so this small source is rebuilt on each readings refresh.
+	if (!map.getSource(SOURCE_NODES)) {
+		map.addSource(SOURCE_NODES, {
+			type: 'geojson',
+			data: emptyFc,
+			cluster: false,
+			promoteId: 'id'
+		});
+	}
 
-	// Cluster nodes — spots-style count bubbles (SRF-2660): radius grows with
-	// the station count, a count label sits inside, color = live max wind via
-	// feature-state (paint-only repaint on refresh, no re-layout). One
-	// circle + count-label layer pair per pre-baked tier. A tier missing from
-	// the file matches nothing via its grid filter; loadBase extends the next
-	// finer tier's zoom range downward to cover the gap. Singles show no
-	// number (counts are static file properties — only LIVE values are
-	// constrained to feature-state).
-	const countLabelLayout = {
-		'text-field': ['to-string', ['get', 'count']] as never,
-		'text-font': ['Noto Sans Regular'],
-		'text-allow-overlap': true,
-		'text-ignore-placement': true
-	};
-	const countLabelPaint = {
-		'text-color': '#ffffff',
-		'text-halo-color': 'rgba(20,26,38,0.55)',
-		'text-halo-width': 1.1
-	};
+	// Cluster nodes — a stack of station badges coloured by the node's live
+	// max wind, dimmed without a reading. Two discs for a pair, three for
+	// more; a single station shows one badge. One layer per pre-baked tier;
+	// a tier missing from the file matches nothing via its grid filter, and
+	// loadBase extends the next finer tier's zoom range down over the gap.
 	for (const tier of NODE_TIERS) {
 		const gridMatch = tier.acceptsLegacy
 			? // Legacy files carry ungridded nodes — fold them into this tier.
 				['any', ['!', ['has', 'grid']], ['==', ['get', 'grid'], tier.grid]]
 			: ['==', ['get', 'grid'], tier.grid];
-		const radiusExpr = [
-			'min',
-			tier.radius.cap,
-			['+', tier.radius.base, ['*', tier.radius.k, ['sqrt', ['get', 'count']]]]
-		];
 		if (!map.getLayer(nodeLayerId(tier.grid))) {
 			map.addLayer({
 				id: nodeLayerId(tier.grid),
-				type: 'circle',
-				source: SOURCE_BASE,
-				minzoom: tier.minZoom,
-				maxzoom: tier.maxZoom,
-				filter: ['all', ['==', ['get', 'node'], true], gridMatch] as never,
-				paint: {
-					'circle-color': liveKtsColorExpr as never,
-					'circle-radius': radiusExpr as never,
-					'circle-stroke-width': 1.5,
-					'circle-stroke-color': 'rgba(255,255,255,0.7)',
-					'circle-opacity': 0.92
-				}
-			});
-		}
-		if (!map.getLayer(nodeCountLayerId(tier.grid))) {
-			map.addLayer({
-				id: nodeCountLayerId(tier.grid),
 				type: 'symbol',
-				source: SOURCE_BASE,
+				source: SOURCE_NODES,
 				minzoom: tier.minZoom,
 				maxzoom: tier.maxZoom,
-				filter: [
-					'all',
-					['==', ['get', 'node'], true],
-					gridMatch,
-					['>', ['get', 'count'], 1]
-				] as never,
-				layout: { ...countLabelLayout, 'text-size': tier.textSize },
-				paint: countLabelPaint
+				filter: gridMatch as never,
+				layout: {
+					'icon-image': badgeImageExpr(
+						[
+							'case',
+							['>=', ['coalesce', ['get', 'count'], 1], 3],
+							'stack3',
+							['==', ['coalesce', ['get', 'count'], 1], 2],
+							'stack2',
+							'pws'
+						],
+						['case', ['has', 'kts'], ['to-string', bandIndexExpr(['get', 'kts'])], DIM_BAND]
+					) as never,
+					'icon-anchor': 'bottom',
+					'icon-allow-overlap': true,
+					'icon-ignore-placement': true
+				}
 			});
 		}
 	}
 
 	// Station dots — z8+, every station from the base file. Colored when a
 	// live reading exists (feature-state), dimmed otherwise. Hidden (opacity
-	// 0) when the station has a pill, so silent stations are exactly the
+	// 0) when the station has a badge, so silent stations are exactly the
 	// visible dots.
 	if (!map.getLayer(LAYER_ID_DOTS)) {
 		map.addLayer({
@@ -459,14 +554,14 @@ const ensureLayers = (map: maplibregl.Map): void => {
 			layout: {
 				'icon-image': SELECTION_PILL_IMAGE_ID,
 				'icon-text-fit': 'both',
-				'icon-text-fit-padding': [5, 10, 5, 24],
+				'icon-text-fit-padding': [4, 9, 4, 22],
 				'icon-allow-overlap': true,
 				'icon-ignore-placement': true,
 				'text-field': ['to-string', ['get', 'windKtsRounded']] as never,
 				'text-font': ['Noto Sans Regular'],
-				'text-size': 13,
+				'text-size': PILL_TEXT_SIZE,
 				'text-anchor': 'left',
-				'text-offset': [0.5, 0.05],
+				'text-offset': PILL_TEXT_OFFSET,
 				'text-allow-overlap': true,
 				'text-ignore-placement': true
 			},
@@ -477,9 +572,8 @@ const ensureLayers = (map: maplibregl.Map): void => {
 		});
 	}
 
-	// Capsule pill with the wind speed — individuals only (nodes are
-	// color-only circles; feature-state can't drive layout, and per the
-	// architecture decision clusters show no numbers/arrows).
+	// Neutral pill with the wind speed, off the badge's right. Individuals
+	// only — per the architecture decision nodes show no numbers or arrows.
 	if (!map.getLayer(LAYER_ID_PILL)) {
 		map.addLayer({
 			id: LAYER_ID_PILL,
@@ -487,50 +581,23 @@ const ensureLayers = (map: maplibregl.Map): void => {
 			source: SOURCE_LIVE,
 			minzoom: SWITCH_ZOOM,
 			layout: {
-				'icon-image': pillByStops(['get', 'windKts']) as never,
+				'icon-image': PILL_IMAGE_ID,
 				'icon-text-fit': 'both',
 				// Extra left pad reserves space for the rotated arrow.
-				'icon-text-fit-padding': [3, 8, 3, 22],
+				'icon-text-fit-padding': [2, 7, 2, 20],
 				'icon-allow-overlap': true,
 				'icon-ignore-placement': true,
 				'text-field': ['to-string', ['get', 'windKtsRounded']] as never,
 				'text-font': ['Noto Sans Regular'],
-				'text-size': 13,
+				'text-size': PILL_TEXT_SIZE,
 				'text-anchor': 'left',
-				'text-offset': [0.5, 0.05],
+				'text-offset': PILL_TEXT_OFFSET,
 				'text-allow-overlap': true,
 				'text-ignore-placement': true
 			},
 			paint: {
-				'text-color': ['case', isLightPillExpr, '#1a1a2e', '#ffffff'] as never
+				'text-color': PILL_TEXT_COLOR
 			}
-		});
-	}
-
-	// Verified badge — official networks only (priority 0 in the live-cluster:
-	// metar/ndbc/knmi), not PWS, push or other community stations.
-	if (!map.getLayer(LAYER_ID_VERIFIED)) {
-		map.addLayer({
-			id: LAYER_ID_VERIFIED,
-			type: 'symbol',
-			source: SOURCE_LIVE,
-			minzoom: SWITCH_ZOOM,
-			filter: ['==', ['get', 'priority'], 0],
-			layout: {
-				'icon-image': VERIFIED_IMAGE_ID,
-				'icon-text-fit': 'both',
-				'icon-text-fit-padding': [3, 8, 3, 22],
-				'icon-allow-overlap': true,
-				'icon-ignore-placement': true,
-				'text-field': ['to-string', ['get', 'windKtsRounded']] as never,
-				'text-font': ['Noto Sans Regular'],
-				'text-size': 13,
-				'text-anchor': 'left',
-				'text-offset': [0.5, 0.05],
-				'text-allow-overlap': true,
-				'text-ignore-placement': true
-			},
-			paint: { 'text-opacity': 0 }
 		});
 	}
 
@@ -546,10 +613,38 @@ const ensureLayers = (map: maplibregl.Map): void => {
 			minzoom: SWITCH_ZOOM,
 			filter: ['has', 'windDir'],
 			layout: {
-				'icon-image': ['case', isLightPillExpr, ARROW_IMAGE_ID_DARK, ARROW_IMAGE_ID] as never,
+				'icon-image': ARROW_IMAGE_ID_DARK,
 				'icon-rotate': ['+', ['get', 'windDir'], 180] as never,
 				'icon-rotation-alignment': 'map',
 				'icon-size': 1,
+				'icon-allow-overlap': true,
+				'icon-ignore-placement': true
+			},
+			// Screen-space shift onto the pill. icon-offset can't be used here:
+			// it is applied in the icon's rotated frame, so it would orbit the
+			// point with the wind direction.
+			paint: {
+				'icon-translate': [MARKER_DX, MARKER_DY],
+				'icon-translate-anchor': 'viewport'
+			}
+		});
+	}
+
+	// Station badge — drawn last so the pill tucks under its right edge.
+	// Official networks (priority 0 in the live-cluster: metar/ndbc/knmi) get
+	// the check dot; PWS, push and other community stations don't.
+	if (!map.getLayer(LAYER_ID_BADGE)) {
+		map.addLayer({
+			id: LAYER_ID_BADGE,
+			type: 'symbol',
+			source: SOURCE_LIVE,
+			minzoom: SWITCH_ZOOM,
+			layout: {
+				'icon-image': badgeImageExpr(
+					['case', ['==', ['get', 'priority'], 0], 'verified', 'pws'],
+					['to-string', bandIndexExpr(['get', 'windKts'])]
+				) as never,
+				'icon-anchor': 'bottom',
 				'icon-allow-overlap': true,
 				'icon-ignore-placement': true
 			}
@@ -598,6 +693,7 @@ const loadBase = async (
 		baseVersion = fileVersion;
 		baseLoaded = true;
 		baseIndex = new Map();
+		nodeFeatures = [];
 		const gridsInFile = new Set<number>();
 		let hasLegacyNodes = false;
 		for (const f of fc.features as LiveClusterFeature[]) {
@@ -607,6 +703,7 @@ const loadBase = async (
 				const grid = (p as { grid?: number }).grid;
 				if (typeof grid === 'number') gridsInFile.add(grid);
 				else hasLegacyNodes = true;
+				nodeFeatures.push(f);
 				continue;
 			}
 			baseIndex.set(p.id, {
@@ -617,6 +714,7 @@ const loadBase = async (
 			});
 		}
 		getSource(map, SOURCE_BASE)?.setData(fc);
+		renderNodes(map);
 
 		// Rollout fallback: older files may lack the coarser tiers (or carry
 		// only ungridded legacy nodes, which the legacy-accepting tier
@@ -627,10 +725,8 @@ const loadBase = async (
 		for (const tier of NODE_TIERS) {
 			const available = gridsInFile.has(tier.grid) || (tier.acceptsLegacy && hasLegacyNodes);
 			if (!available) continue; // its grid filter matches nothing anyway
-			for (const layerId of [nodeLayerId(tier.grid), nodeCountLayerId(tier.grid)]) {
-				if (map.getLayer(layerId)) {
-					map.setLayerZoomRange(layerId, carryMin, tier.maxZoom);
-				}
+			if (map.getLayer(nodeLayerId(tier.grid))) {
+				map.setLayerZoomRange(nodeLayerId(tier.grid), carryMin, tier.maxZoom);
 			}
 			carryMin = tier.maxZoom;
 		}
@@ -650,23 +746,28 @@ type ReadingsFile = {
 	nodes?: Record<string, number>;
 };
 
+// Re-emit the nodes with their live max wind as a `kts` property (omitted
+// without a reading, so the layer's `has kts` check picks the dim stack).
+const renderNodes = (map: maplibregl.Map): void => {
+	const features = nodeFeatures.map((f): GeoJSON.Feature => {
+		const kts = nodeKts.get(f.properties.id);
+		return {
+			type: 'Feature',
+			geometry: f.geometry,
+			properties: kts == null ? f.properties : { ...f.properties, kts }
+		};
+	});
+	getSource(map, SOURCE_NODES)?.setData({ type: 'FeatureCollection', features });
+};
+
 const applyReadings = (map: maplibregl.Map, readings: ReadingsFile): void => {
 	const nowSec = Date.now() / 1000;
 	const stations = readings.stations ?? {};
 	const nodes = readings.nodes ?? {};
 
-	// Node colors — pure feature-state repaint.
-	const nextNodeIds = new Set<string>();
-	for (const [cellId, maxKts] of Object.entries(nodes)) {
-		map.setFeatureState({ source: SOURCE_BASE, id: cellId }, { kts: maxKts });
-		nextNodeIds.add(cellId);
-	}
-	for (const cellId of liveNodeIds) {
-		if (!nextNodeIds.has(cellId)) {
-			map.removeFeatureState({ source: SOURCE_BASE, id: cellId }, 'kts');
-		}
-	}
-	liveNodeIds = nextNodeIds;
+	// Node colors — the stack image follows the wind band.
+	nodeKts = new Map(Object.entries(nodes));
+	renderNodes(map);
 
 	// Station dots + the live (pill) source.
 	const nextLiveIds = new Set<string>();
@@ -837,7 +938,7 @@ const setCursorDefault = (): void => {
 	if (currentMap) currentMap.getCanvas().style.cursor = '';
 };
 
-const INTERACTIVE_STATION_LAYERS = [LAYER_ID_PILL, LAYER_ID_ARROW, LAYER_ID_DOTS];
+const INTERACTIVE_STATION_LAYERS = [LAYER_ID_BADGE, LAYER_ID_PILL, LAYER_ID_ARROW, LAYER_ID_DOTS];
 
 const attachInteractionHandlers = (map: maplibregl.Map): void => {
 	for (const layerId of INTERACTIVE_STATION_LAYERS) {
@@ -869,12 +970,11 @@ const detachInteractionHandlers = (map: maplibregl.Map): void => {
 
 const ALL_LAYERS = [
 	...NODE_LAYER_IDS,
-	...NODE_COUNT_LAYER_IDS,
 	LAYER_ID_DOTS,
 	LAYER_ID_SELECTION_PILL,
 	LAYER_ID_PILL,
-	LAYER_ID_VERIFIED,
-	LAYER_ID_ARROW
+	LAYER_ID_ARROW,
+	LAYER_ID_BADGE
 ];
 
 const bootstrap = async (map: maplibregl.Map): Promise<void> => {
@@ -941,10 +1041,12 @@ export const teardownWindyStations = (map: maplibregl.Map): void => {
 	pendingAbort = undefined;
 	getSource(map, SOURCE_BASE)?.setData(emptyFc);
 	getSource(map, SOURCE_LIVE)?.setData(emptyFc);
+	getSource(map, SOURCE_NODES)?.setData(emptyFc);
 	selectedStationId = null;
 	baseIndex.clear();
 	liveIds.clear();
-	liveNodeIds.clear();
+	nodeFeatures = [];
+	nodeKts.clear();
 	baseVersion = null;
 	baseLoaded = false;
 	currentMap = null;
