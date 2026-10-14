@@ -25,6 +25,7 @@
 //
 // Needs `global_fetch_strictly_public` (wrangler.toml): the live-wind service runs on our
 // own zone, and without the flag a fetch to it would skip the Worker on its route.
+import { UpstreamGate, lookupFile } from '../lib/upstream-gate';
 
 interface Env {
 	// Override for preview deployments, e.g. https://test-live-wind.thesurfr.app/v1/stations/layer
@@ -68,6 +69,10 @@ const corsHeaders = {
 	'Access-Control-Max-Age': '3000'
 };
 
+// One upstream call per file at a time, and a cooldown after failures (see the gate).
+const UPSTREAM_FAILURE_BACKOFF_MS = 30_000;
+const gate = new UpstreamGate(UPSTREAM_FAILURE_BACKOFF_MS);
+
 const errorResponse = (status: number, body: Record<string, unknown>): Response =>
 	new Response(JSON.stringify(body), {
 		status,
@@ -86,7 +91,8 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 
 	const url = new URL(request.url);
 	const file = url.pathname.replace(/^\/stations\//, '');
-	const policy = FILES[file];
+	// Own properties only: /stations/constructor and friends are not files.
+	const policy = lookupFile(FILES, file);
 	if (!policy) return errorResponse(404, { error: 'not-found', file });
 	if (!env.STATIONS_TOKEN) return errorResponse(503, { error: 'not-configured', file });
 
@@ -97,35 +103,48 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 	const cache = caches.default;
 	const forceRefresh = request.headers.get(FORCE_REFRESH_HEADER) === '1';
 
-	let body: Response | undefined = await cache.match(cacheKey);
+	const cached: Response | undefined = await cache.match(cacheKey);
+	let body = cached;
 	if (body && forceRefresh) {
 		const cachedAt = Number(body.headers.get(CACHED_AT_HEADER) ?? 0);
 		if (Date.now() - cachedAt >= FORCE_REFRESH_MIN_AGE_MS) body = undefined;
 	}
 	let upstreamMs = 0;
 	if (!body) {
-		const fetchStart = Date.now();
-		const upstream = await fetch(upstreamUrl, {
-			headers: { Authorization: `Bearer ${env.STATIONS_TOKEN}` }
-		});
-		upstreamMs = Date.now() - fetchStart;
-		if (!upstream.ok) {
-			return errorResponse(upstream.status === 404 ? 404 : 502, {
-				error: 'upstream',
-				status: upstream.status,
-				file
-			});
-		}
-		const toCache = new Response(upstream.body, {
-			headers: {
-				'Content-Type': 'application/json',
-				'Cache-Control': `public, s-maxage=${policy.edgeTtl}`,
-				[CACHED_AT_HEADER]: String(Date.now()),
-				...(upstream.headers.get('ETag') ? { ETag: upstream.headers.get('ETag')! } : {})
+		// A recent upstream failure is still cooling down: serve the last good
+		// copy (even past its TTL) or fail, without another token-spending call.
+		if (gate.inBackoff(upstreamUrl)) {
+			if (cached) body = cached;
+			else return errorResponse(503, { error: 'upstream-backoff', file });
+		} else {
+			const fetchStart = Date.now();
+			const upstream = await gate.fetch(upstreamUrl, () =>
+				fetch(upstreamUrl, { headers: { Authorization: `Bearer ${env.STATIONS_TOKEN}` } })
+			);
+			upstreamMs = Date.now() - fetchStart;
+			if (!upstream.ok) {
+				if (cached) {
+					body = cached; // stale beats an error for a map layer
+				} else {
+					return errorResponse(upstream.status === 404 ? 404 : 502, {
+						error: 'upstream',
+						status: upstream.status,
+						file
+					});
+				}
+			} else {
+				const toCache = new Response(upstream.body, {
+					headers: {
+						'Content-Type': 'application/json',
+						'Cache-Control': `public, s-maxage=${policy.edgeTtl}`,
+						[CACHED_AT_HEADER]: String(Date.now()),
+						...(upstream.etag ? { ETag: upstream.etag } : {})
+					}
+				});
+				context.waitUntil(cache.put(cacheKey, toCache.clone()));
+				body = toCache;
 			}
-		});
-		context.waitUntil(cache.put(cacheKey, toCache.clone()));
-		body = toCache;
+		}
 	}
 
 	const headers = new Headers();
