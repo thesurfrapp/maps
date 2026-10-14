@@ -60,6 +60,10 @@ const FORCE_REFRESH_HEADER = 'X-Surfr-Force-Refresh';
 // upstream load stays bounded per PoP however often the header arrives.
 const FORCE_REFRESH_MIN_AGE_MS = 30_000;
 const CACHED_AT_HEADER = 'X-Surfr-Cached-At';
+// The PoP keeps each copy this long, well past its TTL, so an upstream failure can
+// still serve the last good file. Freshness comes from CACHED_AT_HEADER, not from
+// the Cache API (which drops an entry once its s-maxage has passed).
+const STALE_RETAIN_S = 86400;
 
 const corsHeaders = {
 	'Access-Control-Allow-Origin': '*',
@@ -104,15 +108,17 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 	const forceRefresh = request.headers.get(FORCE_REFRESH_HEADER) === '1';
 
 	const cached: Response | undefined = await cache.match(cacheKey);
-	let body = cached;
-	if (body && forceRefresh) {
-		const cachedAt = Number(body.headers.get(CACHED_AT_HEADER) ?? 0);
-		if (Date.now() - cachedAt >= FORCE_REFRESH_MIN_AGE_MS) body = undefined;
-	}
+	// Fresh for the file's TTL; a forced refresh refetches anything older than
+	// FORCE_REFRESH_MIN_AGE_MS. Older copies stay as the fallback below.
+	const maxAgeMs = forceRefresh
+		? Math.min(FORCE_REFRESH_MIN_AGE_MS, policy.edgeTtl * 1000)
+		: policy.edgeTtl * 1000;
+	const cachedAt = Number(cached?.headers.get(CACHED_AT_HEADER) ?? 0);
+	let body = cached && Date.now() - cachedAt < maxAgeMs ? cached : undefined;
 	let upstreamMs = 0;
 	if (!body) {
 		// A recent upstream failure is still cooling down: serve the last good
-		// copy (even past its TTL) or fail, without another token-spending call.
+		// copy or fail, without another token-spending call.
 		if (gate.inBackoff(upstreamUrl)) {
 			if (cached) body = cached;
 			else return errorResponse(503, { error: 'upstream-backoff', file });
@@ -136,7 +142,7 @@ export const onRequest: PagesFunction<Env> = async (context) => {
 				const toCache = new Response(upstream.body, {
 					headers: {
 						'Content-Type': 'application/json',
-						'Cache-Control': `public, s-maxage=${policy.edgeTtl}`,
+						'Cache-Control': `public, s-maxage=${STALE_RETAIN_S}`,
 						[CACHED_AT_HEADER]: String(Date.now()),
 						...(upstream.etag ? { ETag: upstream.etag } : {})
 					}

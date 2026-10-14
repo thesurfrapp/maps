@@ -9,8 +9,8 @@ export const needsBaseReload = (baseVersion: number | null, readingsV: unknown):
 	typeof readingsV === 'number' && baseVersion !== null && readingsV !== baseVersion;
 
 /**
- * Readings may be painted on the positions on screen. Files without a version
- * (older formats) are trusted, as before.
+ * Readings may be painted on these positions. Files without a version (older
+ * formats) are trusted, as before.
  */
 export const readingsMatchBase = (baseVersion: number | null, readingsV: unknown): boolean =>
 	typeof readingsV !== 'number' || baseVersion === null || readingsV === baseVersion;

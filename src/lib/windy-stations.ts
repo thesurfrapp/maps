@@ -572,7 +572,13 @@ type LiveClusterFeature = GeoJSON.Feature<
 	}
 >;
 
-const loadBase = async (map: maplibregl.Map, reload = false): Promise<boolean> => {
+// `forReadingsV`: install the file only if it matches these readings. A reload
+// that still returns another version keeps the current, consistent pair on screen.
+const loadBase = async (
+	map: maplibregl.Map,
+	reload = false,
+	forReadingsV?: number
+): Promise<boolean> => {
 	try {
 		// `reload` fires on a version mismatch (nightly rotation, or a
 		// format upgrade like SRF-2660). cache:'reload' busts the browser
@@ -586,8 +592,10 @@ const loadBase = async (map: maplibregl.Map, reload = false): Promise<boolean> =
 		if (!res.ok) return false;
 		const fc = (await res.json()) as GeoJSON.FeatureCollection & { v?: number };
 		if (!fc || fc.type !== 'FeatureCollection' || !Array.isArray(fc.features)) return false;
+		const fileVersion = typeof fc.v === 'number' ? fc.v : null;
+		if (forReadingsV !== undefined && !readingsMatchBase(fileVersion, forReadingsV)) return false;
 
-		baseVersion = typeof fc.v === 'number' ? fc.v : null;
+		baseVersion = fileVersion;
 		baseLoaded = true;
 		baseIndex = new Map();
 		const gridsInFile = new Set<number>();
@@ -716,13 +724,16 @@ const refreshReadings = async (map: maplibregl.Map): Promise<void> => {
 		const readings = (await res.json()) as ReadingsFile;
 
 		// Version guard: the station set changed while we hold an older
-		// live-cluster — refetch it, then apply the readings only if the two now
-		// agree. A failed reload, or the proxy still serving the old file during
-		// its refresh cooldown, skips this round instead of painting values on the
-		// wrong positions; the next refresh retries.
-		if (needsBaseReload(baseVersion, readings.v)) {
-			const reloaded = await loadBase(map, true);
-			if (!reloaded || !readingsMatchBase(baseVersion, readings.v)) return;
+		// live-cluster — refetch it, and install it plus the readings only if the
+		// two agree. A failed reload, or the proxy serving another version (its
+		// refresh cooldown), skips this round and leaves the current positions and
+		// values on screen together; the next refresh retries.
+		if (
+			typeof readings.v === 'number' &&
+			needsBaseReload(baseVersion, readings.v) &&
+			!(await loadBase(map, true, readings.v))
+		) {
+			return;
 		}
 		applyReadings(map, readings);
 	} catch (e) {
