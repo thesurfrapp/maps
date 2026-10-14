@@ -170,7 +170,12 @@ const memorisedHash = (json: string, cachedJson: string, cachedHash: string) => 
 	return { json, hash: hashValue(json) };
 };
 
-export const getOMUrl = () => {
+// Optional `variableOverride` lets callers fetch a sibling variable's .om
+// file without touching the user-facing selection. Used by the vector
+// manager so the wind-direction arrows can keep rendering on top of the
+// gust overlay (which is a scalar magnitude and has no direction component
+// of its own).
+export const getOMUrl = (variableOverride?: string) => {
 	const domain = get(d);
 	const base = `${getBaseUri(domain)}/data_spatial/${domain}`;
 	const modelRun = get(mR);
@@ -178,7 +183,7 @@ export const getOMUrl = () => {
 	const selectedTime = get(time);
 
 	let result = `${base}/${fmtModelRun(modelRun)}/${fmtSelectedTime(selectedTime)}.om`;
-	result += `?variable=${get(v)}`;
+	result += `?variable=${variableOverride ?? get(v)}`;
 
 	if (mode.current === 'dark') result += '&dark=true';
 	const vectorOptions = get(vO);

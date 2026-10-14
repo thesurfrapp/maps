@@ -16,9 +16,23 @@ import {
 } from '$lib/constants';
 import { type SlotLayer, SlotManager } from '$lib/slot-manager';
 
+import { isLiveStationsEnabled } from './feature-flags';
 import { refreshPopup } from './popup';
 import { currentOmUrl } from './stores/om-url';
+import { variable as v } from './stores/variables';
 import { getOMUrl } from './url';
+
+// Gust is a scalar magnitude — the .om file has no u/v direction component,
+// so the wind-arrows source-layer is empty. Resolve to the wind u/v file
+// for the vector layer so direction arrows still render on top of the gust
+// color heatmap. Same idea as Windguru: gust intensity colored, wind
+// direction overlaid (gusts and wind share direction in practice). Part of the
+// live-stations map style, so only with `?stations=1`.
+const getVectorVariable = (): string => {
+	const current = get(v);
+	if (current === 'wind_gusts_10m' && isLiveStationsEnabled()) return 'wind_u_component_10m';
+	return current;
+};
 
 // =============================================================================
 // Expression helpers
@@ -367,10 +381,11 @@ export const createManagers = (): void => {
 export const addOmFileLayers = (): void => {
 	const map = get(m);
 	if (!map) return;
-	const omUrl = getOMUrl();
+	const rasterUrl = getOMUrl();
+	const vectorUrl = getOMUrl(getVectorVariable());
 	createManagers();
-	rasterManager?.update('om://' + omUrl);
-	vectorManager?.update('om://' + omUrl);
+	rasterManager?.update('om://' + rasterUrl);
+	vectorManager?.update('om://' + vectorUrl);
 };
 
 export const changeOMfileURL = (vectorOnly = false, rasterOnly = false): void => {
@@ -380,14 +395,15 @@ export const changeOMfileURL = (vectorOnly = false, rasterOnly = false): void =>
 		return;
 	}
 
-	const omUrl = getOMUrl();
+	const rasterUrl = getOMUrl();
+	const vectorUrl = getOMUrl(getVectorVariable());
 	const previous = get(currentOmUrl);
-	console.log('[changeOMfileURL] new=', omUrl, 'previous=', previous);
-	if (previous == omUrl || !omUrl) {
+	console.log('[changeOMfileURL] new=', rasterUrl, 'previous=', previous);
+	if (previous == rasterUrl || !rasterUrl) {
 		console.log('[changeOMfileURL] noop (same url or no modelRun)');
 		return;
 	}
-	currentOmUrl.set(omUrl);
+	currentOmUrl.set(rasterUrl);
 
 	loading.set(true);
 	if (!vectorOnly) postRnLifecycle('mapDataLoading');
@@ -403,6 +419,6 @@ export const changeOMfileURL = (vectorOnly = false, rasterOnly = false): void =>
 		resolveBeforeLayer(map, preferences.hillshade ? HILLSHADE_LAYER : BEFORE_LAYER_RASTER)
 	);
 
-	if (!vectorOnly) rasterManager?.update('om://' + omUrl);
-	if (!rasterOnly) vectorManager?.update('om://' + omUrl);
+	if (!vectorOnly) rasterManager?.update('om://' + rasterUrl);
+	if (!rasterOnly) vectorManager?.update('om://' + vectorUrl);
 };

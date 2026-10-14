@@ -1,5 +1,8 @@
 name = "maps"
 compatibility_date = "2025-01-01"
+# The /stations proxy fetches the live-wind service, which runs on our own zone: without
+# this flag a same-zone fetch skips the Worker on that route (see functions/stations).
+compatibility_flags = ["global_fetch_strictly_public"]
 pages_build_output_dir = "build"
 
 [[r2_buckets]]

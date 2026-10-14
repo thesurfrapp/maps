@@ -1,13 +1,95 @@
-// Render live wind station data from the Windy Stations API (via Surfr backend proxy)
-// as Windy-style pill markers: colored capsule with direction arrow + speed number.
-// Uses DOM markers (MapLibre Marker API) for proper pill rendering.
+// Live wind stations — two-phase loading (SRF-2644).
+//
+// Phase 1 (paint): one static "live-cluster" file — all active station
+// positions plus pre-clustered z8-grid nodes, generated nightly by the
+// backend (SRF-2643) and served same-origin via the /stations/* Pages
+// Function (Cloudflare edge cache in front of the public GCS bucket).
+// Cached hard by the browser, so a repeat map open paints with zero
+// station-related network requests.
+//
+// Phase 2 (hydrate): a small readings file every ~5 minutes — id-keyed live
+// values + per-node max-wind aggregates. Applied via setFeatureState, so
+// cluster/dot colors repaint without re-parsing, re-clustering, or symbol
+// re-layout. Stations absent from the readings render dimmed (absence IS the
+// staleness signal). Individual pills/arrows (z8+) rebuild from a second,
+// small GeoJSON source containing only stations with a current reading.
+//
+// One rendering switch at z8 (same shape as spots, without spots' data swap):
+//   z0–7.99  cluster nodes (circle layer, color = live max wind)
+//   z8+      individual stations (Marijn's pill + arrow + badge design)
+// MapLibre's own clustering is NOT used — nodes are pre-baked server-side
+// with stable cell ids and a baked expansionZoom for drill-down.
+//
+// No per-pan or per-zoom fetching. /windystations/bbox has left the map
+// path entirely; it remains only for tap details (names live there — the
+// live-cluster carries none) and search.
+//
+// API surface preserved: initWindyStations, setWindyStationsConfig,
+// setWindyStationsVisible, teardownWindyStations + the LAYER_ID_* exports
+// rn-bridge consumes.
+import { needsBaseReload, readingsMatchBase } from './stations-version';
 
-import { Marker } from 'maplibre-gl';
 import type * as maplibregl from 'maplibre-gl';
 
-const MIN_ZOOM = 5;
-const LIMIT = 200;
-const DEBOUNCE_MS = 700;
+const SOURCE_BASE = 'windy-stations-base'; // live-cluster: nodes + all stations
+const SOURCE_LIVE = 'windy-stations'; // stations with a current reading (pills)
+
+export const LAYER_ID_DOTS = 'windy-stations-dots';
+export const LAYER_ID_SELECTION_PILL = 'windy-stations-selection-pill';
+export const LAYER_ID_PILL = 'windy-stations-pill';
+export const LAYER_ID_ARROW = 'windy-stations-arrow';
+export const LAYER_ID_VERIFIED = 'windy-stations-verified';
+
+const ARROW_IMAGE_ID = 'windy-station-arrow';
+const ARROW_IMAGE_ID_DARK = 'windy-station-arrow-dark';
+const PILL_IMAGE_PREFIX = 'windy-station-pill-';
+const SELECTION_PILL_IMAGE_ID = 'windy-station-selection-pill';
+const VERIFIED_IMAGE_ID = 'windy-station-verified';
+
+// Same-origin default — the /stations/* Pages Function proxies + edge-caches
+// the public GCS objects. Overridable via setWindyStationsConfig for dev.
+const DEFAULT_STATIONS_BASE_URL = '/stations';
+const LIVE_CLUSTER_FILE = 'live-cluster.json';
+const READINGS_FILE = 'readings.json';
+
+// The rendering ladder: individuals from the switch up, count-bubble node
+// tiers below. Each tier's zoom band starts where its grid's cell spacing
+// safely exceeds the max bubble diameter, so bubbles never overlap: z3 cells
+// are ≥64px at z1, z5 cells ≥128px at z4, z8 cells ≥64px at z6.
+const SWITCH_ZOOM = 8;
+type NodeTier = {
+	grid: number;
+	minZoom: number;
+	maxZoom: number;
+	/** radius = min(cap, base + k·√count) */
+	radius: { base: number; k: number; cap: number };
+	textSize: number;
+	/** Legacy files carry ungridded nodes — only the z8 tier accepts them. */
+	acceptsLegacy?: boolean;
+};
+const NODE_TIERS: NodeTier[] = [
+	{ grid: 3, minZoom: 0, maxZoom: 4, radius: { base: 8, k: 1.6, cap: 22 }, textSize: 11 },
+	{ grid: 5, minZoom: 4, maxZoom: 6, radius: { base: 7, k: 1.5, cap: 20 }, textSize: 11 },
+	{
+		grid: 8,
+		minZoom: 6,
+		maxZoom: SWITCH_ZOOM,
+		radius: { base: 6, k: 1.2, cap: 16 },
+		textSize: 10,
+		acceptsLegacy: true
+	}
+];
+const nodeLayerId = (grid: number): string => `windy-stations-nodes-z${grid}`;
+const nodeCountLayerId = (grid: number): string => `windy-stations-node-count-z${grid}`;
+const NODE_LAYER_IDS = NODE_TIERS.map((t) => nodeLayerId(t.grid));
+const NODE_COUNT_LAYER_IDS = NODE_TIERS.map((t) => nodeCountLayerId(t.grid));
+// Matches the backend's refresh cadence + the readings file's max-age.
+const REFRESH_MS = 5 * 60_000;
+// A reading older than this renders dimmed even if still in the file
+// (backend already filters at 60 min — this is belt & braces client-side).
+const STALE_MS = 60 * 60_000;
+
+const DIM_COLOR = '#8a97a3'; // silent/stale stations & nodes without data
 
 type WindyStation = {
 	id: string;
@@ -24,12 +106,16 @@ type WindyStation = {
 };
 
 type WindyStationsConfig = {
+	/** Backend origin for tap-details/search (NOT for the station files). */
 	endpoint?: string;
+	/** Base URL of the station files; defaults to same-origin /stations. */
+	stationsBaseUrl?: string;
 	visible?: boolean;
 	onStationTap?: (station: WindyStation) => void;
 };
 
-// Surfr embed wind color anchors [kt, r, g, b]
+// Surfr embed wind color anchors [kt, r, g, b] — identical to the GFS
+// background ramp so dots read as "ground truth" samples of the same scale.
 const COLOR_ANCHORS: [number, number, number, number][] = [
 	[0, 64, 89, 153],
 	[8, 110, 221, 235],
@@ -40,167 +126,826 @@ const COLOR_ANCHORS: [number, number, number, number][] = [
 	[30, 255, 118, 82],
 	[35, 255, 82, 173],
 	[40, 255, 88, 235],
-	[50, 173, 112, 255],
+	[50, 173, 112, 255]
 ];
 
-const lerp = (a: number, b: number, t: number) => Math.round(a + (b - a) * t);
-
-function windColor(kts: number): string {
-	if (kts <= COLOR_ANCHORS[0][0]) {
-		const [, r, g, b] = COLOR_ANCHORS[0];
-		return `rgb(${r},${g},${b})`;
+// MapLibre interpolate stops over a feature-state kts value.
+const ktsColorStops = (): (number | string)[] => {
+	const stops: (number | string)[] = [];
+	for (const [k, r, g, b] of COLOR_ANCHORS) {
+		stops.push(k, `rgb(${r},${g},${b})`);
 	}
-	for (let i = 0; i < COLOR_ANCHORS.length - 1; i++) {
-		const [k0, r0, g0, b0] = COLOR_ANCHORS[i];
-		const [k1, r1, g1, b1] = COLOR_ANCHORS[i + 1];
-		if (kts >= k0 && kts < k1) {
-			const t = (kts - k0) / (k1 - k0);
-			return `rgb(${lerp(r0, r1, t)},${lerp(g0, g1, t)},${lerp(b0, b1, t)})`;
-		}
-	}
-	const last = COLOR_ANCHORS[COLOR_ANCHORS.length - 1];
-	return `rgb(${last[1]},${last[2]},${last[3]})`;
-}
+	return stops;
+};
 
-function textColor(kts: number): string {
-	return kts >= 20 && kts < 30 ? '#1a1a2e' : '#ffffff';
-}
+// Paint expression: color by live kts from feature-state, dim when absent.
+// MapLibre expressions can't compare against a null literal, so absence is
+// mapped to a -1 sentinel via coalesce (real kts are always >= 0).
+const liveKtsColorExpr = [
+	'interpolate',
+	['linear'],
+	['coalesce', ['feature-state', 'kts'], -1],
+	-1,
+	DIM_COLOR,
+	...ktsColorStops()
+];
 
-// SVG arrow pointing up (will be rotated by wind direction)
-function arrowSvg(dir: number, color: string): string {
-	// Wind direction is "from" — rotate to point downwind (+180°)
-	const rotation = (dir + 180) % 360;
-	return `<svg width="10" height="10" viewBox="0 0 10 10" style="transform:rotate(${rotation}deg)">` +
-		`<polygon points="5,1 9,8 5,6 1,8" fill="${color}"/></svg>`;
-}
+const emptyFc: GeoJSON.FeatureCollection = { type: 'FeatureCollection', features: [] };
 
-function verifiedSvg(): string {
-	return `<svg width="10" height="10" viewBox="0 0 10 10" style="flex-shrink:0">` +
-		`<circle cx="5" cy="5" r="4.5" fill="#4ADE80"/>` +
-		`<path d="M3 5.2 L4.3 6.5 L7 3.8" stroke="#fff" stroke-width="1.3" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
-}
+// ── module state ───────────────────────────────────────────────────────────
 
-function createPillElement(station: WindyStation): HTMLDivElement {
-	const stale = station.stale;
-	const hasWind = station.windKts != null;
-	const kts = Math.round(station.windKts ?? 0);
-	const bg = stale ? '#555' : windColor(kts);
-	const fg = stale ? '#999' : textColor(kts);
-	const dir = station.windDir ?? 0;
-	const isVerified = station.source != null && station.source !== 'pws';
-
-	const el = document.createElement('div');
-	el.className = 'ws-pill';
-	el.style.cssText =
-		`display:inline-flex;align-items:center;gap:2px;` +
-		`background:${bg};color:${fg};` +
-		`padding:3px 6px 3px 4px;border-radius:10px;` +
-		`font:700 11px/1 system-ui,-apple-system,sans-serif;` +
-		`white-space:nowrap;cursor:pointer;` +
-		`border:1px solid ${stale ? 'rgba(255,255,255,0.15)' : 'rgba(255,255,255,0.35)'};` +
-		`box-shadow:0 1px 3px rgba(0,0,0,0.4);` +
-		`opacity:${stale ? '0.6' : '1'};` +
-		`pointer-events:auto;user-select:none;`;
-
-	el.innerHTML = hasWind
-		? arrowSvg(dir, fg) + `<span>${kts}</span>` + (isVerified ? verifiedSvg() : '')
-		: `<span>--</span>`;
-	return el;
-}
+type BaseStation = {
+	lat: number;
+	lon: number;
+	source: string | null;
+	priority: number;
+};
+type Reading = [number, number | null, number | null, number]; // kts, dir, gust, obsTsSec
 
 let currentMap: maplibregl.Map | null = null;
 let currentConfig: WindyStationsConfig = {};
-let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+let baseVersion: number | null = null;
+// The positions file loaded at least once (baseVersion alone can't tell: legacy files have no v).
+let baseLoaded = false;
+let baseIndex = new Map<string, BaseStation>();
+let liveIds = new Set<string>(); // ids with feature-state applied (for cleanup)
+let liveNodeIds = new Set<string>();
+let selectedStationId: string | number | null = null;
+let refreshTimer: ReturnType<typeof setInterval> | undefined;
 let pendingAbort: AbortController | undefined;
-let activeMarkers: Marker[] = [];
-let lastStations: WindyStation[] = [];
+let visibilityListener: (() => void) | undefined;
 
-const removeAllMarkers = () => {
-	for (const m of activeMarkers) m.remove();
-	activeMarkers = [];
+const stationsBaseUrl = (): string =>
+	(currentConfig.stationsBaseUrl ?? DEFAULT_STATIONS_BASE_URL).replace(/\/$/, '');
+
+const getSource = (map: maplibregl.Map, id: string): maplibregl.GeoJSONSource | undefined =>
+	map.getSource(id) as maplibregl.GeoJSONSource | undefined;
+
+// ── image atlas (unchanged visual design) ──────────────────────────────────
+
+// Slim white triangle, no outline — sits INSIDE a colored pill so its
+// contrast comes from the pill background. Points UP at icon-rotate=0.
+const ARROW_SIZE = 12;
+const drawArrow = (fill: string): ImageData | null => {
+	const canvas = document.createElement('canvas');
+	canvas.width = ARROW_SIZE;
+	canvas.height = ARROW_SIZE;
+	const ctx = canvas.getContext('2d');
+	if (!ctx) return null;
+	ctx.fillStyle = fill;
+	ctx.beginPath();
+	// Notched chevron silhouette — reads as "arrow indicator" rather than a
+	// play button.
+	ctx.moveTo(ARROW_SIZE / 2, 0.5);
+	ctx.lineTo(ARROW_SIZE - 0.5, ARROW_SIZE - 0.5);
+	ctx.lineTo(ARROW_SIZE / 2, ARROW_SIZE * 0.62);
+	ctx.lineTo(0.5, ARROW_SIZE - 0.5);
+	ctx.closePath();
+	ctx.fill();
+	return ctx.getImageData(0, 0, ARROW_SIZE, ARROW_SIZE);
 };
 
-const renderMarkers = (map: maplibregl.Map, stations: WindyStation[]) => {
-	removeAllMarkers();
-	lastStations = stations;
-	for (const s of stations) {
-		const el = createPillElement(s);
-		el.addEventListener('click', (e) => {
-			e.stopPropagation();
-			currentConfig.onStationTap?.(s);
+const ensureArrowImage = (map: maplibregl.Map): void => {
+	if (!map.hasImage(ARROW_IMAGE_ID)) {
+		const white = drawArrow('#ffffff');
+		if (white) {
+			map.addImage(ARROW_IMAGE_ID, {
+				width: ARROW_SIZE,
+				height: ARROW_SIZE,
+				data: new Uint8Array(white.data)
+			});
+		}
+	}
+	if (!map.hasImage(ARROW_IMAGE_ID_DARK)) {
+		const dark = drawArrow('#1a1a2e');
+		if (dark) {
+			map.addImage(ARROW_IMAGE_ID_DARK, {
+				width: ARROW_SIZE,
+				height: ARROW_SIZE,
+				data: new Uint8Array(dark.data)
+			});
+		}
+	}
+};
+
+const PILL_W = 36;
+const PILL_H = 22;
+const PILL_R = PILL_H / 2;
+
+const drawCapsule = (fill: string): ImageData | null => {
+	const canvas = document.createElement('canvas');
+	canvas.width = PILL_W;
+	canvas.height = PILL_H;
+	const ctx = canvas.getContext('2d');
+	if (!ctx) return null;
+	ctx.fillStyle = fill;
+	ctx.beginPath();
+	if (typeof ctx.roundRect === 'function') {
+		ctx.roundRect(0, 0, PILL_W, PILL_H, PILL_R);
+	} else {
+		ctx.moveTo(PILL_R, 0);
+		ctx.lineTo(PILL_W - PILL_R, 0);
+		ctx.arc(PILL_W - PILL_R, PILL_R, PILL_R, -Math.PI / 2, Math.PI / 2);
+		ctx.lineTo(PILL_R, PILL_H);
+		ctx.arc(PILL_R, PILL_R, PILL_R, Math.PI / 2, (3 * Math.PI) / 2);
+		ctx.closePath();
+	}
+	ctx.fill();
+	return ctx.getImageData(0, 0, PILL_W, PILL_H);
+};
+
+const addStretchableImage = (map: maplibregl.Map, id: string, img: ImageData): void => {
+	map.addImage(
+		id,
+		{ width: PILL_W, height: PILL_H, data: new Uint8Array(img.data) },
+		{
+			content: [PILL_R, 0, PILL_W - PILL_R, PILL_H],
+			stretchX: [[PILL_R, PILL_W - PILL_R]]
+		}
+	);
+};
+
+const ensurePillImages = (map: maplibregl.Map): void => {
+	for (let i = 0; i < COLOR_ANCHORS.length; i++) {
+		const id = `${PILL_IMAGE_PREFIX}${i}`;
+		if (map.hasImage(id)) continue;
+		const [, r, g, b] = COLOR_ANCHORS[i];
+		const img = drawCapsule(`rgb(${r},${g},${b})`);
+		if (img) addStretchableImage(map, id, img);
+	}
+};
+
+const ensureSelectionPillImage = (map: maplibregl.Map): void => {
+	if (map.hasImage(SELECTION_PILL_IMAGE_ID)) return;
+	const img = drawCapsule('#22d3ee');
+	if (img) addStretchableImage(map, SELECTION_PILL_IMAGE_ID, img);
+};
+
+// Verified badge — FontAwesome circle-check knocked out of the pill's right
+// cap (see SRF station bottom sheet); rendered at 3× for retina crispness.
+const VERIFIED_SCALE = 3;
+const FA_CIRCLE_CHECK =
+	'M256 512A256 256 0 1 0 256 0a256 256 0 1 0 0 512zM369 209L241 337c-9.4 9.4-24.6 9.4-33.9 0l-64-64c-9.4-9.4-9.4-24.6 0-33.9s24.6-9.4 33.9 0l47 47L335 175c9.4-9.4 24.6-9.4 33.9 0s9.4 24.6 0 33.9z';
+const drawVerified = (): ImageData | null => {
+	const canvas = document.createElement('canvas');
+	canvas.width = PILL_W * VERIFIED_SCALE;
+	canvas.height = PILL_H * VERIFIED_SCALE;
+	const ctx = canvas.getContext('2d');
+	if (!ctx) return null;
+	ctx.scale(VERIFIED_SCALE, VERIFIED_SCALE);
+	const D = 10;
+	const sc = D / 512;
+	const cx = PILL_W - PILL_R / 2;
+	const cy = PILL_H / 2;
+	ctx.translate(cx - 256 * sc, cy - 256 * sc);
+	ctx.scale(sc, sc);
+	ctx.fillStyle = '#ffffff';
+	ctx.fill(new Path2D(FA_CIRCLE_CHECK), 'evenodd');
+	return ctx.getImageData(0, 0, PILL_W * VERIFIED_SCALE, PILL_H * VERIFIED_SCALE);
+};
+
+const ensureVerifiedImage = (map: maplibregl.Map): void => {
+	if (map.hasImage(VERIFIED_IMAGE_ID)) return;
+	const img = drawVerified();
+	if (!img) return;
+	const s = VERIFIED_SCALE;
+	map.addImage(
+		VERIFIED_IMAGE_ID,
+		{ width: PILL_W * s, height: PILL_H * s, data: new Uint8Array(img.data) },
+		{
+			pixelRatio: s,
+			content: [PILL_R * s, 0, (PILL_W - PILL_R) * s, PILL_H * s],
+			stretchX: [[PILL_R * s, (PILL_W - PILL_R) * s]]
+		}
+	);
+};
+
+// Step expression picking the pill icon for a windKts property value.
+const pillByStops = (speedExpr: unknown): unknown[] => {
+	const expr: unknown[] = ['step', speedExpr, `${PILL_IMAGE_PREFIX}0`];
+	for (let i = 1; i < COLOR_ANCHORS.length; i++) {
+		expr.push(COLOR_ANCHORS[i][0], `${PILL_IMAGE_PREFIX}${i}`);
+	}
+	return expr;
+};
+
+// Yellow/orange pills (20–30 kt) have light backgrounds where white fails
+// contrast — same test drives text color and arrow variant.
+const isLightPillExpr = ['all', ['>=', ['get', 'windKts'], 20], ['<', ['get', 'windKts'], 30]];
+
+// ── layers ─────────────────────────────────────────────────────────────────
+
+const ensureLayers = (map: maplibregl.Map): void => {
+	ensureArrowImage(map);
+	ensurePillImages(map);
+	ensureSelectionPillImage(map);
+	ensureVerifiedImage(map);
+
+	// Base source: the live-cluster file's contents (nodes + every station).
+	// No MapLibre clustering — nodes are pre-baked server-side.
+	if (!map.getSource(SOURCE_BASE)) {
+		map.addSource(SOURCE_BASE, {
+			type: 'geojson',
+			data: emptyFc,
+			cluster: false,
+			promoteId: 'id'
 		});
-		const marker = new Marker({ element: el, anchor: 'center' })
-			.setLngLat([s.lon, s.lat])
-			.addTo(map);
-		activeMarkers.push(marker);
+	}
+	// Live source: only stations with a current reading — feeds the pill/
+	// arrow/badge symbol layers at z8+. Rebuilt on each readings refresh.
+	if (!map.getSource(SOURCE_LIVE)) {
+		map.addSource(SOURCE_LIVE, {
+			type: 'geojson',
+			data: emptyFc,
+			cluster: false,
+			promoteId: 'id'
+		});
+	}
+
+	// Cluster nodes — spots-style count bubbles (SRF-2660): radius grows with
+	// the station count, a count label sits inside, color = live max wind via
+	// feature-state (paint-only repaint on refresh, no re-layout). One
+	// circle + count-label layer pair per pre-baked tier. A tier missing from
+	// the file matches nothing via its grid filter; loadBase extends the next
+	// finer tier's zoom range downward to cover the gap. Singles show no
+	// number (counts are static file properties — only LIVE values are
+	// constrained to feature-state).
+	const countLabelLayout = {
+		'text-field': ['to-string', ['get', 'count']] as never,
+		'text-font': ['Noto Sans Regular'],
+		'text-allow-overlap': true,
+		'text-ignore-placement': true
+	};
+	const countLabelPaint = {
+		'text-color': '#ffffff',
+		'text-halo-color': 'rgba(20,26,38,0.55)',
+		'text-halo-width': 1.1
+	};
+	for (const tier of NODE_TIERS) {
+		const gridMatch = tier.acceptsLegacy
+			? // Legacy files carry ungridded nodes — fold them into this tier.
+				['any', ['!', ['has', 'grid']], ['==', ['get', 'grid'], tier.grid]]
+			: ['==', ['get', 'grid'], tier.grid];
+		const radiusExpr = [
+			'min',
+			tier.radius.cap,
+			['+', tier.radius.base, ['*', tier.radius.k, ['sqrt', ['get', 'count']]]]
+		];
+		if (!map.getLayer(nodeLayerId(tier.grid))) {
+			map.addLayer({
+				id: nodeLayerId(tier.grid),
+				type: 'circle',
+				source: SOURCE_BASE,
+				minzoom: tier.minZoom,
+				maxzoom: tier.maxZoom,
+				filter: ['all', ['==', ['get', 'node'], true], gridMatch] as never,
+				paint: {
+					'circle-color': liveKtsColorExpr as never,
+					'circle-radius': radiusExpr as never,
+					'circle-stroke-width': 1.5,
+					'circle-stroke-color': 'rgba(255,255,255,0.7)',
+					'circle-opacity': 0.92
+				}
+			});
+		}
+		if (!map.getLayer(nodeCountLayerId(tier.grid))) {
+			map.addLayer({
+				id: nodeCountLayerId(tier.grid),
+				type: 'symbol',
+				source: SOURCE_BASE,
+				minzoom: tier.minZoom,
+				maxzoom: tier.maxZoom,
+				filter: [
+					'all',
+					['==', ['get', 'node'], true],
+					gridMatch,
+					['>', ['get', 'count'], 1]
+				] as never,
+				layout: { ...countLabelLayout, 'text-size': tier.textSize },
+				paint: countLabelPaint
+			});
+		}
+	}
+
+	// Station dots — z8+, every station from the base file. Colored when a
+	// live reading exists (feature-state), dimmed otherwise. Hidden (opacity
+	// 0) when the station has a pill, so silent stations are exactly the
+	// visible dots.
+	if (!map.getLayer(LAYER_ID_DOTS)) {
+		map.addLayer({
+			id: LAYER_ID_DOTS,
+			type: 'circle',
+			source: SOURCE_BASE,
+			minzoom: SWITCH_ZOOM,
+			filter: ['!=', ['get', 'node'], true],
+			paint: {
+				'circle-color': liveKtsColorExpr as never,
+				'circle-radius': 4,
+				'circle-stroke-width': 1,
+				'circle-stroke-color': 'rgba(255,255,255,0.4)',
+				'circle-opacity': ['case', ['boolean', ['feature-state', 'live'], false], 0, 0.55] as never
+			}
+		});
+	}
+
+	// Selection halo — solid cyan capsule rendered behind the main pill;
+	// +2px icon-text-fit padding per side = a constant 2px halo at any width.
+	if (!map.getLayer(LAYER_ID_SELECTION_PILL)) {
+		map.addLayer({
+			id: LAYER_ID_SELECTION_PILL,
+			type: 'symbol',
+			source: SOURCE_LIVE,
+			minzoom: SWITCH_ZOOM,
+			layout: {
+				'icon-image': SELECTION_PILL_IMAGE_ID,
+				'icon-text-fit': 'both',
+				'icon-text-fit-padding': [5, 10, 5, 24],
+				'icon-allow-overlap': true,
+				'icon-ignore-placement': true,
+				'text-field': ['to-string', ['get', 'windKtsRounded']] as never,
+				'text-font': ['Noto Sans Regular'],
+				'text-size': 13,
+				'text-anchor': 'left',
+				'text-offset': [0.5, 0.05],
+				'text-allow-overlap': true,
+				'text-ignore-placement': true
+			},
+			paint: {
+				'icon-opacity': ['case', ['boolean', ['feature-state', 'selected'], false], 1, 0],
+				'text-opacity': 0
+			}
+		});
+	}
+
+	// Capsule pill with the wind speed — individuals only (nodes are
+	// color-only circles; feature-state can't drive layout, and per the
+	// architecture decision clusters show no numbers/arrows).
+	if (!map.getLayer(LAYER_ID_PILL)) {
+		map.addLayer({
+			id: LAYER_ID_PILL,
+			type: 'symbol',
+			source: SOURCE_LIVE,
+			minzoom: SWITCH_ZOOM,
+			layout: {
+				'icon-image': pillByStops(['get', 'windKts']) as never,
+				'icon-text-fit': 'both',
+				// Extra left pad reserves space for the rotated arrow.
+				'icon-text-fit-padding': [3, 8, 3, 22],
+				'icon-allow-overlap': true,
+				'icon-ignore-placement': true,
+				'text-field': ['to-string', ['get', 'windKtsRounded']] as never,
+				'text-font': ['Noto Sans Regular'],
+				'text-size': 13,
+				'text-anchor': 'left',
+				'text-offset': [0.5, 0.05],
+				'text-allow-overlap': true,
+				'text-ignore-placement': true
+			},
+			paint: {
+				'text-color': ['case', isLightPillExpr, '#1a1a2e', '#ffffff'] as never
+			}
+		});
+	}
+
+	// Verified badge — official networks only (priority 0 in the live-cluster:
+	// metar/ndbc/knmi), not PWS, push or other community stations.
+	if (!map.getLayer(LAYER_ID_VERIFIED)) {
+		map.addLayer({
+			id: LAYER_ID_VERIFIED,
+			type: 'symbol',
+			source: SOURCE_LIVE,
+			minzoom: SWITCH_ZOOM,
+			filter: ['==', ['get', 'priority'], 0],
+			layout: {
+				'icon-image': VERIFIED_IMAGE_ID,
+				'icon-text-fit': 'both',
+				'icon-text-fit-padding': [3, 8, 3, 22],
+				'icon-allow-overlap': true,
+				'icon-ignore-placement': true,
+				'text-field': ['to-string', ['get', 'windKtsRounded']] as never,
+				'text-font': ['Noto Sans Regular'],
+				'text-size': 13,
+				'text-anchor': 'left',
+				'text-offset': [0.5, 0.05],
+				'text-allow-overlap': true,
+				'text-ignore-placement': true
+			},
+			paint: { 'text-opacity': 0 }
+		});
+	}
+
+	// Direction arrow — ONLY when a direction is known. A station reporting
+	// speed without direction must not fabricate a due-north arrow (the old
+	// `?? 0` bug). The windDir key is omitted from feature properties when the
+	// reading has no direction, so `has` is the guard.
+	if (!map.getLayer(LAYER_ID_ARROW)) {
+		map.addLayer({
+			id: LAYER_ID_ARROW,
+			type: 'symbol',
+			source: SOURCE_LIVE,
+			minzoom: SWITCH_ZOOM,
+			filter: ['has', 'windDir'],
+			layout: {
+				'icon-image': ['case', isLightPillExpr, ARROW_IMAGE_ID_DARK, ARROW_IMAGE_ID] as never,
+				'icon-rotate': ['+', ['get', 'windDir'], 180] as never,
+				'icon-rotation-alignment': 'map',
+				'icon-size': 1,
+				'icon-allow-overlap': true,
+				'icon-ignore-placement': true
+			}
+		});
 	}
 };
 
-const fetchAndRender = async (map: maplibregl.Map, config: WindyStationsConfig): Promise<void> => {
-	if (!config.endpoint || !config.visible) return;
-	if (map.getZoom() < MIN_ZOOM) {
-		removeAllMarkers();
-		return;
-	}
-	const bounds = map.getBounds();
-	const url =
-		`${config.endpoint.replace(/\/$/, '')}/windystations/bbox` +
-		`?minlat=${bounds.getSouth()}` +
-		`&maxlat=${bounds.getNorth()}` +
-		`&minlon=${bounds.getWest()}` +
-		`&maxlon=${bounds.getEast()}` +
-		`&limit=${LIMIT}`;
+// ── phase 1: the live-cluster (static base) ────────────────────────────────
 
+type LiveClusterFeature = GeoJSON.Feature<
+	GeoJSON.Point,
+	{
+		id: string;
+		node?: boolean;
+		count?: number;
+		expansionZoom?: number;
+		source?: string;
+		priority?: number;
+		offline?: boolean;
+	}
+>;
+
+// `forReadingsV`: install the file only if it matches these readings. A reload
+// that still returns another version keeps the current, consistent pair on screen.
+const loadBase = async (
+	map: maplibregl.Map,
+	reload = false,
+	forReadingsV?: number
+): Promise<boolean> => {
+	try {
+		// `reload` fires on a version mismatch (nightly rotation, or a
+		// format upgrade like SRF-2660). cache:'reload' busts the browser
+		// cache; the header tells the /stations proxy to bypass its
+		// Cloudflare edge cache too — without it, a stale edge entry (up to
+		// 6h TTL) survives any client-side reload and the mismatch persists.
+		const res = await fetch(`${stationsBaseUrl()}/${LIVE_CLUSTER_FILE}`, {
+			cache: reload ? 'reload' : 'default',
+			headers: reload ? { 'X-Surfr-Force-Refresh': '1' } : undefined
+		});
+		if (!res.ok) return false;
+		const fc = (await res.json()) as GeoJSON.FeatureCollection & { v?: number };
+		if (!fc || fc.type !== 'FeatureCollection' || !Array.isArray(fc.features)) return false;
+		const fileVersion = typeof fc.v === 'number' ? fc.v : null;
+		if (forReadingsV !== undefined && !readingsMatchBase(fileVersion, forReadingsV)) return false;
+
+		baseVersion = fileVersion;
+		baseLoaded = true;
+		baseIndex = new Map();
+		const gridsInFile = new Set<number>();
+		let hasLegacyNodes = false;
+		for (const f of fc.features as LiveClusterFeature[]) {
+			const p = f.properties;
+			if (!p || !f.geometry) continue;
+			if (p.node) {
+				const grid = (p as { grid?: number }).grid;
+				if (typeof grid === 'number') gridsInFile.add(grid);
+				else hasLegacyNodes = true;
+				continue;
+			}
+			baseIndex.set(p.id, {
+				lon: f.geometry.coordinates[0],
+				lat: f.geometry.coordinates[1],
+				source: p.source ?? null,
+				priority: p.priority ?? 1
+			});
+		}
+		getSource(map, SOURCE_BASE)?.setData(fc);
+
+		// Rollout fallback: older files may lack the coarser tiers (or carry
+		// only ungridded legacy nodes, which the legacy-accepting tier
+		// renders). Walk the ladder coarsest→finest and hand each missing
+		// tier's zoom band to the next available finer tier, so no zoom range
+		// ever renders nothing.
+		let carryMin = 0;
+		for (const tier of NODE_TIERS) {
+			const available = gridsInFile.has(tier.grid) || (tier.acceptsLegacy && hasLegacyNodes);
+			if (!available) continue; // its grid filter matches nothing anyway
+			for (const layerId of [nodeLayerId(tier.grid), nodeCountLayerId(tier.grid)]) {
+				if (map.getLayer(layerId)) {
+					map.setLayerZoomRange(layerId, carryMin, tier.maxZoom);
+				}
+			}
+			carryMin = tier.maxZoom;
+		}
+		return true;
+	} catch (e) {
+		console.warn('[windy-stations] live-cluster load failed', e);
+		return false;
+	}
+};
+
+// ── phase 2: readings hydration ────────────────────────────────────────────
+
+type ReadingsFile = {
+	v?: number;
+	ts?: number;
+	stations?: Record<string, Reading>;
+	nodes?: Record<string, number>;
+};
+
+const applyReadings = (map: maplibregl.Map, readings: ReadingsFile): void => {
+	const nowSec = Date.now() / 1000;
+	const stations = readings.stations ?? {};
+	const nodes = readings.nodes ?? {};
+
+	// Node colors — pure feature-state repaint.
+	const nextNodeIds = new Set<string>();
+	for (const [cellId, maxKts] of Object.entries(nodes)) {
+		map.setFeatureState({ source: SOURCE_BASE, id: cellId }, { kts: maxKts });
+		nextNodeIds.add(cellId);
+	}
+	for (const cellId of liveNodeIds) {
+		if (!nextNodeIds.has(cellId)) {
+			map.removeFeatureState({ source: SOURCE_BASE, id: cellId }, 'kts');
+		}
+	}
+	liveNodeIds = nextNodeIds;
+
+	// Station dots + the live (pill) source.
+	const nextLiveIds = new Set<string>();
+	const features: GeoJSON.Feature[] = [];
+	for (const [id, r] of Object.entries(stations)) {
+		const base = baseIndex.get(id);
+		if (!base) continue; // unknown id — station newer than our live-cluster
+		const [kts, dir, gust, obsTsSec] = r;
+		if (kts == null || nowSec - obsTsSec > STALE_MS / 1000) continue;
+
+		map.setFeatureState({ source: SOURCE_BASE, id }, { kts, live: true });
+		nextLiveIds.add(id);
+
+		// Null-valued keys are OMITTED (not set to null): the arrow layer's
+		// `has windDir` filter relies on absence, and MapLibre expressions
+		// can't test against null literals.
+		const props: Record<string, unknown> = {
+			id,
+			windKts: kts,
+			windKtsRounded: Math.round(kts),
+			updatedAt: obsTsSec * 1000
+		};
+		if (dir != null) props.windDir = dir;
+		if (gust != null) props.gustKts = gust;
+		if (base.source != null) props.source = base.source;
+		props.priority = base.priority;
+		features.push({
+			type: 'Feature',
+			geometry: { type: 'Point', coordinates: [base.lon, base.lat] },
+			properties: props as GeoJSON.GeoJsonProperties
+		});
+	}
+	for (const id of liveIds) {
+		if (!nextLiveIds.has(id)) {
+			map.removeFeatureState({ source: SOURCE_BASE, id });
+		}
+	}
+	liveIds = nextLiveIds;
+
+	getSource(map, SOURCE_LIVE)?.setData({ type: 'FeatureCollection', features });
+};
+
+const refreshReadings = async (map: maplibregl.Map): Promise<void> => {
 	pendingAbort?.abort();
 	pendingAbort = new AbortController();
 	try {
-		const res = await fetch(url, { signal: pendingAbort.signal });
+		// No positions yet (the first load failed): load them first, or readings
+		// have nothing to attach to. Every refresh retries until it succeeds.
+		if (!baseLoaded && !(await loadBase(map))) return;
+
+		const res = await fetch(`${stationsBaseUrl()}/${READINGS_FILE}`, {
+			signal: pendingAbort.signal
+		});
 		if (!res.ok) return;
-		const stations = (await res.json()) as WindyStation[];
-		if (!Array.isArray(stations)) return;
-		renderMarkers(map, stations);
+		const readings = (await res.json()) as ReadingsFile;
+
+		// Version guard: the station set changed while we hold an older
+		// live-cluster — refetch it, and install it plus the readings only if the
+		// two agree. A failed reload, or the proxy serving another version (its
+		// refresh cooldown), skips this round and leaves the current positions and
+		// values on screen together; the next refresh retries.
+		if (
+			typeof readings.v === 'number' &&
+			needsBaseReload(baseVersion, readings.v) &&
+			!(await loadBase(map, true, readings.v))
+		) {
+			return;
+		}
+		applyReadings(map, readings);
 	} catch (e) {
 		if ((e as Error).name === 'AbortError') return;
-		console.warn('[windy-stations] fetch failed', e);
+		console.warn('[windy-stations] readings refresh failed', e);
 	}
 };
 
-const debounced = (map: maplibregl.Map) => {
-	if (debounceTimer) clearTimeout(debounceTimer);
-	debounceTimer = setTimeout(() => fetchAndRender(map, currentConfig), DEBOUNCE_MS);
+// ── refresh loop (paused when hidden or layer off) ─────────────────────────
+
+const stopTimer = (): void => {
+	if (refreshTimer) {
+		clearInterval(refreshTimer);
+		refreshTimer = undefined;
+	}
 };
 
-const onMoveEnd = (): void => {
-	if (currentMap && currentConfig.visible) debounced(currentMap);
+const startTimer = (map: maplibregl.Map): void => {
+	stopTimer();
+	refreshTimer = setInterval(() => {
+		if (document.visibilityState === 'visible' && currentConfig.visible) {
+			void refreshReadings(map);
+		}
+	}, REFRESH_MS);
+};
+
+const onVisibilityChange = (): void => {
+	if (!currentMap) return;
+	if (document.visibilityState === 'visible' && currentConfig.visible) {
+		// Catch up immediately after returning to the foreground.
+		void refreshReadings(currentMap);
+		startTimer(currentMap);
+	} else {
+		stopTimer();
+	}
+};
+
+// ── interactions ───────────────────────────────────────────────────────────
+
+const handleStationClick = (
+	e: maplibregl.MapMouseEvent & { features?: maplibregl.MapGeoJSONFeature[] }
+): void => {
+	if (!currentMap) return;
+	const f = e.features?.[0];
+	if (!f) return;
+	const id = (f.properties?.id ?? f.id) as string | undefined;
+	if (id == null) return;
+
+	if (selectedStationId != null && selectedStationId !== id) {
+		try {
+			currentMap.removeFeatureState({ source: SOURCE_LIVE, id: selectedStationId }, 'selected');
+		} catch {
+			/* state may not exist after data refresh — ignore */
+		}
+	}
+	currentMap.setFeatureState({ source: SOURCE_LIVE, id }, { selected: true });
+	selectedStationId = id;
+
+	const base = baseIndex.get(id);
+	const props = f.properties ?? {};
+	const station: WindyStation = {
+		id,
+		name: '', // live-cluster carries no names — fetched below
+		lat: base?.lat ?? Number(props.lat) ?? 0,
+		lon: base?.lon ?? Number(props.lon) ?? 0,
+		windKts: (props.windKts as number | null) ?? null,
+		windDir: (props.windDir as number | null) ?? null,
+		gustKts: (props.gustKts as number | null) ?? null,
+		updatedAt: (props.updatedAt as number | null) ?? null,
+		fetchedAt: null,
+		source: base?.source ?? (props.source as string | null) ?? null,
+		stale: false
+	};
+
+	// The live-cluster carries no names. The app's station sheet fetches the
+	// station (name, attribution, history) from the live-wind service by id, so
+	// the map makes no extra request per tap.
+	currentConfig.onStationTap?.(station);
+};
+
+// Node drill-down — the expansion zoom is baked server-side; no async
+// getClusterExpansionZoom round-trip.
+const handleNodeClick = (
+	e: maplibregl.MapMouseEvent & { features?: maplibregl.MapGeoJSONFeature[] }
+): void => {
+	if (!currentMap) return;
+	const f = e.features?.[0];
+	if (!f || f.geometry.type !== 'Point') return;
+	const zoom = Number(f.properties?.expansionZoom ?? SWITCH_ZOOM);
+	currentMap.easeTo({
+		center: f.geometry.coordinates as [number, number],
+		zoom,
+		duration: 500
+	});
+};
+
+const setCursorPointer = (): void => {
+	if (currentMap) currentMap.getCanvas().style.cursor = 'pointer';
+};
+const setCursorDefault = (): void => {
+	if (currentMap) currentMap.getCanvas().style.cursor = '';
+};
+
+const INTERACTIVE_STATION_LAYERS = [LAYER_ID_PILL, LAYER_ID_ARROW, LAYER_ID_DOTS];
+
+const attachInteractionHandlers = (map: maplibregl.Map): void => {
+	for (const layerId of INTERACTIVE_STATION_LAYERS) {
+		map.on('click', layerId, handleStationClick);
+		map.on('mouseenter', layerId, setCursorPointer);
+		map.on('mouseleave', layerId, setCursorDefault);
+	}
+	for (const layerId of NODE_LAYER_IDS) {
+		map.on('click', layerId, handleNodeClick);
+		map.on('mouseenter', layerId, setCursorPointer);
+		map.on('mouseleave', layerId, setCursorDefault);
+	}
+};
+
+const detachInteractionHandlers = (map: maplibregl.Map): void => {
+	for (const layerId of INTERACTIVE_STATION_LAYERS) {
+		map.off('click', layerId, handleStationClick);
+		map.off('mouseenter', layerId, setCursorPointer);
+		map.off('mouseleave', layerId, setCursorDefault);
+	}
+	for (const layerId of NODE_LAYER_IDS) {
+		map.off('click', layerId, handleNodeClick);
+		map.off('mouseenter', layerId, setCursorPointer);
+		map.off('mouseleave', layerId, setCursorDefault);
+	}
+};
+
+// ── public API (unchanged surface) ─────────────────────────────────────────
+
+const ALL_LAYERS = [
+	...NODE_LAYER_IDS,
+	...NODE_COUNT_LAYER_IDS,
+	LAYER_ID_DOTS,
+	LAYER_ID_SELECTION_PILL,
+	LAYER_ID_PILL,
+	LAYER_ID_VERIFIED,
+	LAYER_ID_ARROW
+];
+
+const bootstrap = async (map: maplibregl.Map): Promise<void> => {
+	const ok = await loadBase(map);
+	if (ok) await refreshReadings(map);
 };
 
 export const initWindyStations = (map: maplibregl.Map): void => {
-	currentMap = map;
-	map.on('moveend', onMoveEnd);
+	// Boundary guard: a stations-layer failure must never break the caller's
+	// map-load flow (the RN bridge installs after us) — degrade to "no station
+	// layer" and shout in the console instead.
+	try {
+		currentMap = map;
+		ensureLayers(map);
+		attachInteractionHandlers(map);
+		visibilityListener = onVisibilityChange;
+		document.addEventListener('visibilitychange', visibilityListener);
+	} catch (e) {
+		console.error('[windy-stations] init failed — station layer disabled', e);
+	}
 };
 
 export const setWindyStationsConfig = (config: WindyStationsConfig): void => {
 	currentConfig = { ...currentConfig, ...config };
-	if (currentMap && currentConfig.visible) fetchAndRender(currentMap, currentConfig);
+	if (currentMap && currentConfig.visible) {
+		void bootstrap(currentMap);
+		startTimer(currentMap);
+	}
 };
 
 export const setWindyStationsVisible = (map: maplibregl.Map, visible: boolean): void => {
 	currentConfig.visible = visible;
+	const vis = visible ? 'visible' : 'none';
+	for (const layerId of ALL_LAYERS) {
+		if (map.getLayer(layerId)) {
+			map.setLayoutProperty(layerId, 'visibility', vis);
+		}
+	}
 	if (visible && currentMap) {
-		fetchAndRender(currentMap, currentConfig);
+		if (!baseLoaded) {
+			// First show (RN configures endpoint and visibility in separate
+			// messages, so the config path may never have bootstrapped): load
+			// the live-cluster before hydrating, or readings have nothing to
+			// attach to.
+			void bootstrap(currentMap);
+		} else {
+			// Re-show: cached data is still on the sources; just catch up.
+			void refreshReadings(currentMap);
+		}
+		startTimer(currentMap);
 	} else {
-		removeAllMarkers();
+		stopTimer();
 	}
 };
 
 export const teardownWindyStations = (map: maplibregl.Map): void => {
-	map.off('moveend', onMoveEnd);
+	detachInteractionHandlers(map);
+	stopTimer();
+	if (visibilityListener) {
+		document.removeEventListener('visibilitychange', visibilityListener);
+		visibilityListener = undefined;
+	}
 	pendingAbort?.abort();
 	pendingAbort = undefined;
-	if (debounceTimer) {
-		clearTimeout(debounceTimer);
-		debounceTimer = undefined;
-	}
-	removeAllMarkers();
+	getSource(map, SOURCE_BASE)?.setData(emptyFc);
+	getSource(map, SOURCE_LIVE)?.setData(emptyFc);
+	selectedStationId = null;
+	baseIndex.clear();
+	liveIds.clear();
+	liveNodeIds.clear();
+	baseVersion = null;
+	baseLoaded = false;
 	currentMap = null;
 };

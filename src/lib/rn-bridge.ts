@@ -3,10 +3,13 @@
 // host and listen for commands coming down. Outside of embed mode, this module is inert.
 import { get } from 'svelte/store';
 
+import { Marker } from 'maplibre-gl';
+
 import { displayTimezone, displayTzOffsetSeconds } from '$lib/stores/preferences';
 import { metaJson, time } from '$lib/stores/time';
 import { domain, variable } from '$lib/stores/variables';
 
+import { isLiveStationsEnabled } from '$lib/feature-flags';
 import { changeOMfileURL } from '$lib/layers';
 import { setGlobeProjection } from '$lib/map-controls';
 import {
@@ -15,7 +18,12 @@ import {
 	setSelectedSpotHighlight,
 	setSurfrSpotsConfig
 } from '$lib/surfr-spots';
-import { setWindyStationsConfig, setWindyStationsVisible } from '$lib/windy-stations';
+import {
+	LAYER_ID_ARROW as WINDY_STATIONS_ARROW_LAYER,
+	LAYER_ID_PILL as WINDY_STATIONS_PILL_LAYER,
+	setWindyStationsConfig,
+	setWindyStationsVisible
+} from '$lib/windy-stations';
 
 import {
 	formatISOWithoutTimezone,
@@ -124,7 +132,13 @@ type InMsg =
 	// domain causing repeated metadata fetch failures) and no in-WebView
 	// interaction un-sticks it.
 	| { type: 'clearState' }
-	| { type: 'setWindyStationsConfig'; endpoint?: string; visible?: boolean };
+	| {
+			type: 'setWindyStationsConfig';
+			endpoint?: string;
+			visible?: boolean;
+			/** Optional override for the station-file base URL (default: same-origin /stations). */
+			stationsBaseUrl?: string;
+	  };
 
 declare global {
 	interface Window {
@@ -227,15 +241,27 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 	}, 150);
 	map.on('moveend', onMoveEnd);
 
+	const liveStations = isLiveStationsEnabled();
+
 	// A tap anywhere on the map sets a forecast location — RN listens and refreshes
-	// its model picker + ForecastTable for that point. Mirrors Windy's
-	// "click to place forecast marker" UX.
+	// its model picker + ForecastTable for that point. What the map draws depends
+	// on the `stations` flag:
 	//
-	// If the tap lands on (or near) a Surfr spot dot, treat it AS a forecast-location
-	// tap snapped to the spot's exact coordinates — drop the red pin, notify RN for
-	// the forecast table — and additionally emit `spotSelected` so RN can show a
-	// "View details" pill, and light up a pulsing ring around the spot as visual
-	// feedback. Tapping empty map clears the ring.
+	// Classic (flag off — every app version that doesn't send `stations=1`):
+	//   - On a Surfr spot dot: snap to the spot's coords, emit spotSelected, light
+	//     up the blue pulsing ring and hide the red pin (one coherent selection).
+	//   - On empty map: drop the red pin at the tap point, clear the spot ring.
+	//
+	// Live stations (flag on) — Path B, Windy-style: every tap means "tell me
+	// about this point," no pin is drawn on tap:
+	//   - On a station pill: windy-stations layer handler opens the station
+	//     sheet and emits forecastLocationSet with the station's exact coords.
+	//     The early-return below skips the global-click default for that case.
+	//   - On a Surfr spot dot: same as classic, minus touching the pin.
+	//   - On empty map: just emit forecastLocationSet for the tap point and
+	//     clear any lingering spot highlight. The RN bottom sheet is the only
+	//     visual representation of "where you're forecasting." Long-press drops
+	//     the (draggable) pin instead — see onContextMenu.
 	//
 	// Hit-target padding: the visible dot is only `circle-radius: 4` (~8px wide),
 	// way under Apple's 44pt / Material 48dp tap-target guidelines. Rather than
@@ -249,17 +275,31 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 			[x - SPOT_HIT_PADDING_PX, y - SPOT_HIT_PADDING_PX],
 			[x + SPOT_HIT_PADDING_PX, y + SPOT_HIT_PADDING_PX]
 		];
+		// Wind-station tap: the windy-stations module owns its own layer
+		// click handler which fires onStationTap (in setWindyStationsConfig).
+		// That handler emits both stationTapped (opens the detail sheet) and
+		// forecastLocationSet (with the station's exact coords). Returning
+		// early here prevents this global handler from also emitting
+		// forecastLocationSet with the offset tap point — the station's exact
+		// coordinates should win for the forecast.
+		const stationLayers: string[] = [];
+		if (map.getLayer(WINDY_STATIONS_PILL_LAYER)) stationLayers.push(WINDY_STATIONS_PILL_LAYER);
+		if (map.getLayer(WINDY_STATIONS_ARROW_LAYER)) stationLayers.push(WINDY_STATIONS_ARROW_LAYER);
+		if (stationLayers.length > 0) {
+			const stationHit = map.queryRenderedFeatures(bbox, { layers: stationLayers });
+			if (stationHit.length > 0) return;
+		}
 		const spotHit = map
 			.queryRenderedFeatures(bbox, { layers: [SURFR_SPOTS_LAYER] })
 			.find((f) => f.properties?.id != null);
 		if (spotHit) {
-			// Snap to the spot's exact coordinates — the user tapped "this spot",
-			// not the tap-point near it. The blue spot dot + blue pulsing ring
-			// serve as the "forecast is here" visual — we hide the red pin so
-			// the selection reads as one coherent blue highlight instead of
-			// competing red + blue markers stacked on top of each other.
+			// Snap to the spot's exact coordinates — the user tapped "this
+			// spot", not the tap-point near it. The blue spot dot + blue
+			// pulsing ring are the only visual indicator, so the selection
+			// reads as one coherent highlight (classic hides the red pin;
+			// Path B never drew one on tap).
 			const [spotLng, spotLat] = (spotHit.geometry as GeoJSON.Point).coordinates;
-			hideForecastMarker(map);
+			if (!liveStations) hideForecastMarker(map);
 			postToRN({ type: 'forecastLocationSet', lat: spotLat, lng: spotLng });
 			postToRN({
 				type: 'spotSelected',
@@ -271,13 +311,28 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 			setSelectedSpotHighlight(map, spotLat, spotLng);
 			return;
 		}
-		// Empty-map tap: current behavior + drop any lingering spot highlight.
+		// Empty-map tap: emit forecast location for RN to refresh its bottom
+		// sheet, and drop any lingering spot highlight. Classic drops the red
+		// pin here; in Path B the bottom sheet IS the forecast surface.
 		clearSelectedSpotHighlight();
 		const { lat, lng } = ev.lngLat;
 		postToRN({ type: 'forecastLocationSet', lat, lng });
-		placeForecastMarker(map, lat, lng);
+		if (!liveStations) placeForecastMarker(map, lat, lng);
 	};
 	map.on('click', onClick);
+
+	// Path B only: long-press (touch) / right-click (desktop) drops the forecast
+	// pin at the press location. MapLibre fires `contextmenu` for both. This
+	// matches the Apple/Google Maps convention: tap = select existing object,
+	// long-press = drop a new pin. Once placed, the pin is independently
+	// draggable (handled by the Marker's draggable=true config).
+	const onContextMenu = (ev: maplibregl.MapMouseEvent) => {
+		const { lat, lng } = ev.lngLat;
+		clearSelectedSpotHighlight();
+		placeForecastMarker(map, lat, lng);
+		postToRN({ type: 'forecastLocationSet', lat, lng });
+	};
+	if (liveStations) map.on('contextmenu', onContextMenu);
 
 	// Desktop affordance: pointer cursor when hovering a spot dot. Harmless on
 	// touch (no hover) but makes the embed feel right when used in a browser.
@@ -506,9 +561,14 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 				break;
 			}
 			case 'setForecastLocation': {
-				// Drop the red marker without moving the camera — used when the
-				// RN host picks a search result / spot.
-				placeForecastMarker(map, msg.lat, msg.lng);
+				// RN-driven pin placement — used when the user picks a search
+				// result or a deeplink lands on a non-spot location. Drops the
+				// pin (or moves it if already placed) without changing the
+				// camera. In Path B tap is ephemeral on the map side, so this is
+				// the only way to plant the pin besides long-press.
+				if (Number.isFinite(msg.lat) && Number.isFinite(msg.lng)) {
+					placeForecastMarker(map, msg.lat, msg.lng);
+				}
 				break;
 			}
 			case 'setTzOffsetSeconds': {
@@ -534,7 +594,9 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 			}
 			case 'setSpotHighlight': {
 				if (Number.isFinite(msg.lat) && Number.isFinite(msg.lng)) {
-					hideForecastMarker(map);
+					// Classic: the blue ring replaces the red pin. Path B keeps the
+					// pin, which is a long-press bookmark independent of selection.
+					if (!liveStations) hideForecastMarker(map);
 					setSelectedSpotHighlight(map, msg.lat, msg.lng);
 				}
 				break;
@@ -576,6 +638,9 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 				break;
 			}
 			case 'setWindyStationsConfig': {
+				// Without the flag the station layer doesn't exist: ignore the
+				// message so a host that sends it can't change the classic map.
+				if (!liveStations) break;
 				const onStationTap = (s: {
 					id: string;
 					name: string;
@@ -599,9 +664,20 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 						updatedAt: s.updatedAt ?? 0,
 						source: s.source ?? null
 					});
+					// Emit forecastLocationSet with the station's exact coords so
+					// RN's bottom sheet shows the model forecast for the station's
+					// position when the user dismisses the station detail sheet —
+					// solves the "model vs reading" comparison without needing a
+					// separate map indicator.
+					postToRN({ type: 'forecastLocationSet', lat: s.lat, lng: s.lon });
 				};
 				if (msg.endpoint) {
-					setWindyStationsConfig({ endpoint: msg.endpoint, visible: msg.visible, onStationTap });
+					setWindyStationsConfig({
+						endpoint: msg.endpoint,
+						stationsBaseUrl: msg.stationsBaseUrl,
+						visible: msg.visible,
+						onStationTap
+					});
 				}
 				if (msg.visible !== undefined) {
 					setWindyStationsVisible(map, msg.visible);
@@ -653,6 +729,7 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 	return () => {
 		map.off('moveend', onMoveEnd);
 		map.off('click', onClick);
+		map.off('contextmenu', onContextMenu);
 		map.off('mouseenter', SURFR_SPOTS_LAYER, onSpotEnter);
 		map.off('mouseleave', SURFR_SPOTS_LAYER, onSpotLeave);
 		unsubMeta();
@@ -661,15 +738,24 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 		window.removeEventListener('message', onWindowMessage);
 		document.removeEventListener('message', onWindowMessage as EventListener);
 		clearSelectedSpotHighlight();
+		if (forecastMarker) {
+			forecastMarker.remove();
+			forecastMarker = null;
+		}
 	};
 };
 
-// Persistent forecast marker — one red target icon, moved on each tap.
+const placeForecastMarker = (map: maplibregl.Map, lat: number, lng: number): void => {
+	if (isLiveStationsEnabled()) placeDraggablePin(map, lat, lng);
+	else placeClassicMarker(map, lat, lng);
+};
+
+// Classic forecast marker (flag off) — one red target icon, moved on each tap.
 const MARKER_SOURCE_ID = 'rn-forecast-marker';
 const MARKER_LAYER_ID = 'rn-forecast-marker-layer';
 const EMPTY_FC: GeoJSON.FeatureCollection = { type: 'FeatureCollection', features: [] };
 
-const placeForecastMarker = (map: maplibregl.Map, lat: number, lng: number): void => {
+const placeClassicMarker = (map: maplibregl.Map, lat: number, lng: number): void => {
 	const data = {
 		type: 'FeatureCollection' as const,
 		features: [
@@ -699,11 +785,60 @@ const placeForecastMarker = (map: maplibregl.Map, lat: number, lng: number): voi
 	});
 };
 
-// Clear the red forecast marker without touching the spot-selection highlight.
+// Clear the classic red marker without touching the spot-selection highlight.
 // Used when the tap lands on a spot — the blue pulsing ring + blue spot dot
 // already communicate the selected forecast location, and the red pin would
 // clash with the blue highlight (looks like "two selections").
 const hideForecastMarker = (map: maplibregl.Map): void => {
 	const src = map.getSource(MARKER_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
 	if (src) src.setData(EMPTY_FC);
+};
+
+// Path B forecast pin (flag on) — Apple/Google Maps convention. NOT placed by
+// tap (tap is ephemeral, Windy-style). Placed by long-press (or right-click on
+// desktop) via the map's `contextmenu` event, and by `setForecastLocation`
+// messages from RN (search results, deeplinks). Once placed, the pin is
+// draggable for pixel-precise refinement.
+//
+// Conceptually the pin is a BOOKMARK — independent of "what the user just
+// tapped." Tap still refreshes the bottom sheet for the tap point; the pin
+// stays put as a reference point until the user long-presses elsewhere,
+// drags it, or RN moves it.
+let forecastMarker: Marker | null = null;
+
+const buildForecastPinElement = (): HTMLDivElement => {
+	const el = document.createElement('div');
+	el.className = 'forecast-pin';
+	el.style.cssText =
+		'width:18px;height:18px;border-radius:50%;' +
+		'background:#ef4444;border:2px solid #ffffff;' +
+		'box-shadow:0 1px 4px rgba(0,0,0,0.55);' +
+		'cursor:grab;pointer-events:auto;' +
+		'box-sizing:border-box;';
+	return el;
+};
+
+const placeDraggablePin = (map: maplibregl.Map, lat: number, lng: number): void => {
+	if (forecastMarker) {
+		const el = forecastMarker.getElement();
+		forecastMarker.setLngLat([lng, lat]);
+		if (!el.isConnected) forecastMarker.addTo(map);
+		return;
+	}
+	const el = buildForecastPinElement();
+	forecastMarker = new Marker({ element: el, draggable: true, anchor: 'center' })
+		.setLngLat([lng, lat])
+		.addTo(map);
+	forecastMarker.on('dragstart', () => {
+		el.style.cursor = 'grabbing';
+	});
+	forecastMarker.on('dragend', () => {
+		el.style.cursor = 'grab';
+		if (!forecastMarker) return;
+		const pos = forecastMarker.getLngLat();
+		// Drag invalidates any active spot selection — the user is now
+		// pointing at a generic location, not a Surfr spot.
+		clearSelectedSpotHighlight();
+		postToRN({ type: 'forecastLocationSet', lat: pos.lat, lng: pos.lng });
+	});
 };

@@ -44,6 +44,7 @@
 
 	import { checkHighDefinition } from '$lib/helpers';
 	import { initSurfrSpots, setSurfrSpotsConfig } from '$lib/surfr-spots';
+	import { isLiveStationsEnabled } from '$lib/feature-flags';
 	import { initWindyStations } from '$lib/windy-stations';
 	import { getIanaOffsetSeconds, ianaFromOffsetSeconds } from '$lib/time-format';
 	import { addOmFileLayers, changeOMfileURL } from '$lib/layers';
@@ -224,7 +225,9 @@
 			// buttons + clipping panel) was removed when we simplified the
 			// standalone UI to just OverlayPills + TimeSelector. Keep the load
 			// flow itself.
+			console.debug('[map-load] fired; awaiting initial metadata…');
 			if (getInitialMetaDataPromise) await getInitialMetaDataPromise;
+			console.debug('[map-load] metadata ready; installing layers + bridge');
 
 			addTerrainSource($map);
 			addTerrainSource($map, 'terrainSource2');
@@ -235,9 +238,10 @@
 			changeOMfileURL();
 
 			initSurfrSpots($map);
-			initWindyStations($map);
+			if (isLiveStationsEnabled()) initWindyStations($map);
 
 			rnBridgeCleanup = installRnBridge($map);
+			console.debug('[map-load] complete — rn-bridge installed');
 		});
 	});
 
