@@ -27,6 +27,8 @@
 // API surface preserved: initWindyStations, setWindyStationsConfig,
 // setWindyStationsVisible, teardownWindyStations + the LAYER_ID_* exports
 // rn-bridge consumes.
+import { needsBaseReload, readingsMatchBase } from './stations-version';
+
 import type * as maplibregl from 'maplibre-gl';
 
 const SOURCE_BASE = 'windy-stations-base'; // live-cluster: nodes + all stations
@@ -163,6 +165,8 @@ type Reading = [number, number | null, number | null, number]; // kts, dir, gust
 let currentMap: maplibregl.Map | null = null;
 let currentConfig: WindyStationsConfig = {};
 let baseVersion: number | null = null;
+// The positions file loaded at least once (baseVersion alone can't tell: legacy files have no v).
+let baseLoaded = false;
 let baseIndex = new Map<string, BaseStation>();
 let liveIds = new Set<string>(); // ids with feature-state applied (for cleanup)
 let liveNodeIds = new Set<string>();
@@ -584,6 +588,7 @@ const loadBase = async (map: maplibregl.Map, reload = false): Promise<boolean> =
 		if (!fc || fc.type !== 'FeatureCollection' || !Array.isArray(fc.features)) return false;
 
 		baseVersion = typeof fc.v === 'number' ? fc.v : null;
+		baseLoaded = true;
 		baseIndex = new Map();
 		const gridsInFile = new Set<number>();
 		let hasLegacyNodes = false;
@@ -700,17 +705,24 @@ const refreshReadings = async (map: maplibregl.Map): Promise<void> => {
 	pendingAbort?.abort();
 	pendingAbort = new AbortController();
 	try {
+		// No positions yet (the first load failed): load them first, or readings
+		// have nothing to attach to. Every refresh retries until it succeeds.
+		if (!baseLoaded && !(await loadBase(map))) return;
+
 		const res = await fetch(`${stationsBaseUrl()}/${READINGS_FILE}`, {
 			signal: pendingAbort.signal
 		});
 		if (!res.ok) return;
 		const readings = (await res.json()) as ReadingsFile;
 
-		// Version guard: the nightly rotation changed the live-cluster while we
-		// hold a cached copy — refetch it (usually a cheap 304/cache-hit), then
-		// apply the readings against the fresh base.
-		if (typeof readings.v === 'number' && baseVersion !== null && readings.v !== baseVersion) {
-			await loadBase(map, true);
+		// Version guard: the station set changed while we hold an older
+		// live-cluster — refetch it, then apply the readings only if the two now
+		// agree. A failed reload, or the proxy still serving the old file during
+		// its refresh cooldown, skips this round instead of painting values on the
+		// wrong positions; the next refresh retries.
+		if (needsBaseReload(baseVersion, readings.v)) {
+			const reloaded = await loadBase(map, true);
+			if (!reloaded || !readingsMatchBase(baseVersion, readings.v)) return;
 		}
 		applyReadings(map, readings);
 	} catch (e) {
@@ -891,7 +903,7 @@ export const setWindyStationsVisible = (map: maplibregl.Map, visible: boolean): 
 		}
 	}
 	if (visible && currentMap) {
-		if (baseVersion === null) {
+		if (!baseLoaded) {
 			// First show (RN configures endpoint and visibility in separate
 			// messages, so the config path may never have bootstrapped): load
 			// the live-cluster before hydrating, or readings have nothing to
@@ -923,5 +935,6 @@ export const teardownWindyStations = (map: maplibregl.Map): void => {
 	liveIds.clear();
 	liveNodeIds.clear();
 	baseVersion = null;
+	baseLoaded = false;
 	currentMap = null;
 };
