@@ -74,6 +74,39 @@ const NODE_TIERS: NodeTier[] = [
 ];
 const nodeLayerId = (grid: number): string => `windy-stations-nodes-z${grid}`;
 const NODE_LAYER_IDS = NODE_TIERS.map((t) => nodeLayerId(t.grid));
+
+// Which marker shows is decided by the MAP zoom, through icon opacity — never
+// by layer min/maxzoom alone. Layer ranges are judged on the map zoom, but a
+// symbol layer is only built for a tile when the TILE zoom is inside its range,
+// and on the globe tiles load up to ~1.5 zooms ahead of the map zoom at high
+// latitudes (+0.2 at 27°N, +0.7 at 52°N). With hard ranges, a band either side
+// of every switch showed nothing: the coarser layer had no bucket in the
+// finer tiles and the finer layer was still hidden — so a node tap that
+// landed on zoom 7.999… emptied the map. Layers are built ZOOM_SLACK beyond
+// their window and fade in and out on the map zoom instead.
+const ZOOM_SLACK = 2;
+// The map-zoom window each node tier is shown in. loadBase widens a tier when
+// a coarser one is missing from the file.
+const nodeWindow = new Map<number, [number, number]>(
+	NODE_TIERS.map((t) => [t.grid, [t.minZoom, t.maxZoom]])
+);
+const bandOpacity = (min: number, max: number | null): unknown[] => {
+	const expr: unknown[] = ['step', ['zoom'], min > 0 ? 0 : 1];
+	if (min > 0) expr.push(min, 1);
+	if (max != null) expr.push(max, 0);
+	return expr;
+};
+// Individual stations: visible from the switch up.
+const INDIVIDUAL_OPACITY = bandOpacity(SWITCH_ZOOM, null);
+const INDIVIDUAL_MIN_ZOOM = SWITCH_ZOOM - ZOOM_SLACK;
+const showsIndividuals = (map: maplibregl.Map): boolean => map.getZoom() >= SWITCH_ZOOM;
+const nodeTierActive = (map: maplibregl.Map, layerId: string): boolean => {
+	const tier = NODE_TIERS.find((t) => nodeLayerId(t.grid) === layerId);
+	const window = tier && nodeWindow.get(tier.grid);
+	if (!window) return false;
+	const z = map.getZoom();
+	return z >= window[0] && z < window[1];
+};
 // Matches the backend's refresh cadence + the readings file's max-age.
 const REFRESH_MS = 5 * 60_000;
 // A reading older than this renders dimmed even if still in the file
@@ -499,8 +532,8 @@ const ensureLayers = (map: maplibregl.Map): void => {
 				id: nodeLayerId(tier.grid),
 				type: 'symbol',
 				source: SOURCE_NODES,
-				minzoom: tier.minZoom,
-				maxzoom: tier.maxZoom,
+				minzoom: Math.max(0, tier.minZoom - ZOOM_SLACK),
+				maxzoom: tier.maxZoom + ZOOM_SLACK,
 				filter: gridMatch as never,
 				layout: {
 					'icon-image': badgeImageExpr(
@@ -517,7 +550,8 @@ const ensureLayers = (map: maplibregl.Map): void => {
 					'icon-anchor': 'bottom',
 					'icon-allow-overlap': true,
 					'icon-ignore-placement': true
-				}
+				},
+				paint: { 'icon-opacity': bandOpacity(tier.minZoom, tier.maxZoom) as never }
 			});
 		}
 	}
@@ -531,14 +565,21 @@ const ensureLayers = (map: maplibregl.Map): void => {
 			id: LAYER_ID_DOTS,
 			type: 'circle',
 			source: SOURCE_BASE,
-			minzoom: SWITCH_ZOOM,
+			minzoom: INDIVIDUAL_MIN_ZOOM,
 			filter: ['!=', ['get', 'node'], true],
 			paint: {
 				'circle-color': liveKtsColorExpr as never,
 				'circle-radius': 4,
 				'circle-stroke-width': 1,
 				'circle-stroke-color': 'rgba(255,255,255,0.4)',
-				'circle-opacity': ['case', ['boolean', ['feature-state', 'live'], false], 0, 0.55] as never
+				'circle-stroke-opacity': INDIVIDUAL_OPACITY as never,
+				'circle-opacity': [
+					'step',
+					['zoom'],
+					0,
+					SWITCH_ZOOM,
+					['case', ['boolean', ['feature-state', 'live'], false], 0, 0.55]
+				] as never
 			}
 		});
 	}
@@ -550,7 +591,7 @@ const ensureLayers = (map: maplibregl.Map): void => {
 			id: LAYER_ID_SELECTION_PILL,
 			type: 'symbol',
 			source: SOURCE_LIVE,
-			minzoom: SWITCH_ZOOM,
+			minzoom: INDIVIDUAL_MIN_ZOOM,
 			layout: {
 				'icon-image': SELECTION_PILL_IMAGE_ID,
 				'icon-text-fit': 'both',
@@ -566,7 +607,13 @@ const ensureLayers = (map: maplibregl.Map): void => {
 				'text-ignore-placement': true
 			},
 			paint: {
-				'icon-opacity': ['case', ['boolean', ['feature-state', 'selected'], false], 1, 0],
+				'icon-opacity': [
+					'step',
+					['zoom'],
+					0,
+					SWITCH_ZOOM,
+					['case', ['boolean', ['feature-state', 'selected'], false], 1, 0]
+				] as never,
 				'text-opacity': 0
 			}
 		});
@@ -579,7 +626,7 @@ const ensureLayers = (map: maplibregl.Map): void => {
 			id: LAYER_ID_PILL,
 			type: 'symbol',
 			source: SOURCE_LIVE,
-			minzoom: SWITCH_ZOOM,
+			minzoom: INDIVIDUAL_MIN_ZOOM,
 			layout: {
 				'icon-image': PILL_IMAGE_ID,
 				'icon-text-fit': 'both',
@@ -596,7 +643,9 @@ const ensureLayers = (map: maplibregl.Map): void => {
 				'text-ignore-placement': true
 			},
 			paint: {
-				'text-color': PILL_TEXT_COLOR
+				'text-color': PILL_TEXT_COLOR,
+				'icon-opacity': INDIVIDUAL_OPACITY as never,
+				'text-opacity': INDIVIDUAL_OPACITY as never
 			}
 		});
 	}
@@ -610,7 +659,7 @@ const ensureLayers = (map: maplibregl.Map): void => {
 			id: LAYER_ID_ARROW,
 			type: 'symbol',
 			source: SOURCE_LIVE,
-			minzoom: SWITCH_ZOOM,
+			minzoom: INDIVIDUAL_MIN_ZOOM,
 			filter: ['has', 'windDir'],
 			layout: {
 				'icon-image': ARROW_IMAGE_ID_DARK,
@@ -625,7 +674,8 @@ const ensureLayers = (map: maplibregl.Map): void => {
 			// point with the wind direction.
 			paint: {
 				'icon-translate': [MARKER_DX, MARKER_DY],
-				'icon-translate-anchor': 'viewport'
+				'icon-translate-anchor': 'viewport',
+				'icon-opacity': INDIVIDUAL_OPACITY as never
 			}
 		});
 	}
@@ -638,7 +688,7 @@ const ensureLayers = (map: maplibregl.Map): void => {
 			id: LAYER_ID_BADGE,
 			type: 'symbol',
 			source: SOURCE_LIVE,
-			minzoom: SWITCH_ZOOM,
+			minzoom: INDIVIDUAL_MIN_ZOOM,
 			layout: {
 				'icon-image': badgeImageExpr(
 					['case', ['==', ['get', 'priority'], 0], 'verified', 'pws'],
@@ -647,7 +697,8 @@ const ensureLayers = (map: maplibregl.Map): void => {
 				'icon-anchor': 'bottom',
 				'icon-allow-overlap': true,
 				'icon-ignore-placement': true
-			}
+			},
+			paint: { 'icon-opacity': INDIVIDUAL_OPACITY as never }
 		});
 	}
 };
@@ -725,8 +776,18 @@ const loadBase = async (
 		for (const tier of NODE_TIERS) {
 			const available = gridsInFile.has(tier.grid) || (tier.acceptsLegacy && hasLegacyNodes);
 			if (!available) continue; // its grid filter matches nothing anyway
+			nodeWindow.set(tier.grid, [carryMin, tier.maxZoom]);
 			if (map.getLayer(nodeLayerId(tier.grid))) {
-				map.setLayerZoomRange(nodeLayerId(tier.grid), carryMin, tier.maxZoom);
+				map.setLayerZoomRange(
+					nodeLayerId(tier.grid),
+					Math.max(0, carryMin - ZOOM_SLACK),
+					tier.maxZoom + ZOOM_SLACK
+				);
+				map.setPaintProperty(
+					nodeLayerId(tier.grid),
+					'icon-opacity',
+					bandOpacity(carryMin, tier.maxZoom) as never
+				);
 			}
 			carryMin = tier.maxZoom;
 		}
@@ -874,12 +935,48 @@ const onVisibilityChange = (): void => {
 
 // ── interactions ───────────────────────────────────────────────────────────
 
-const handleStationClick = (
-	e: maplibregl.MapMouseEvent & { features?: maplibregl.MapGeoJSONFeature[] }
-): void => {
+// Tap area around the finger, reaching further DOWN than up: markers are drawn
+// above their anchor (a badge whose tail tip sits on the station), and on the
+// globe MapLibre matches a symbol near its anchor rather than its drawn image,
+// so a tap on a badge lands above the point a strict query can see. Of the
+// markers found, the one whose anchor sits nearest to "a badge's height below
+// the finger" wins.
+const TAP_BOX = { side: 28, up: 14, down: 48 };
+const BADGE_TAP_DY = BADGE_H - BADGE_CY;
+
+type StationTarget = { kind: 'station' | 'node'; feature: maplibregl.MapGeoJSONFeature };
+
+const stationTargetAt = (map: maplibregl.Map, point: maplibregl.Point): StationTarget | null => {
+	const individuals = showsIndividuals(map);
+	const layers = (
+		individuals
+			? [LAYER_ID_BADGE, LAYER_ID_PILL, LAYER_ID_ARROW, LAYER_ID_DOTS]
+			: NODE_LAYER_IDS.filter((id) => nodeTierActive(map, id))
+	).filter((id) => map.getLayer(id));
+	if (layers.length === 0) return null;
+	const hits = map.queryRenderedFeatures(
+		[
+			[point.x - TAP_BOX.side, point.y - TAP_BOX.up],
+			[point.x + TAP_BOX.side, point.y + TAP_BOX.down]
+		],
+		{ layers }
+	);
+	let best: maplibregl.MapGeoJSONFeature | null = null;
+	let bestDistance = Infinity;
+	for (const f of hits) {
+		if (f.geometry.type !== 'Point') continue;
+		const anchor = map.project(f.geometry.coordinates as [number, number]);
+		const distance = Math.hypot(anchor.x - point.x, anchor.y - (point.y + BADGE_TAP_DY));
+		if (distance < bestDistance) {
+			bestDistance = distance;
+			best = f;
+		}
+	}
+	return best ? { kind: individuals ? 'station' : 'node', feature: best } : null;
+};
+
+const selectStation = (f: maplibregl.MapGeoJSONFeature): void => {
 	if (!currentMap) return;
-	const f = e.features?.[0];
-	if (!f) return;
 	const id = (f.properties?.id ?? f.id) as string | undefined;
 	if (id == null) return;
 
@@ -917,13 +1014,11 @@ const handleStationClick = (
 
 // Node drill-down — the expansion zoom is baked server-side; no async
 // getClusterExpansionZoom round-trip.
-const handleNodeClick = (
-	e: maplibregl.MapMouseEvent & { features?: maplibregl.MapGeoJSONFeature[] }
-): void => {
-	if (!currentMap) return;
-	const f = e.features?.[0];
-	if (!f || f.geometry.type !== 'Point') return;
-	const zoom = Number(f.properties?.expansionZoom ?? SWITCH_ZOOM);
+const zoomIntoNode = (f: maplibregl.MapGeoJSONFeature): void => {
+	if (!currentMap || f.geometry.type !== 'Point') return;
+	// The baked expansion zoom is a tier switch (4, 6 or 8). Land just past it,
+	// so the next tier (or the individual stations) is the one on screen.
+	const zoom = Number(f.properties?.expansionZoom ?? SWITCH_ZOOM) + 0.01;
 	currentMap.easeTo({
 		center: f.geometry.coordinates as [number, number],
 		zoom,
@@ -938,35 +1033,44 @@ const setCursorDefault = (): void => {
 	if (currentMap) currentMap.getCanvas().style.cursor = '';
 };
 
+// One tap handler for every station marker: it only acts on what is on
+// screen at this zoom (nodes and individuals are built beyond their windows,
+// faded out), using the same lookup the RN bridge asks via hitsVisibleStation.
+const handleMapClick = (e: maplibregl.MapMouseEvent): void => {
+	if (!currentMap || !currentConfig.visible) return;
+	const target = stationTargetAt(currentMap, e.point);
+	if (!target) return;
+	if (target.kind === 'node') zoomIntoNode(target.feature);
+	else selectStation(target.feature);
+};
+
 const INTERACTIVE_STATION_LAYERS = [LAYER_ID_BADGE, LAYER_ID_PILL, LAYER_ID_ARROW, LAYER_ID_DOTS];
 
 const attachInteractionHandlers = (map: maplibregl.Map): void => {
-	for (const layerId of INTERACTIVE_STATION_LAYERS) {
-		map.on('click', layerId, handleStationClick);
-		map.on('mouseenter', layerId, setCursorPointer);
-		map.on('mouseleave', layerId, setCursorDefault);
-	}
-	for (const layerId of NODE_LAYER_IDS) {
-		map.on('click', layerId, handleNodeClick);
+	map.on('click', handleMapClick);
+	for (const layerId of [...INTERACTIVE_STATION_LAYERS, ...NODE_LAYER_IDS]) {
 		map.on('mouseenter', layerId, setCursorPointer);
 		map.on('mouseleave', layerId, setCursorDefault);
 	}
 };
 
 const detachInteractionHandlers = (map: maplibregl.Map): void => {
-	for (const layerId of INTERACTIVE_STATION_LAYERS) {
-		map.off('click', layerId, handleStationClick);
-		map.off('mouseenter', layerId, setCursorPointer);
-		map.off('mouseleave', layerId, setCursorDefault);
-	}
-	for (const layerId of NODE_LAYER_IDS) {
-		map.off('click', layerId, handleNodeClick);
+	map.off('click', handleMapClick);
+	for (const layerId of [...INTERACTIVE_STATION_LAYERS, ...NODE_LAYER_IDS]) {
 		map.off('mouseenter', layerId, setCursorPointer);
 		map.off('mouseleave', layerId, setCursorDefault);
 	}
 };
 
 // ── public API (unchanged surface) ─────────────────────────────────────────
+
+/**
+ * Is there a station marker the user can see under this tap? The RN bridge
+ * asks before treating a tap as "forecast here": a visible station or node
+ * owns the tap, a faded-out one (built beyond its zoom window) does not.
+ */
+export const hitsVisibleStation = (map: maplibregl.Map, point: maplibregl.Point): boolean =>
+	!!currentConfig.visible && stationTargetAt(map, point) !== null;
 
 const ALL_LAYERS = [
 	...NODE_LAYER_IDS,

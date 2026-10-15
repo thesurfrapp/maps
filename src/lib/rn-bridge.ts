@@ -19,9 +19,7 @@ import {
 	setSurfrSpotsConfig
 } from '$lib/surfr-spots';
 import {
-	LAYER_ID_ARROW as WINDY_STATIONS_ARROW_LAYER,
-	LAYER_ID_BADGE as WINDY_STATIONS_BADGE_LAYER,
-	LAYER_ID_PILL as WINDY_STATIONS_PILL_LAYER,
+	hitsVisibleStation,
 	setWindyStationsConfig,
 	setWindyStationsVisible
 } from '$lib/windy-stations';
@@ -283,14 +281,9 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 		// early here prevents this global handler from also emitting
 		// forecastLocationSet with the offset tap point — the station's exact
 		// coordinates should win for the forecast.
-		const stationLayers: string[] = [];
-		if (map.getLayer(WINDY_STATIONS_PILL_LAYER)) stationLayers.push(WINDY_STATIONS_PILL_LAYER);
-		if (map.getLayer(WINDY_STATIONS_ARROW_LAYER)) stationLayers.push(WINDY_STATIONS_ARROW_LAYER);
-		if (map.getLayer(WINDY_STATIONS_BADGE_LAYER)) stationLayers.push(WINDY_STATIONS_BADGE_LAYER);
-		if (stationLayers.length > 0) {
-			const stationHit = map.queryRenderedFeatures(bbox, { layers: stationLayers });
-			if (stationHit.length > 0) return;
-		}
+		// A tap on a visible station marker or station group belongs to the
+		// stations module (opens the sheet, or zooms into the group).
+		if (hitsVisibleStation(map, ev.point)) return;
 		const spotHit = map
 			.queryRenderedFeatures(bbox, { layers: [SURFR_SPOTS_LAYER] })
 			.find((f) => f.properties?.id != null);
