@@ -20,6 +20,7 @@ import {
 } from '$lib/surfr-spots';
 import {
 	LAYER_ID_ARROW as WINDY_STATIONS_ARROW_LAYER,
+	LAYER_ID_BADGE as WINDY_STATIONS_BADGE_LAYER,
 	LAYER_ID_PILL as WINDY_STATIONS_PILL_LAYER,
 	setWindyStationsConfig,
 	setWindyStationsVisible
@@ -254,7 +255,7 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 	//
 	// Live stations (flag on) — Path B, Windy-style: every tap means "tell me
 	// about this point," no pin is drawn on tap:
-	//   - On a station pill: windy-stations layer handler opens the station
+	//   - On a station badge or pill: windy-stations layer handler opens the station
 	//     sheet and emits forecastLocationSet with the station's exact coords.
 	//     The early-return below skips the global-click default for that case.
 	//   - On a Surfr spot dot: same as classic, minus touching the pin.
@@ -285,6 +286,7 @@ export const installRnBridge = (map: maplibregl.Map): (() => void) => {
 		const stationLayers: string[] = [];
 		if (map.getLayer(WINDY_STATIONS_PILL_LAYER)) stationLayers.push(WINDY_STATIONS_PILL_LAYER);
 		if (map.getLayer(WINDY_STATIONS_ARROW_LAYER)) stationLayers.push(WINDY_STATIONS_ARROW_LAYER);
+		if (map.getLayer(WINDY_STATIONS_BADGE_LAYER)) stationLayers.push(WINDY_STATIONS_BADGE_LAYER);
 		if (stationLayers.length > 0) {
 			const stationHit = map.queryRenderedFeatures(bbox, { layers: stationLayers });
 			if (stationHit.length > 0) return;
