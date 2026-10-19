@@ -9,7 +9,7 @@
 //
 // Phase 2 (hydrate): a small readings file every ~5 minutes — id-keyed live
 // values + per-node max-wind aggregates. Applied via setFeatureState, so
-// cluster/dot colors repaint without re-parsing, re-clustering, or symbol
+// silent-station badges hide/show without re-parsing, re-clustering, or symbol
 // re-layout. Stations absent from the readings render dimmed (absence IS the
 // staleness signal). Individual pills/arrows (z8+) rebuild from a second,
 // small GeoJSON source containing only stations with a current reading.
@@ -30,6 +30,7 @@
 // API surface preserved: initWindyStations, setWindyStationsConfig,
 // setWindyStationsVisible, teardownWindyStations + the LAYER_ID_* exports
 // rn-bridge consumes.
+import { groupBounds, groupTapZoom } from './station-groups';
 import { needsBaseReload, readingsMatchBase } from './stations-version';
 
 import type * as maplibregl from 'maplibre-gl';
@@ -139,7 +140,7 @@ type WindyStationsConfig = {
 };
 
 // Surfr embed wind color anchors [kt, r, g, b] — identical to the GFS
-// background ramp so dots read as "ground truth" samples of the same scale.
+// background ramp so badges read as "ground truth" samples of the same scale.
 const COLOR_ANCHORS: [number, number, number, number][] = [
 	[0, 64, 89, 153],
 	[8, 110, 221, 235],
@@ -151,27 +152,6 @@ const COLOR_ANCHORS: [number, number, number, number][] = [
 	[35, 255, 82, 173],
 	[40, 255, 88, 235],
 	[50, 173, 112, 255]
-];
-
-// MapLibre interpolate stops over a feature-state kts value.
-const ktsColorStops = (): (number | string)[] => {
-	const stops: (number | string)[] = [];
-	for (const [k, r, g, b] of COLOR_ANCHORS) {
-		stops.push(k, `rgb(${r},${g},${b})`);
-	}
-	return stops;
-};
-
-// Paint expression: color by live kts from feature-state, dim when absent.
-// MapLibre expressions can't compare against a null literal, so absence is
-// mapped to a -1 sentinel via coalesce (real kts are always >= 0).
-const liveKtsColorExpr = [
-	'interpolate',
-	['linear'],
-	['coalesce', ['feature-state', 'kts'], -1],
-	-1,
-	DIM_COLOR,
-	...ktsColorStops()
 ];
 
 const emptyFc: GeoJSON.FeatureCollection = { type: 'FeatureCollection', features: [] };
@@ -556,29 +536,36 @@ const ensureLayers = (map: maplibregl.Map): void => {
 		}
 	}
 
-	// Station dots — z8+, every station from the base file. Colored when a
-	// live reading exists (feature-state), dimmed otherwise. Hidden (opacity
-	// 0) when the station has a badge, so silent stations are exactly the
-	// visible dots.
+	// Silent stations — z8+, every station from the base file, drawn as the
+	// dimmed station badge (the same grey the dimmed group stacks use), so a
+	// group that is grey when zoomed out stays a set of grey badges when zoomed
+	// in. Hidden (opacity 0) while the station has a live reading — it then has
+	// its coloured badge + pill on the live source — so silent stations are
+	// exactly the visible grey badges. They used to be 4px dots at 55% opacity,
+	// which riders read as "the stations vanished" (SRF-3044).
 	if (!map.getLayer(LAYER_ID_DOTS)) {
 		map.addLayer({
 			id: LAYER_ID_DOTS,
-			type: 'circle',
+			type: 'symbol',
 			source: SOURCE_BASE,
 			minzoom: INDIVIDUAL_MIN_ZOOM,
 			filter: ['!=', ['get', 'node'], true],
+			layout: {
+				'icon-image': badgeImageExpr(
+					['case', ['==', ['get', 'priority'], 0], 'verified', 'pws'],
+					DIM_BAND
+				) as never,
+				'icon-anchor': 'bottom',
+				'icon-allow-overlap': true,
+				'icon-ignore-placement': true
+			},
 			paint: {
-				'circle-color': liveKtsColorExpr as never,
-				'circle-radius': 4,
-				'circle-stroke-width': 1,
-				'circle-stroke-color': 'rgba(255,255,255,0.4)',
-				'circle-stroke-opacity': INDIVIDUAL_OPACITY as never,
-				'circle-opacity': [
+				'icon-opacity': [
 					'step',
 					['zoom'],
 					0,
 					SWITCH_ZOOM,
-					['case', ['boolean', ['feature-state', 'live'], false], 0, 0.55]
+					['case', ['boolean', ['feature-state', 'live'], false], 0, 1]
 				] as never
 			}
 		});
@@ -830,7 +817,7 @@ const applyReadings = (map: maplibregl.Map, readings: ReadingsFile): void => {
 	nodeKts = new Map(Object.entries(nodes));
 	renderNodes(map);
 
-	// Station dots + the live (pill) source.
+	// Silent-station badges (feature-state) + the live (pill) source.
 	const nextLiveIds = new Set<string>();
 	const features: GeoJSON.Feature[] = [];
 	for (const [id, r] of Object.entries(stations)) {
@@ -839,7 +826,7 @@ const applyReadings = (map: maplibregl.Map, readings: ReadingsFile): void => {
 		const [kts, dir, gust, obsTsSec] = r;
 		if (kts == null || nowSec - obsTsSec > STALE_MS / 1000) continue;
 
-		map.setFeatureState({ source: SOURCE_BASE, id }, { kts, live: true });
+		map.setFeatureState({ source: SOURCE_BASE, id }, { live: true });
 		nextLiveIds.add(id);
 
 		// Null-valued keys are OMITTED (not set to null): the arrow layer's
@@ -885,19 +872,28 @@ const refreshReadings = async (map: maplibregl.Map): Promise<void> => {
 		if (!res.ok) return;
 		const readings = (await res.json()) as ReadingsFile;
 
+		// Paint the readings straight away, even when their version differs from
+		// the positions on screen. They are keyed by station id and node cell id,
+		// and positions come from our own index by id, so a mismatch can't put a
+		// value on the wrong station — at worst a station added since our
+		// positions file has no marker yet. Holding them back until the versions
+		// agreed left every marker grey (SRF-3044): `v` changes whenever any
+		// station joins, leaves or moves, and a cached readings file can trail
+		// the positions by minutes, so the guard often failed a whole round.
+		applyReadings(map, readings);
+
 		// Version guard: the station set changed while we hold an older
-		// live-cluster — refetch it, and install it plus the readings only if the
-		// two agree. A failed reload, or the proxy serving another version (its
-		// refresh cooldown), skips this round and leaves the current positions and
-		// values on screen together; the next refresh retries.
+		// live-cluster — refetch it, and install it only if it matches the
+		// readings; then repaint onto the new positions. A failed reload, or the
+		// proxy serving another version (its refresh cooldown), keeps the current
+		// positions; the next refresh retries.
 		if (
 			typeof readings.v === 'number' &&
 			needsBaseReload(baseVersion, readings.v) &&
-			!(await loadBase(map, true, readings.v))
+			(await loadBase(map, true, readings.v))
 		) {
-			return;
+			applyReadings(map, readings);
 		}
-		applyReadings(map, readings);
 	} catch (e) {
 		if ((e as Error).name === 'AbortError') return;
 		console.warn('[windy-stations] readings refresh failed', e);
@@ -1012,16 +1008,54 @@ const selectStation = (f: maplibregl.MapGeoJSONFeature): void => {
 	currentConfig.onStationTap?.(station);
 };
 
-// Node drill-down — the expansion zoom is baked server-side; no async
-// getClusterExpansionZoom round-trip.
+// A group tap never lands closer than this, however tight the group.
+const GROUP_FIT_MAX_ZOOM = 11;
+// Room around a fitted group, as a share of the map: the app overlays the
+// search bar on top, the forecast sheet at the bottom and control columns on
+// both sides, and a badge's pill reaches out to its right.
+const GROUP_FIT_PADDING = { top: 0.16, bottom: 0.26, left: 0.16, right: 0.2 };
+
+// Node drill-down — fit the map to the stations the tapped group stands for
+// (SRF-3044). Centring on the node's centroid at its expansion zoom put
+// members at the screen edges, under the app's overlays. The expansion zoom
+// is baked server-side (a tier switch: 4, 6 or 8); the camera always lands
+// just past it, so the next tier (or the individual stations) is on screen.
+// A group too wide to fit there is still centred on its stations' extent, so
+// its outermost members sit as far from the edges as the zoom allows.
 const zoomIntoNode = (f: maplibregl.MapGeoJSONFeature): void => {
 	if (!currentMap || f.geometry.type !== 'Point') return;
-	// The baked expansion zoom is a tier switch (4, 6 or 8). Land just past it,
-	// so the next tier (or the individual stations) is the one on screen.
-	const zoom = Number(f.properties?.expansionZoom ?? SWITCH_ZOOM) + 0.01;
-	currentMap.easeTo({
-		center: f.geometry.coordinates as [number, number],
-		zoom,
+	const map = currentMap;
+	const expansionZoom = Number(f.properties?.expansionZoom ?? SWITCH_ZOOM);
+	const grid = Number(f.properties?.grid);
+	const bounds = Number.isInteger(grid)
+		? groupBounds(String(f.properties?.id), grid, baseIndex.values())
+		: null; // legacy ungridded node — no member lookup, centroid only
+	if (!bounds) {
+		map.easeTo({
+			center: f.geometry.coordinates as [number, number],
+			zoom: groupTapZoom(undefined, expansionZoom, GROUP_FIT_MAX_ZOOM),
+			duration: 500
+		});
+		return;
+	}
+	const { clientWidth: w, clientHeight: h } = map.getCanvas();
+	const padding = {
+		top: h * GROUP_FIT_PADDING.top,
+		bottom: h * GROUP_FIT_PADDING.bottom,
+		left: w * GROUP_FIT_PADDING.left,
+		right: w * GROUP_FIT_PADDING.right
+	};
+	const [[west, south], [east, north]] = bounds;
+	map.easeTo({
+		center: [(west + east) / 2, (south + north) / 2],
+		zoom: groupTapZoom(
+			map.cameraForBounds(bounds, { padding })?.zoom,
+			expansionZoom,
+			GROUP_FIT_MAX_ZOOM
+		),
+		// Centre the stations in the padded area, not the whole map. A one-off
+		// offset, unlike easeTo's `padding`, which would stick to the map.
+		offset: [(padding.left - padding.right) / 2, (padding.top - padding.bottom) / 2],
 		duration: 500
 	});
 };
@@ -1081,9 +1115,20 @@ const ALL_LAYERS = [
 	LAYER_ID_BADGE
 ];
 
-const bootstrap = async (map: maplibregl.Map): Promise<void> => {
-	const ok = await loadBase(map);
-	if (ok) await refreshReadings(map);
+// One bootstrap at a time: RN's config message turns the layer on through both
+// setWindyStationsConfig and setWindyStationsVisible, and two overlapping runs
+// raced each other — duplicate positions fetches, and the second readings
+// fetch aborting the first.
+let bootstrapping: Promise<void> | undefined;
+const bootstrap = (map: maplibregl.Map): Promise<void> => {
+	bootstrapping ??= (async () => {
+		try {
+			if (await loadBase(map)) await refreshReadings(map);
+		} finally {
+			bootstrapping = undefined;
+		}
+	})();
+	return bootstrapping;
 };
 
 export const initWindyStations = (map: maplibregl.Map): void => {
