@@ -1048,8 +1048,10 @@ const zoomIntoNode = (f: maplibregl.MapGeoJSONFeature): void => {
 	const [[west, south], [east, north]] = bounds;
 	map.easeTo({
 		center: [(west + east) / 2, (south + north) / 2],
+		// Fit at the current bearing — easeTo keeps it, so a north-up fit on a
+		// rotated map would size the group against the wrong screen axis.
 		zoom: groupTapZoom(
-			map.cameraForBounds(bounds, { padding })?.zoom,
+			map.cameraForBounds(bounds, { padding, bearing: map.getBearing() })?.zoom,
 			expansionZoom,
 			GROUP_FIT_MAX_ZOOM
 		),
